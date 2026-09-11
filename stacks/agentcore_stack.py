@@ -202,6 +202,21 @@ class AgentCoreStack(Stack):
             )
         )
 
+        # The mount broker, when files storage is deployed. cred_helper.py runs in the
+        # agent container as this role and calls the broker on every credential refresh.
+        # Named rather than referenced: importing the function from the storage stack would
+        # make this stack depend on one that already depends on it (the bucket), and the
+        # name is deterministic anyway. This is the agent's only permission anywhere near
+        # the file system — it cannot read the bucket, mount, or sign a ticket, only ask.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["lambda:InvokeFunction"],
+                resources=[
+                    f"arn:aws:lambda:{region}:{account}:function:{prefix}-mount-broker",
+                ],
+            )
+        )
+
         # ECR pull (agent image lives in the CDK assets repo).
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
@@ -238,9 +253,29 @@ class AgentCoreStack(Stack):
             encryption=s3.BucketEncryption.S3_MANAGED,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
+            # Required by S3 Files: creating a file system over a bucket without
+            # versioning fails with "Your bucket must have versioning enabled".
+            versioned=True,
             removal_policy=RemovalPolicy.DESTROY,  # PoC
             auto_delete_objects=True,
-            lifecycle_rules=[s3.LifecycleRule(expiration=Duration.days(365))],
+            # Versioning is mandatory for S3 Files, and it makes capacity grow from four
+            # separate directions — a mounted filesystem overwrites constantly (an
+            # appended jsonl, a rewritten cache), so each needs its own rule.
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="expire-current-and-old-versions",
+                    expiration=Duration.days(365),
+                    # 1. Every overwrite and delete retains the previous version.
+                    noncurrent_version_expiration=Duration.days(30),
+                    # 2. Orphaned multipart parts are billed and do not show up in a
+                    #    listing, which is what makes them easy to miss.
+                    abort_incomplete_multipart_upload_after=Duration.days(7)),
+                # 3. Deleting a versioned object leaves a delete marker behind. AWS
+                #    rejects ExpiredObjectDeleteMarker in the same rule as a Days
+                #    expiration, hence a second rule.
+                s3.LifecycleRule(id="clean-expired-delete-markers",
+                                 expired_object_delete_marker=True),
+            ],
         )
 
         # --- Container image (ARM64) ------------------------------------------

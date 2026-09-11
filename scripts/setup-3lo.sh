@@ -69,12 +69,21 @@ fi
 # Lark is not standard OIDC (no discovery doc), so we pass authorizationServerMetadata.
 # clientAuthenticationMethod goes on the provider config — setting the legacy
 # tokenEndpointAuthMethods in the metadata too is a validation error.
+#
+# Through boto3 rather than the CLI: AWS CLI 2.34 bundles an older service model that
+# rejects clientAuthenticationMethod as an unknown parameter, even though the service
+# accepts it (verified). uv resolves a current botocore, so the script does not depend on
+# how fresh the operator's CLI happens to be.
 log "OAuth2 credential provider ($PROVIDER)"
-CFG="$(SHIM_ISSUER="$SHIM_ISSUER" SHIM_AUTHORIZE="$SHIM_AUTHORIZE" SHIM_TOKEN="$SHIM_TOKEN" \
-       LARK_APP_ID="$LARK_APP_ID" LARK_APP_SECRET="$LARK_APP_SECRET" python3 <<'PY'
-import json, os
+PROVIDER="$PROVIDER" SHIM_ISSUER="$SHIM_ISSUER" SHIM_AUTHORIZE="$SHIM_AUTHORIZE" \
+SHIM_TOKEN="$SHIM_TOKEN" LARK_APP_ID="$LARK_APP_ID" LARK_APP_SECRET="$LARK_APP_SECRET" \
+uv run --with 'boto3>=1.43.92' python - <<'PYEOF'
+import os
+import boto3
+
 e = os.environ
-print(json.dumps({
+c = boto3.client("bedrock-agentcore-control")
+cfg = {
     "customOauth2ProviderConfig": {
         "oauthDiscovery": {
             "authorizationServerMetadata": {
@@ -88,21 +97,20 @@ print(json.dumps({
         "clientSecret": e["LARK_APP_SECRET"],
         "clientAuthenticationMethod": "CLIENT_SECRET_POST",
     }
-}))
-PY
-)"
-
-if aws bedrock-agentcore-control get-oauth2-credential-provider --name "$PROVIDER" >/dev/null 2>&1; then
-  aws bedrock-agentcore-control update-oauth2-credential-provider \
-    --name "$PROVIDER" --credential-provider-vendor CustomOauth2 \
-    --oauth2-provider-config-input "$CFG" >/dev/null
-  echo "  updated"
-else
-  aws bedrock-agentcore-control create-oauth2-credential-provider \
-    --name "$PROVIDER" --credential-provider-vendor CustomOauth2 \
-    --oauth2-provider-config-input "$CFG" >/dev/null
-  echo "  created"
-fi
+}
+name = e["PROVIDER"]
+try:
+    c.get_oauth2_credential_provider(name=name)
+    c.update_oauth2_credential_provider(
+        name=name, credentialProviderVendor="CustomOauth2",
+        oauth2ProviderConfigInput=cfg)
+    print("  updated")
+except c.exceptions.ResourceNotFoundException:
+    c.create_oauth2_credential_provider(
+        name=name, credentialProviderVendor="CustomOauth2",
+        oauth2ProviderConfigInput=cfg)
+    print("  created")
+PYEOF
 
 CALLBACK="$(aws bedrock-agentcore-control get-oauth2-credential-provider \
   --name "$PROVIDER" --query callbackUrl --output text)"

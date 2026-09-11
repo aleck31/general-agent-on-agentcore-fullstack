@@ -35,6 +35,26 @@ ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT" CDK_DEFAULT_REGION="$REGION"
 CDK="npx --yes aws-cdk@2"
 
+# Control-plane calls whose parameters are newer than the AWS CLI's bundled service model.
+# Verified against CLI 2.34: it rejects requireServiceS3Endpoint, sessionConfiguration and
+# clientAuthenticationMethod as unknown parameters even though the service accepts them.
+# uv resolves a current botocore, so these calls do not depend on how fresh the operator's
+# CLI happens to be. Usage: acp <operation_name> <json params>  → prints the JSON result.
+acp() {
+  ACP_OP="$1" ACP_PARAMS="$2" ACP_REGION="${3:-$REGION}" \
+  uv run --with 'boto3>=1.43.92' python - <<'PYEOF'
+import json, os, sys
+import boto3
+c = boto3.client("bedrock-agentcore-control", region_name=os.environ["ACP_REGION"])
+try:
+    r = getattr(c, os.environ["ACP_OP"])(**json.loads(os.environ["ACP_PARAMS"]))
+except Exception as e:
+    sys.stderr.write(f"{type(e).__name__}: {e}\n")
+    sys.exit(1)
+print(json.dumps({k: v for k, v in r.items() if k != "ResponseMetadata"}, default=str))
+PYEOF
+}
+
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 
 cfn_out() { # stack, output-key
@@ -78,30 +98,33 @@ base_cdk_stacks() {
 }
 
 phase2_runtime() {
-  # The Runtime image must be ARM64 and built via CodeBuild.
-  # We use the AgentCore CLI, which runs CodeBuild in the cloud and creates/updates the runtime.
-  # Requires `npm i -g @aws/agentcore`.
-  log "Runtime — build (CodeBuild ARM64) + deploy via AgentCore CLI"
-  command -v agentcore >/dev/null || { echo "agentcore CLI not found: npm i -g @aws/agentcore"; exit 1; }
-  export AGENTCORE_SUPPRESS_RECOMMENDATION=1
+  # The agent Runtime is created straight from the control plane, using the ARM64 image
+  # CDK already published to ECR (AgentImageUri).
+  #
+  # The AgentCore CLI used to do this (`agentcore configure` + `agentcore deploy`), but
+  # 0.28 removed `configure` and turned `deploy` into "deploy project infrastructure via
+  # CDK", which wants to own the CDK app this repo already has. Driving the API directly
+  # removes the dependency on a fast-moving CLI and matches what build-mcp.sh has always
+  # done for the MCP server runtimes. It also lets the authorizer and network mode be set
+  # at creation time instead of patched in afterwards.
+  log "Runtime — create/update the agent Runtime from the CDK-published image"
 
-  local role model memory shim mcp_arn mcp_url pool client pwsecret ws_url approval_url approval_arn
+  local role image model memory shim mcp_arn mcp_url pool client pwsecret ws_url
+  local approval_url approval_arn issuer
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
-  # Cognito lets the agent mint the access token the search Gateway authorises with.
+  image="$(cfn_out "$PREFIX-agentcore" AgentImageUri)"
   pool="$(cfn_out "$PREFIX-security" UserPoolId)"
   client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
+  issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
   pwsecret="$PREFIX/cognito-password-secret"
   ws_url="$(uv run python -c "import json,os;f='.cdk-state.json';print((json.load(open(f)) if os.path.isfile(f) else {}).get('websearch_gateway_url',''))" 2>/dev/null)"
-  # MODEL_ID from .env wins; else cdk.json's default_model_id.
   model="${MODEL_ID:-$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['default_model_id'])")}"
   memory="$(uv run python -c "import json,os;f='.cdk-state.json';print((json.load(open(f)) if os.path.isfile(f) else {}).get('memory_id',''))" 2>/dev/null)"
   shim="$(cfn_out "$PREFIX-shim" ShimReturnUrl)"
-  # lark-cli MCP server runtime → its SigV4 MCP invocations URL (URL-encoded ARN).
+
   mcp_arn="$(aws bedrock-agentcore-control list-agent-runtimes \
-    --query "agentRuntimes[?agentRuntimeName=='agentcore_fullstack_mcp'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
+    --query "agentRuntimes[?agentRuntimeName=='${PREFIX//-/_}_mcp'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
   mcp_url="https://bedrock-agentcore.$REGION.amazonaws.com/runtimes/$(uv run python -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$mcp_arn")/invocations?qualifier=DEFAULT"
-  # Approval MCP server, if ./deploy.sh approval ran. Optional by design: left empty
-  # the agent simply has no approval tools, same as web search.
   approval_arn="$(aws bedrock-agentcore-control list-agent-runtimes \
     --query "agentRuntimes[?agentRuntimeName=='${PREFIX//-/_}_approval'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
   if [ -n "$approval_arn" ] && [ "$approval_arn" != "None" ]; then
@@ -109,15 +132,16 @@ phase2_runtime() {
     echo "  approval tools: enabled"
   else
     approval_url=""
-    echo "  approval tools: not deployed (./deploy.sh approval to add them)"
+    echo "  approval tools: not deployed (./deploy.sh mcp approval to add them)"
   fi
 
   [ -n "$role" ] || { echo "missing execution role output — run --base first"; exit 1; }
-  [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || { echo "agentcore_fullstack_mcp runtime not found — deploy the MCP server first (scripts/build-mcp.sh + create runtime)"; exit 1; }
+  [ -n "$image" ] || { echo "missing agent image output — run --base first"; exit 1; }
+  [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || {
+    echo "${PREFIX//-/_}_mcp runtime not found — run ./deploy.sh mcp first"; exit 1; }
 
   # Files storage: the mount is NFS, so the Runtime has to join the storage stack's VPC.
-  # These stay empty when the feature is off, and every use of them below is guarded.
-  local subnets="" runtime_sg="" fs_id="" broker_fn="" vpc_args=()
+  local subnets="" runtime_sg="" fs_id="" broker_fn=""
   if [ "$FILES_STORAGE" = "true" ]; then
     subnets="$(cfn_out "$PREFIX-storage" RuntimeSubnetIds)"
     runtime_sg="$(cfn_out "$PREFIX-storage" RuntimeSecurityGroupId)"
@@ -125,106 +149,100 @@ phase2_runtime() {
     broker_fn="$(cfn_out "$PREFIX-storage" BrokerFunctionName)"
     [ -n "$subnets" ] && [ "$subnets" != "None" ] || {
       echo "storage stack outputs missing — run --base with FILES_STORAGE=true first"; exit 1; }
-    vpc_args=(--vpc --subnets "$subnets" --security-groups "$runtime_sg")
     echo "  files storage: VPC mode, subnets $subnets"
+    # The router needs the file system id too, and it is AWS-assigned — so it travels
+    # through .cdk-state.json and reaches the router on the re-deploy below.
+    ctx_set files_file_system_id "$fs_id"
   fi
 
-  # Configure once (idempotent; writes .bedrock_agentcore.yaml). Custom Dockerfile
-  # in agent/ is respected. Allow the agent's own execution role to fetch per-user
-  # tokens and invoke the lark-cli MCP runtime (granted out-of-band / in agentcore stack).
-  #
-  # Note the network mode is only settled here, on first configure. Switching an existing
-  # deployment between PUBLIC and VPC is done by the update below, which sends the whole
-  # network configuration explicitly.
-  if [ ! -f .bedrock_agentcore.yaml ]; then
-    agentcore configure -e agent/server.py -n "${PREFIX//-/_}_agent" \
-      --execution-role "$role" -dt container -p HTTP -r "$REGION" --non-interactive \
-      "${vpc_args[@]}"
-  fi
-
-  agentcore deploy --auto-update-on-conflict \
-    --env "MOUNT_PATH=${fs_id:+/mnt/user}" \
-    --env "S3FILES_FS_ID=$fs_id" \
-    --env "MOUNT_BROKER_FN=$broker_fn" \
-    --env "BEDROCK_MODEL_ID=$model" \
-    --env "BEDROCK_AGENTCORE_MEMORY_ID=$memory" \
-    --env "LARK_MCP_URL=$mcp_url" \
-    --env "SHIM_RETURN_URL=$shim" \
-    --env "LARK_OAUTH_PROVIDER=agentcore-fullstack-3lo" \
-    --env "AGENT_WORKLOAD_NAME=agentcore-fullstack-wl" \
-    --env "LARK_SCOPES=drive:drive docx:document offline_access" \
-    --env "LARK_SECRET_ID=$PREFIX/channels/lark" \
-    --env "LARK_API_DOMAIN=$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['lark_api_domain'])")" \
-    --env "COGNITO_USER_POOL_ID=$pool" \
-    --env "COGNITO_CLIENT_ID=$client" \
-    --env "COGNITO_PASSWORD_SECRET_ID=$pwsecret" \
-    --env "WEBSEARCH_GATEWAY_URL=$ws_url" \
-    --env "APPROVAL_MCP_URL=$approval_url"
-
-  # Persist the runtime id into .cdk-state.json for the dependent stacks.
-  local rid
-  rid="$(aws bedrock-agentcore-control list-agent-runtimes \
-    --query "agentRuntimes[?agentRuntimeName=='${PREFIX//-/_}_agent'].agentRuntimeId" \
-    --output text 2>/dev/null | head -1)"
-  [ -n "$rid" ] && [ "$rid" != "None" ] && ctx_set runtime_id "$rid"
-
-  # Inbound auth: CUSTOM_JWT, so the platform verifies who the caller is and hands the
-  # agent a workload token derived from that identity. The AgentCore CLI has no flag for
-  # this, hence a follow-up update.
-  #
-  # UpdateAgentRuntime REPLACES the runtime rather than patching it: anything omitted is
-  # cleared, and it silently dropped every environment variable the first time round
-  # (SHIM_RETURN_URL going missing surfaced as a ValidationException from
-  # GetResourceOauth2Token). So read the current config back and resend all of it.
-  #
-  # This is also what makes SigV4 invocation stop working ("Authorization method
-  # mismatch"), so the router deploy above and this step belong to the same cutover.
-  if [ -n "$rid" ] && [ "$rid" != "None" ]; then
-    log "Runtime — inbound auth: CUSTOM_JWT (Cognito)"
-    local issuer client cur art net envvars
-    issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
-    client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
-    cur="$(aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$rid" --output json)"
-    _rt_get() { printf '%s' "$cur" | uv run python -c "import json,sys;print(json.dumps(json.load(sys.stdin).get('$1') or {}))"; }
-    art="$(_rt_get agentRuntimeArtifact)"
-    net="$(_rt_get networkConfiguration)"
-    envvars="$(_rt_get environmentVariables)"
-    # With files storage on, the network configuration is *set* rather than preserved —
-    # a runtime that already exists in PUBLIC mode has to be moved into the VPC, and
-    # reading its current config back would keep it where it is. The S3 gateway endpoint
-    # is service-managed and free (a gateway endpoint, not an interface one).
-    if [ "$FILES_STORAGE" = "true" ]; then
-      net="$(SUBNETS="$subnets" SG="$runtime_sg" uv run python -c '
+  local rname="${PREFIX//-/_}_agent" params rid
+  params="$(RNAME="$rname" IMAGE="$image" ROLE="$role" ISSUER="$issuer" CLIENT="$client" \
+    SUBNETS="$subnets" SG="$runtime_sg" MODEL="$model" MEMORY="$memory" MCP_URL="$mcp_url" \
+    SHIM="$shim" POOL="$pool" PWSECRET="$pwsecret" WS_URL="$ws_url" \
+    APPROVAL_URL="$approval_url" FS_ID="$fs_id" BROKER_FN="$broker_fn" PREFIX="$PREFIX" \
+    LARK_DOMAIN="$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['lark_api_domain'])")" \
+    uv run python - <<'PYEOF'
 import json, os
-print(json.dumps({"networkMode": "VPC", "networkModeConfig": {
-    "subnets": [s for s in os.environ["SUBNETS"].split(",") if s],
-    "securityGroups": [os.environ["SG"]],
-    "requireServiceS3Endpoint": True}}))')"
-    fi
-    # Fail loudly rather than deploy a runtime stripped of its configuration.
-    [ "$envvars" = "{}" ] && { echo "  aborting: runtime reports no environment variables to preserve"; exit 1; }
-    aws bedrock-agentcore-control update-agent-runtime --agent-runtime-id "$rid" \
-      --agent-runtime-artifact "$art" --role-arn "$role" --network-configuration "$net" \
-      --environment-variables "$envvars" \
-      --authorizer-configuration "{\"customJWTAuthorizer\":{\"discoveryUrl\":\"$issuer/.well-known/openid-configuration\",\"allowedClients\":[\"$client\"]}}" \
-      --query 'status' --output text
-    for _ in $(seq 1 40); do
-      [ "$(aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$rid" \
-           --query status --output text 2>/dev/null)" = "READY" ] && break
-      sleep 5
-    done
-    echo "  inbound: CUSTOM_JWT ($client); env vars preserved: $(printf '%s' "$envvars" | uv run python -c 'import json,sys;print(len(json.load(sys.stdin)))')"
+e = os.environ
+env = {
+    "BEDROCK_MODEL_ID": e["MODEL"],
+    "BEDROCK_AGENTCORE_MEMORY_ID": e["MEMORY"],
+    "LARK_MCP_URL": e["MCP_URL"],
+    "SHIM_RETURN_URL": e["SHIM"],
+    "LARK_OAUTH_PROVIDER": e["PREFIX"] + "-3lo",
+    "AGENT_WORKLOAD_NAME": e["PREFIX"] + "-wl",
+    "LARK_SCOPES": "drive:drive docx:document offline_access",
+    "LARK_SECRET_ID": e["PREFIX"] + "/channels/lark",
+    "LARK_API_DOMAIN": e["LARK_DOMAIN"],
+    "COGNITO_USER_POOL_ID": e["POOL"],
+    "COGNITO_CLIENT_ID": e["CLIENT"],
+    "COGNITO_PASSWORD_SECRET_ID": e["PWSECRET"],
+    "WEBSEARCH_GATEWAY_URL": e["WS_URL"],
+    "APPROVAL_MCP_URL": e["APPROVAL_URL"],
+    # Empty unless files storage is on; the agent and cred_helper treat that as "no mount".
+    "S3FILES_FS_ID": e["FS_ID"],
+    "MOUNT_BROKER_FN": e["BROKER_FN"],
+    "MOUNT_PATH": "/mnt/user" if e["FS_ID"] else "",
+}
+net = {"networkMode": "PUBLIC"}
+if e["SUBNETS"]:
+    net = {"networkMode": "VPC", "networkModeConfig": {
+        "subnets": [x for x in e["SUBNETS"].split(",") if x],
+        "securityGroups": [e["SG"]]}}
+print(json.dumps({
+    "agentRuntimeName": e["RNAME"],
+    "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": e["IMAGE"]}},
+    "roleArn": e["ROLE"],
+    "networkConfiguration": net,
+    "protocolConfiguration": {"serverProtocol": "HTTP"},
+    "environmentVariables": {k: v for k, v in env.items() if v},
+    # Inbound CUSTOM_JWT: the platform verifies the caller and hands the agent a workload
+    # token derived from that identity, so the agent never names a user itself.
+    "authorizerConfiguration": {"customJWTAuthorizer": {
+        "discoveryUrl": e["ISSUER"] + "/.well-known/openid-configuration",
+        "allowedClients": [e["CLIENT"]]}},
+}))
+PYEOF
+)"
+
+  rid="$(aws bedrock-agentcore-control list-agent-runtimes \
+    --query "agentRuntimes[?agentRuntimeName=='$rname'].agentRuntimeId" --output text 2>/dev/null | head -1)"
+  if [ -n "$rid" ] && [ "$rid" != "None" ]; then
+    # update takes the id instead of the name, and replaces rather than patches — which is
+    # why every field above is sent every time.
+    acp update_agent_runtime "$(RID="$rid" P="$params" uv run python -c '
+import json, os
+p = json.loads(os.environ["P"]); p.pop("agentRuntimeName", None)
+p["agentRuntimeId"] = os.environ["RID"]
+# Update-only: the service rejects requireServiceS3Endpoint at creation time. Setting it
+# here gives AgentCore a service-managed S3 gateway endpoint, which costs nothing (a
+# gateway endpoint, not an interface one) and keeps its own S3 traffic off the NAT.
+nmc = (p.get("networkConfiguration") or {}).get("networkModeConfig")
+if nmc:
+    nmc["requireServiceS3Endpoint"] = True
+print(json.dumps(p))')" >/dev/null
+    echo "  updated $rname ($rid)"
+  else
+    rid="$(acp create_agent_runtime "$params" | uv run python -c 'import json,sys;print(json.load(sys.stdin)["agentRuntimeId"])')"
+    echo "  created $rname ($rid)"
   fi
+  ctx_set runtime_id "$rid"
 
-  # The router's AGENTCORE_RUNTIME_ARN was synthesised before the runtime existed
-  # (a PLACEHOLDER), so re-deploy it now that the real id is known — otherwise the
-  # webhook invokes a non-existent runtime.
+  for _ in $(seq 1 40); do
+    [ "$(aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$rid" \
+         --query status --output text 2>/dev/null)" = "READY" ] && break
+    sleep 5
+  done
+  echo "  status: $(aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$rid" --query status --output text 2>/dev/null)"
+
+  # The router's AGENTCORE_RUNTIME_ARN was synthesised before the runtime existed (a
+  # PLACEHOLDER), so re-deploy it now that the real id is known.
   log "Router — re-deploy with the real runtime ARN"
-  $CDK deploy "$PREFIX-router" --require-approval never
+  $CDK deploy "$PREFIX-router" -c "files_storage=$FILES_STORAGE" --require-approval never
 
-  # AgentCore keeps serving existing sessions from the OLD container instance, so
-  # stored session ids would pin users to the previous image. Drop them: the next
-  # message starts a new session on the just-deployed version.
+  # AgentCore keeps serving existing sessions from the OLD container, so stored session
+  # ids would pin users to the previous image. Drop them: the next message starts a new
+  # session on the just-deployed version.
   log "Sessions — drop stored ids so users land on the new version"
   local n=0
   for pk in $(aws dynamodb scan --table-name "$PREFIX-identity" \
@@ -262,14 +280,24 @@ phase3_gateway() {
     --query "items[?name=='${PREFIX}-websearch-gw'].gatewayId" --output text 2>/dev/null || true)"
   if [ -z "$gid" ] || [ "$gid" = "None" ]; then
     echo "  creating gateway"
-    gid="$(aws bedrock-agentcore-control create-gateway --region "$ws_region" \
-      --name "${PREFIX}-websearch-gw" \
-      --protocol-type MCP \
-      --protocol-configuration '{"mcp":{"supportedVersions":["2025-11-25"],"sessionConfiguration":{"sessionTimeoutInSeconds":3600}}}' \
-      --role-arn "$grole" \
-      --authorizer-type CUSTOM_JWT \
-      --authorizer-configuration "{\"customJWTAuthorizer\":{\"discoveryUrl\":\"$issuer/.well-known/openid-configuration\",\"allowedClients\":[\"$client\"]}}" \
-      --query gatewayId --output text)"
+    gid="$(acp create_gateway "$(ACP_NAME="${PREFIX}-websearch-gw" ACP_ROLE="$grole" \
+        ACP_ISSUER="$issuer" ACP_CLIENT="$client" uv run python -c '
+import json, os
+e = os.environ
+print(json.dumps({
+    "name": e["ACP_NAME"],
+    "protocolType": "MCP",
+    "protocolConfiguration": {"mcp": {
+        "supportedVersions": ["2025-11-25"],
+        # Without this the gateway issues no Mcp-Session-Id and every tools/call
+        # cold-starts a fresh downstream microVM (measured; see docs).
+        "sessionConfiguration": {"sessionTimeoutInSeconds": 3600}}},
+    "roleArn": e["ACP_ROLE"],
+    "authorizerType": "CUSTOM_JWT",
+    "authorizerConfiguration": {"customJWTAuthorizer": {
+        "discoveryUrl": e["ACP_ISSUER"] + "/.well-known/openid-configuration",
+        "allowedClients": [e["ACP_CLIENT"]]}},
+}))')" "$ws_region" | uv run python -c 'import json,sys;print(json.load(sys.stdin)["gatewayId"])')"
     # A gateway is briefly CREATING; targets can't be added until it settles.
     for _ in $(seq 1 30); do
       [ "$(aws bedrock-agentcore-control get-gateway --region "$ws_region" \
@@ -287,11 +315,18 @@ phase3_gateway() {
     --output text 2>/dev/null || true)"
   if [ -z "$tid" ] || [ "$tid" = "None" ]; then
     echo "  creating web-search target"
-    tid="$(aws bedrock-agentcore-control create-gateway-target --region "$ws_region" \
-      --gateway-identifier "$gid" --name web-search-tool \
-      --target-configuration '{"mcp":{"connector":{"source":{"connectorId":"web-search"},"configurations":[{"name":"WebSearch","parameterValues":{}}]}}}' \
-      --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]' \
-      --query targetId --output text)"
+    tid="$(acp create_gateway_target "$(ACP_GID="$gid" uv run python -c '
+import json, os
+print(json.dumps({
+    "gatewayIdentifier": os.environ["ACP_GID"],
+    "name": "web-search-tool",
+    # The tool name must be WebSearch, and parameterValues has to be present even when
+    # empty ({} = no domain filter) — the API rejects a config entry without it.
+    "targetConfiguration": {"mcp": {"connector": {
+        "source": {"connectorId": "web-search"},
+        "configurations": [{"name": "WebSearch", "parameterValues": {}}]}}},
+    "credentialProviderConfigurations": [{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
+}))')" "$ws_region" | uv run python -c 'import json,sys;print(json.load(sys.stdin)["targetId"])')"
   fi
   echo "  target: $tid"
 

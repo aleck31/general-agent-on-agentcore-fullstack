@@ -20,11 +20,16 @@ import base64
 import json
 import logging
 import os
+import re
 import shlex
 import time
+import urllib.parse
+import urllib.request
 
 import boto3
 from botocore.config import Config
+
+import cognito
 
 logger = logging.getLogger()
 
@@ -61,7 +66,10 @@ FS_ID="${S3FILES_FS_ID:?}"
 TICKET_FILE="${MOUNT_TICKET_FILE:-/dev/shm/mount_ticket}"
 AP_FILE="${MOUNT_AP_FILE:-/dev/shm/mount_ap}"
 PROFILE=mount
-HELPER="python3 /app/cred_helper.py"
+# The absolute interpreter, not a bare `python3`: the mount helper runs under the system
+# python (which has botocore but not boto3) and spawns credential_process with its own
+# PATH, so a relative name resolves to the wrong interpreter and the import fails.
+HELPER="/usr/bin/python3.11 /app/cred_helper.py"
 
 if findmnt -T "$MOUNT_PATH" >/dev/null 2>&1; then echo "already mounted"; exit 0; fi
 
@@ -76,7 +84,10 @@ printf '[profile %s]\ncredential_process = %s\n' "$PROFILE" "$HELPER" > /root/.a
 
 # First call creates this user's Access Point if it is new and reports its id; later
 # refreshes reuse the id from the file and never create anything.
-"$HELPER" --provision > "$AP_FILE"
+# $HELPER unquoted on purpose: it is "python3 /app/cred_helper.py", so quoting it would
+# make the shell look for a single command with a space in its name.
+# shellcheck disable=SC2086
+$HELPER --provision > "$AP_FILE"
 AP_ID="$(cat "$AP_FILE")"
 
 mkdir -p "$MOUNT_PATH"
@@ -109,44 +120,48 @@ def sign_ticket(actor_id: str) -> str:
 def bootstrap(session_id: str, actor_id: str) -> bool:
     """Mount this user's files into the session. True if the mount is in place.
 
-    Runs the bootstrap through `InvokeAgentRuntimeCommand`, which starts the session's
-    microVM if it is not already running — so this doubles as the warm-up for a new
-    session. Safe to call again: the script exits early when the mount is present."""
+    Over HTTPS with the user's own Cognito JWT, not through boto3: the Runtime is
+    configured CUSTOM_JWT, and SigV4 against it is refused outright with "Authorization
+    method mismatch" (verified on a real deployment — the same mutual exclusivity that
+    makes the router invoke /invocations this way). The command endpoint is
+    POST /runtimes/{arn}/commands.
+
+    Starting the command also starts the session's microVM, so this doubles as the warm-up
+    for a new session. Safe to call again: the script exits early when the mount is
+    present."""
     if not enabled():
         return False
     command = " ".join([
         "bash", "-c", shlex.quote(_BOOTSTRAP), "bootstrap",
         shlex.quote(sign_ticket(actor_id)),
     ])
-    client = boto3.client("bedrock-agentcore", region_name=_REGION, config=_RETRY)
+    url = (f"https://bedrock-agentcore.{_REGION}.amazonaws.com/runtimes/"
+           f"{urllib.parse.quote(RUNTIME_ARN, safe='')}/commands"
+           f"?qualifier={urllib.parse.quote(QUALIFIER)}")
+    req = urllib.request.Request(
+        url, method="POST",
+        data=json.dumps({"command": command, "timeout": BOOTSTRAP_TIMEOUT}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cognito.user_jwt(actor_id)}",
+            "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id,
+        },
+    )
     try:
-        resp = client.invoke_agent_runtime_command(
-            agentRuntimeArn=RUNTIME_ARN, qualifier=QUALIFIER,
-            runtimeSessionId=session_id,
-            body={"command": command, "timeout": BOOTSTRAP_TIMEOUT},
-        )
+        with urllib.request.urlopen(req, timeout=BOOTSTRAP_TIMEOUT + 30) as r:
+            raw = r.read().decode(errors="replace")
     except Exception:  # noqa: BLE001 — no mount means no file tools, not a failed turn
-        logger.exception("mount bootstrap could not be started for %s", actor_id)
+        logger.exception("mount bootstrap failed for %s", actor_id)
         return False
 
-    exit_code, err = None, []
-    try:
-        for event in resp["stream"]:
-            chunk = event.get("chunk", {})
-            if "contentDelta" in chunk:
-                # stdout is only the mount table and progress lines; stderr is what
-                # matters when this goes wrong, so keep it and log it once.
-                if chunk["contentDelta"].get("stderr"):
-                    err.append(chunk["contentDelta"]["stderr"])
-            elif "contentStop" in chunk:
-                exit_code = chunk["contentStop"].get("exitCode")
-    except Exception:  # noqa: BLE001
-        logger.exception("mount bootstrap stream failed for %s", actor_id)
-        return False
-
-    if exit_code == 0:
+    # The response is an AWS event stream. Only two things matter: the exit code, and
+    # whatever went to stderr if it is not zero — so scan the JSON fragments rather than
+    # decode the framing.
+    codes = [int(m) for m in re.findall(r'"exitCode"\s*:\s*(-?\d+)', raw)]
+    if codes and codes[-1] == 0:
         logger.info("mount ready at %s for %s", MOUNT_PATH, actor_id)
         return True
+    errs = "".join(re.findall(r'"stderr"\s*:\s*"(.*?)"', raw))[:500]
     logger.error("mount bootstrap failed for %s (exit %s): %s",
-                 actor_id, exit_code, ("".join(err))[:500])
+                 actor_id, codes[-1] if codes else "unknown", errs)
     return False

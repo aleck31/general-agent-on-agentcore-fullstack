@@ -128,29 +128,39 @@ done
 # One per user, created on first mount — so CloudFormation has never heard of them, and
 # deleting the file system while they exist either fails or orphans them. They also keep
 # the file system undeletable, which then blocks the whole storage stack.
+#
+# Done through boto3 rather than `aws s3files`: that subcommand is missing from AWS CLI
+# 2.34 (verified), so a CLI-based delete fails silently on an otherwise current machine.
+# The service itself is fine — the API answers, the CLI just has no word for it yet.
 if aws cloudformation describe-stacks --stack-name "$PREFIX-storage" >/dev/null 2>&1; then
   log "S3 Files — per-user access points"
   fs_id="$(aws cloudformation describe-stacks --stack-name "$PREFIX-storage" \
     --query "Stacks[0].Outputs[?OutputKey=='FileSystemId'].OutputValue" \
     --output text 2>/dev/null)"
   if [ -n "$fs_id" ] && [ "$fs_id" != "None" ]; then
-    n=0
-    while :; do
-      # List rather than remember: the broker is stateless and keeps no index.
-      aps="$(aws s3files list-access-points --file-system-id "$fs_id" \
-        --query 'accessPoints[].accessPointId' --output text 2>/dev/null || true)"
-      [ -n "$aps" ] && [ "$aps" != "None" ] || break
-      for ap in $aps; do
-        aws s3files delete-access-point --access-point-id "$ap" >/dev/null 2>&1 \
-          && { echo "  deleted access point $ap"; n=$((n+1)); } \
-          || warn "  (access point $ap delete failed)"
-      done
-      # Paginated listing plus deletion is awkward to combine, so re-list until empty —
-      # bounded because every pass deletes something or breaks out.
-      [ "$n" -gt 0 ] || break
-      sleep 2
-    done
-    echo "  $n access point(s) removed; the files themselves stay in the bucket"
+    FS_ID="$fs_id" uv run --with boto3 python - <<'PYEOF' || warn "  (access point cleanup failed)"
+import os, boto3
+fs = os.environ["FS_ID"]
+c = boto3.client("s3files")
+n, token = 0, None
+while True:
+    kw = {"fileSystemId": fs, "maxResults": 100}
+    if token:
+        kw["nextToken"] = token
+    page = c.list_access_points(**kw)
+    for ap in page.get("accessPoints", []):
+        ap_id = ap["accessPointId"]
+        try:
+            c.delete_access_point(accessPointId=ap_id)
+            print(f"  deleted access point {ap_id} ({(ap.get('rootDirectory') or {}).get('path','?')})")
+            n += 1
+        except Exception as e:
+            print(f"  access point {ap_id} delete failed: {type(e).__name__}")
+    token = page.get("nextToken")
+    if not token:
+        break
+print(f"  {n} access point(s) removed; the files themselves stay in the bucket")
+PYEOF
   fi
 fi
 

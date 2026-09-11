@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3.11
 """credential_process helper for the per-user file mount.
 
 The only piece of the mount machinery baked into the image. It has to be, because the

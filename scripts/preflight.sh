@@ -75,7 +75,10 @@ probe iam            aws iam list-roles --max-items 1
 # enough that an old CLI simply has no such command — which is worth catching before a
 # deploy that creates a VPC.
 if [ "${FILES_STORAGE:-false}" = "true" ]; then
-  probe s3files aws s3files list-file-systems --max-results 1
+  # boto3, not `aws s3files`: that subcommand is absent from AWS CLI 2.34, so probing it
+  # through the CLI reports a denial where the real problem is the CLI's vocabulary.
+  probe s3files uv run --with boto3 python -c \
+    "import boto3; boto3.client('s3files').list_file_systems(maxResults=1)"
   probe kms     aws kms list-keys --limit 1
   probe ec2     aws ec2 describe-vpcs --max-items 1
 fi
@@ -95,3 +98,4 @@ echo "  account : $ACCOUNT"
 echo "  region  : $REGION${PROFILE:+   profile: $PROFILE}"
 echo "  model   : $MODEL"
 echo "  search  : $WEB_SEARCH$([ "$WEB_SEARCH" = "true" ] && echo '  (+ a gateway in us-east-1)')"
+echo "  files   : ${FILES_STORAGE:-false}$([ "${FILES_STORAGE:-false}" = "true" ] && echo "  (creates a VPC + NAT — the only fixed monthly cost)" || true)"

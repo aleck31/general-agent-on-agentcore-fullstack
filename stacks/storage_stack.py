@@ -77,13 +77,47 @@ class StorageStack(Stack):
             peer=self.runtime_sg, connection=ec2.Port.tcp(_NFS_PORT),
             description="NFS from the agent Runtime")
 
-        # --- The file system over the existing user-files bucket. `prefix` keeps every
-        # user's tree under one key prefix, so the bucket stays usable for other things.
+        # --- The file system over the user-files bucket, and the role it uses to move
+        # data in and out of that bucket.
+        # Trusted by elasticfilesystem, NOT s3files: S3 Files runs on the EFS control
+        # plane (hence mount.s3files coming from amazon-efs-utils and the
+        # elasticfilesystem:Client* aliases), and IAM rejects s3files.amazonaws.com as an
+        # unknown principal. The conditions keep the trust to file systems in this
+        # account and region, since the principal itself is a whole other service.
         self.fs_role = iam.Role(
             self, "FileSystemRole",
-            assumed_by=iam.ServicePrincipal("s3files.amazonaws.com"),
-            description="Lets S3 Files read and write the user-files bucket")
-        user_files_bucket.grant_read_write(self.fs_role, "users/*")
+            assumed_by=iam.ServicePrincipal(
+                "elasticfilesystem.amazonaws.com",
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": account},
+                    "ArnLike": {
+                        "aws:SourceArn":
+                            f"arn:aws:s3files:{region}:{account}:file-system/*"},
+                }),
+            description="Lets S3 Files move data between the file system and the bucket")
+        # Whole bucket, not just users/*: the file system spans the bucket, and each
+        # user's confinement comes from their Access Point instead. This role is assumable
+        # only by the service, never by the agent.
+        #
+        # Ported from the reference implementation rather than left to grant_read_write:
+        # the service also needs ListBucketVersions, and it manages EventBridge rules for
+        # bucket/file-system synchronisation under a fixed name prefix. The ResourceAccount
+        # conditions keep the role from reaching a bucket in another account.
+        user_files_bucket.grant_read_write(self.fs_role)
+        self.fs_role.add_to_policy(iam.PolicyStatement(
+            actions=["s3:ListBucket", "s3:ListBucketVersions"],
+            resources=[user_files_bucket.bucket_arn],
+            conditions={"StringEquals": {"aws:ResourceAccount": account}}))
+        self.fs_role.add_to_policy(iam.PolicyStatement(
+            actions=["events:PutRule", "events:PutTargets", "events:DeleteRule",
+                     "events:DisableRule", "events:EnableRule", "events:RemoveTargets"],
+            resources=["arn:aws:events:*:*:rule/DO-NOT-DELETE-S3-Files*"],
+            conditions={"StringEquals": {
+                "events:ManagedBy": "elasticfilesystem.amazonaws.com"}}))
+        self.fs_role.add_to_policy(iam.PolicyStatement(
+            actions=["events:DescribeRule", "events:ListRules",
+                     "events:ListRuleNamesByTarget", "events:ListTargetsByRule"],
+            resources=["arn:aws:events:*:*:rule/*"]))
 
         # `prefix` is deliberately not set. The layout is decided in exactly one place —
         # each Access Point's rootDirectory (/users/<actor>) — and scoping the file
@@ -91,16 +125,43 @@ class StorageStack(Stack):
         # confirm without deploying. One source of truth is worth more here.
         self.file_system = s3files.CfnFileSystem(
             self, "FileSystem",
-            bucket=user_files_bucket.bucket_name,
+            # The bucket ARN, not its name: CloudFormation validates this against
+            # ^(arn:aws[a-zA-Z0-9-]*:s3:::.+)$ and rejects a bare name.
+            bucket=user_files_bucket.bucket_arn,
             role_arn=self.fs_role.role_arn,
             # The bucket is ours and holds only what this agent wrote, so the warning
             # about pointing a file system at an existing bucket is expected.
             accept_bucket_warning=True,
         )
+        # A resource-policy Deny that no identity policy can override: mounting is refused
+        # whenever s3files:AccessPointArn is absent, i.e. nobody may mount the file system
+        # root. The STS session policy already scopes each session's credentials to one
+        # Access Point; this closes the root escape structurally, so a later mistake in an
+        # identity policy cannot reopen it. Ported from the reference implementation.
+        s3files.CfnFileSystemPolicy(
+            self, "FileSystemPolicy",
+            file_system_id=self.file_system.ref,
+            policy={
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Sid": "DenyMountWithoutAccessPoint",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": ["s3files:ClientMount", "s3files:ClientWrite",
+                               "s3files:ClientRootAccess"],
+                    "Condition": {"Null": {"s3files:AccessPointArn": "true"}},
+                }],
+            },
+        )
+
         for i, subnet in enumerate(self.vpc.select_subnets(
                 subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS).subnets):
             s3files.CfnMountTarget(
                 self, f"MountTarget{i}",
+                # .ref (the ARN) on purpose: the mount target accepts it, and switching
+                # to the bare id would replace the resource — which S3 Files rejects,
+                # because it allows only one mount target per availability zone and
+                # CloudFormation creates the replacement before deleting the original.
                 file_system_id=self.file_system.ref,
                 subnet_id=subnet.subnet_id,
                 security_groups=[self.mount_sg.security_group_id],
@@ -133,7 +194,9 @@ class StorageStack(Stack):
             memory_size=256,
             log_retention=retention_days(log_days),
             environment={
-                "FILE_SYSTEM_ID": self.file_system.ref,
+                # attr_file_system_id, not .ref: Ref on this resource returns the ARN,
+                # and both the mount command and the access-point ARN need the fs-… id.
+                "FILE_SYSTEM_ID": self.file_system.attr_file_system_id,
                 "KMS_KEY_ID": self.ticket_key.key_arn,
                 "ACCOUNT_ID": account,
             },
@@ -163,12 +226,16 @@ class StorageStack(Stack):
         self.broker.add_environment("MOUNT_ROLE_ARN", self.mount_role.role_arn)
         self.mount_role.grant_assume_role(self.broker.grant_principal)
         self.broker.add_to_role_policy(iam.PolicyStatement(
+            # TagResource is required because create_access_point tags the Access Point
+            # with its actor — without it the create fails with AccessDenied on the tag,
+            # not on the create (matching the reference implementation's policy).
             actions=["s3files:CreateAccessPoint", "s3files:GetAccessPoint",
+                     "s3files:TagResource",
                      "s3files:ListAccessPoints", "s3files:DeleteAccessPoint"],
             resources=["*"],  # Access Point ids are not known until they are created.
         ))
 
-        CfnOutput(self, "FileSystemId", value=self.file_system.ref)
+        CfnOutput(self, "FileSystemId", value=self.file_system.attr_file_system_id)
         CfnOutput(self, "TicketKeyArn", value=self.ticket_key.key_arn)
         CfnOutput(self, "BrokerFunctionName", value=self.broker.function_name)
         CfnOutput(self, "RuntimeSecurityGroupId",

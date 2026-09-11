@@ -4,6 +4,9 @@ cdk.out/
 .cdk.staging/
 # per-deployment state written by deploy.sh (runtime/gateway/memory ids)
 .cdk-state.json
+# environment lookups CDK caches (AZ list per account) — same reason: it carries the
+# account id and one account's topology, and a deploy can always re-resolve it
+cdk.context.json
 
 # Python
 .venv/

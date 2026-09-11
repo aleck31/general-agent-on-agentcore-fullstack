@@ -98,7 +98,12 @@ router = RouterStack(
     app,
     f"{prefix}-router",
     mount_ticket_key_arn=storage.ticket_key.key_arn if storage else "",
-    s3files_file_system_id=storage.file_system.ref if storage else "",
+    # From .cdk-state.json rather than a cross-stack export: the id is assigned by AWS,
+    # so provision.sh reads it back after the storage stack exists and re-deploys the
+    # router — the same path runtime_id and the gateway URL already take. A CDK export
+    # would also deadlock on removal, since the producer cannot drop an export the router
+    # still imports.
+    s3files_file_system_id=ctx("files_file_system_id") or "",
     runtime_arn=agentcore.runtime_arn,
     runtime_endpoint_qualifier=ctx("runtime_endpoint_id") or "DEFAULT",
     lark_secret_name=security.lark_secret.secret_name,
