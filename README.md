@@ -1,8 +1,23 @@
-# Lark Identity on AgentCore — AgentCore Identity
+# Lark Agent on AgentCore — a full-stack agent sample
 
-A reference implementation of enterprise identity on Amazon Bedrock AgentCore, using **Lark (Feishu) as the identity provider**. A simple agent is reachable from **Lark bot chat**; every message resolves to a `lark:{open_id}` identity, and downstream MCP tools **act as that user against Lark** with the user's own token — so they reach only what that user can, and Lark itself adjudicates access. The agent inherits both *who you are* and *what you're allowed to do*, adding nothing of its own.
+A general-purpose agent on **Amazon Bedrock AgentCore**, with **Lark (Feishu) as its interaction channel**. The agent runs on AgentCore Runtime (Strands + Bedrock), keeps conversation history in AgentCore Memory, reaches its tools over MCP, and answers in Lark chat — typed into a streaming card as it is produced, because a real task outlasts any request/response window.
 
-This is the **AgentCore Identity** variant: per-user Lark tokens live in the **AgentCore Identity Token Vault** (OAuth 3LO), which stores, refreshes, and injects each user's token natively — no custom interceptor, no self-managed token store. The sibling repo [lark-agententity-on-agentcore-interceptor](https://github.com/aws-samples/sample-lark-agententity-on-agentcore-interceptor) achieves the same guarantees with a Gateway Request Interceptor and self-managed vaulting; the two differ only in how the downstream hop resolves per-user credentials.
+Its identity foundation is the part most agent samples skip: every message resolves to `lark:{open_id}`, and any tool that touches a user's data acts **as that user**, with the user's own token from the AgentCore Identity Token Vault (OAuth 3LO). So the agent inherits both *who you are* and *what you're allowed to do*, adding nothing of its own — Lark itself adjudicates access, and there is no parallel permission layer to keep in sync.
+
+That identity integration is deliberately not re-documented here. Two samples cover it in full: [sample-lark-identity-on-agentcore-native](https://github.com/aws-samples/sample-lark-identity-on-agentcore-native) (the native Token Vault path this repo uses) and [sample-lark-identity-on-agentcore-interceptor](https://github.com/aws-samples/sample-lark-identity-on-agentcore-interceptor) (same guarantees via a Gateway Request Interceptor and self-managed vaulting). Read either for the per-hop reasoning; this repo documents only what you need to run and extend the agent.
+
+## What it does today
+
+| Capability | How |
+|---|---|
+| Conversational agent in Lark chat | Strands agent on AgentCore Runtime; webhook in, streaming card out |
+| Memory across containers | AgentCore Memory (STM), keyed per user and per thread — a fresh microVM still remembers |
+| Tools as the calling user | MCP server running the official `lark-cli` with that user's vaulted `user_access_token` |
+| Long-running turns | The turn is accepted, runs in the background, and posts its own answer — no synchronous wait to time out |
+| Per-user consent, self-healing | First use posts a 点击授权 link and replays the original message once consent lands; the user never re-sends |
+| Web search *(optional)* | AgentCore Gateway fronting the built-in Web Search connector — no user identity involved |
+| Unattended decisions *(optional)* | Approval events wake a turn with nobody present; limits enforced in code, not by the model |
+| Operational visibility | Chat commands expose session routing, the serving microVM, memory thread and authorization state |
 
 ## Architecture
 
@@ -31,7 +46,7 @@ This is the **AgentCore Identity** variant: per-user Lark tokens live in the **A
   approval, and continues on its own, so the user never re-sends.
 ```
 
-See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop auth, and the consent-wait sequence; **[docs/agentcore-behavior.md](docs/agentcore-behavior.md)** and **[docs/native-3lo-builtin-vendor.md](docs/native-3lo-builtin-vendor.md)** for why 3LO is agent-side (a choice — the Gateway can do per-user 3LO for a `CustomOauth2` provider once its role has the Identity permissions, verified @2026-08-19) and how to add other downstream systems.
+See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop auth, and the consent-wait sequence; **[docs/agentcore-behavior.md](docs/agentcore-behavior.md)** for measured AgentCore Runtime/Gateway behavior (read this before debugging anything platform-level); **[docs/native-3lo-builtin-vendor.md](docs/native-3lo-builtin-vendor.md)** for the reusable recipe to give the agent access to *another* downstream system.
 
 ## Layout
 
@@ -40,16 +55,14 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 | `app.py`, `cdk.json` | CDK app (uv-managed deps) — 6 stacks. Deployment state goes to `.cdk-state.json`, not here |
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
 | `stacks/` | security, agentcore, router, shim, gateway, observability |
-| `agent/` | Strands agent container: HTTP contract + AgentCore Memory + agent-side 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers back into a card (`lark_notify`) |
-| `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands |
+| `agent/` | the agent container: HTTP contract + AgentCore Memory + per-user 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers into a card (`lark_notify`) |
+| `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands. Also the only component that mints per-user JWTs (`cognito.py`) |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
 | `mcp-servers/` | One directory per MCP server, one Runtime each: `lark-cli/` acts as the user against Lark, `approval/` runs approval decisions on the app identity. Each declares its own build/runtime config in `runtime.env`, so adding a server needs no script change |
 | `deploy.sh` | the deploy entry point — orders the steps in `scripts/` |
 | `scripts/` | step implementations: preflight / provision (base/runtime/gateway) / build-mcp / setup-3lo / setup-lark / subscribe-approvals / manage-allowlist / destroy |
 | `tests/` | `run.sh` (all unit suites) + e2e smoke tests that need a deployed stack |
-| `docs/architecture.md` | full architecture (core flow updated to the native path; some sections marked legacy) |
-| `docs/agentcore-behavior.md` | measured AgentCore Gateway/Runtime behavior, incl. the IAM permissions Gateway per-user 3LO actually needs |
-| `docs/native-3lo-builtin-vendor.md` | reusable agent-driven 3LO reference (built-in vendors **and** CustomOauth2) — how to add a downstream system |
+| `probe/` | a measurement MCP server, not part of the deployed agent — how the findings in `docs/agentcore-behavior.md` were established |
 
 ## Deploy
 
@@ -60,7 +73,7 @@ cp .env.example .env          # deployment target (PROFILE/REGION/MODEL_ID) + La
 ./deploy.sh                   # everything, in order — ends by printing the two URLs to register in Lark
 ```
 
-That's the whole deploy. It runs six steps in dependency order and nothing stops to ask you anything: the two values you must paste into the Lark console don't block the deploy, they only gate the bot at runtime, so they're printed together at the end (`./deploy.sh urls` reprints them).
+That's the whole deploy. It runs the steps in dependency order and nothing stops to ask you anything: the two values you must paste into the Lark console don't block the deploy, they only gate the bot at runtime, so they're printed together at the end (`./deploy.sh urls` reprints them).
 
 Individual steps, for iterating — each is idempotent, so re-running any of them is safe:
 
@@ -76,7 +89,7 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 
 Order matters in one place: `3lo` and `gateway` precede `runtime`, because the agent Runtime is created with the provider name and the gateway URL baked into its environment. `deploy.sh` handles that; the underlying implementations are in `scripts/`.
 
-`setup-3lo.sh` registers the OAuth credential provider (Lark behind the RFC-6749 shim) plus the agent's workload identity, and prints the provider `callbackUrl` — register that in the Lark console (step 4 below) before the first 3LO consent. See `docs/native-3lo-builtin-vendor.md` to add other downstream systems.
+`setup-3lo.sh` registers the OAuth credential provider (Lark behind the RFC-6749 shim) plus the agent's workload identity, and prints the provider `callbackUrl` — register that in the Lark console (step 4 below) before the first 3LO consent.
 
 Per-deployment ids (runtime/gateway) go to `.cdk-state.json` (gitignored), so `cdk.json` stays free of environment state.
 
@@ -96,7 +109,7 @@ Two consequences worth knowing: deleting the provider **purges every user's vaul
 ## Lark console setup
 
 1. **Add features**: enable **Bot**.
-2. **Permissions & Scopes** — two groups, and the split is the whole point of this sample: the bot speaks with its own identity, while anything touching a user's data acts as that user.
+2. **Permissions & Scopes** — two groups, and the split is what makes the identity model real: the bot speaks with its own identity, while anything touching a user's data acts as that user.
 
    **Tenant token scopes** (the bot acting as itself — receiving webhooks, replying, reacting):
 
@@ -119,14 +132,14 @@ Two consequences worth knowing: deleting the provider **purges every user's vaul
    | `docx:document` | read/write the user's documents |
    | `offline_access` | issue a refresh token, so the vaulted grant survives without re-consent |
 
-   Nothing in the first group can read a user's documents, and nothing in the second is ever used to speak as the bot — `LARKSUITE_CLI_DEFAULT_AS=user` keeps the MCP server on the user's token exclusively.
+   Nothing in the first group can read a user's documents, and nothing in the second is ever used to speak as the bot — `LARKSUITE_CLI_DEFAULT_AS=user` keeps the MCP server on the user's token exclusively. Widening what the agent can *do* for a user means adding user-token scopes here and to `LARK_SCOPES`; every user then re-consents once.
 3. **Events & Callbacks**: Request URL = the webhook URL from deploy output; enable Encryption; add `im.message.receive_v1`. For the approval demo also add **审批任务状态变更** (`approval_task`) — and note that ticking it here is not enough on its own, see below.
 4. **Security Settings → Redirect URLs**: add the OAuth credential provider's `callbackUrl` (`https://bedrock-agentcore.<region>.amazonaws.com/identities/oauth2/callback/<uuid>`, from `get-oauth2-credential-provider --name lark-agent-3lo`). This is where AgentCore Identity receives the 3LO code — not the shim URL.
 5. **Publish** a version (re-publish after any scope/event change).
 
 ### Optional: the approval demo
 
-Off by default. It shows what to do when a downstream API *refuses* to accept the user's identity — Lark's approval endpoints take only an app token, so a decision is made by the app with a `user_id` saying whose name to record it under. Read [docs/architecture.md](docs/architecture.md#a-third-path-approvals-where-the-users-identity-cannot-be-passed-through) before switching it on: the limits are self-imposed, and what they can and cannot prevent is the point of the demo.
+Off by default. It shows what an agent must do when a downstream API *refuses* to accept the user's identity — Lark's approval endpoints take only an app token, so a decision is made by the app with a `user_id` saying whose name to record it under. Read [docs/architecture.md](docs/architecture.md#a-third-path-approvals-where-the-users-identity-cannot-be-passed-through) before switching it on: the limits are self-imposed, and what they can and cannot prevent is the point of the demo.
 
 To enable:
 
@@ -183,6 +196,29 @@ The three session commands exist because **the runtime session and the Memory th
 
 Authorization is a third, orthogonal dimension: the vaulted Lark token is keyed to `lark:{open_id}`, not to any session — so `/new` does **not** require re-authorizing. Token Vault refreshes the access token automatically; users only re-authorize if the refresh chain lapses, they revoke access in Lark, or the provider is recreated.
 
+## Extending the agent
+
+The four extension points that need no new plumbing:
+
+| To add | Do this |
+|---|---|
+| A tool server | Create `mcp-servers/<name>/` with a `Dockerfile`, a server speaking MCP on `:8000`, and a `runtime.env` (`RUNTIME_SUFFIX`, `IMAGE_TAG`, `RUNTIME_ENV_MAP`, optional `DEPLOY_IF` gate and `REQUIRE_VARS`), then `./deploy.sh mcp <name>`. `scripts/build-mcp.sh` needs no edit — each server describes itself. The agent must be pointed at the new Runtime's URL, the way `APPROVAL_MCP_URL` is in `scripts/provision.sh` |
+| A downstream system with its own login | Register an OAuth credential provider and append an `IDP_REGISTRY` entry — `/auth` then reports it and `/auth <key>` consents to it. Built-in vendors need no shim; anything non-standard needs one like `lambda/shim/`. Recipe: `docs/native-3lo-builtin-vendor.md` |
+| A different model | `MODEL_ID` in `.env` (falls back to `default_model_id` in `cdk.json`), then `./deploy.sh runtime` |
+| A different system prompt | `AGENT_SYSTEM_PROMPT` on the agent Runtime. Note the deploy script does not set it today, so the default in `agent/agent_core.py` applies until you pass it through `scripts/provision.sh` |
+
+Two structural constraints shape anything larger. **One Runtime per MCP server** — `protocolConfiguration.serverProtocol` is a single value and a container exposes one MCP endpoint, so tools are grouped by trust boundary rather than packed together, which is why `lark-cli` (acts as the user) and `approval` (acts as the app) are separate servers. And **a Runtime-hosted MCP server cannot receive a per-user token from the Gateway**, so the agent fetches tokens itself and passes them in a custom header; a tool server on an addressable HTTPS endpoint could use the managed Gateway path instead. Both are explained in `docs/agentcore-behavior.md`.
+
+## Roadmap
+
+Not implemented yet — listed so the current shape isn't mistaken for the intended one. Directions, not commitments:
+
+- **Agent framework: Strands → LangGraph.** The turn loop is Strands today (`agent/agent_core.py`), chosen for its AgentCore Memory and MCP integrations; the plan is to move to LangGraph for a more portable, widely-used graph model. What that touches is contained by design — the HTTP contract (`agent/server.py`), the identity layer (`lark_3lo`), the tool servers and the channel all sit outside the loop. The two real coupling points are the `AgentCoreMemorySessionManager` (Strands-specific, so history persistence needs a LangGraph equivalent or a checkpointer over Memory) and the token-stream shape that feeds the streaming card.
+- **More interaction surfaces.** Lark chat is the only entrypoint today. A web UI is the obvious next one (the sibling interceptor variant has one; this repo does not), and the router's identity resolution is deliberately channel-shaped (`resolve_user(channel, channel_user_id)`) so a second channel doesn't require reworking it.
+- **A broader tool set.** `mcp-servers/lark-cli/` exposes three tools — whoami, list-my-docs, and a raw Lark API passthrough — chosen to prove per-user access end to end, not to be complete.
+- **More downstream systems.** One OAuth provider per system is already the model; nothing but a provider and an `IDP_REGISTRY` entry is missing for the second one.
+- **Richer Lark interaction.** Interactive cards are used for output streaming only; card callbacks, files and images are unhandled beyond image download scope.
+
 ## Test
 
 ```bash
@@ -196,11 +232,11 @@ Unit tests sit next to the code they cover and mock AWS; `tests/run.sh` walks th
 This deploys billable AWS resources. All the always-on pieces are consumption- or per-unit-priced (no fixed reservation), so an idle single-user demo in us-west-2 is on the order of a couple USD/month before model usage; the variable cost is dominated by the agent's Bedrock calls. Verify current rates on the AWS pricing pages — figures below are as researched, not a quote.
 
 - **Bedrock model invocations** — the main usage-sensitive line; priced per input/output token on the model in `default_model_id`. A chatty demo is cents-to-dollars; a load test is not.
-- **AgentCore Runtime ×2–3** — the agent and the lark-cli MCP server always, plus the approval MCP server if `AGENT_DECIDE_APPROVAL_CODES` is set. Each is metered per-second: CPU (`~$0.0895/vCPU-hour`) only during active processing, memory (`~$0.00945/GB-hour`) continuously while the microVM is alive. So each extra MCP server adds idle memory-time even when nothing calls it — which is why the approval one is gated on that variable rather than always deployed.
-- **AgentCore Identity Token Vault (3LO)** — stores/refreshes/injects each user's Lark token natively. No separate per-user Secrets Manager charge (unlike the interceptor variant) — this is the main cost-structure difference between the two.
+- **AgentCore Runtime ×2–3** — the agent and the lark-cli MCP server always, plus the approval MCP server if `AGENT_DECIDE_APPROVAL_CODES` is set. Each is metered per-second: CPU (`~$0.0895/vCPU-hour`) only during active processing, memory (`~$0.00945/GB-hour`) continuously while the microVM is alive. So each extra MCP server adds idle memory-time even when nothing calls it — which is why the approval one is gated on that variable rather than always deployed, and why grouping tools by trust boundary has a running cost.
+- **AgentCore Identity Token Vault (3LO)** — stores/refreshes/injects each user's Lark token natively. No separate per-user Secrets Manager charge (unlike the interceptor variant).
 - **AgentCore Memory (STM)** — billed per event *written* (`~$0.25 per 1,000` create-event calls), **not** for retention duration.
 - **Lambda + API Gateway** — router (webhook) + shim (OAuth RFC-6749 façade, a backend web service); effectively free at demo volume.
-- **Secrets Manager** — `$0.40/secret/month` each, and only two static secrets: the Lark credentials (`{prefix}/channels/lark`) and the Cognito password salt. This variant does **not** create dynamic per-user secrets.
+- **Secrets Manager** — `$0.40/secret/month` each, and only two static secrets: the Lark credentials (`{prefix}/channels/lark`) and the Cognito password salt. No dynamic per-user secrets.
 - **Web search (optional)** — only when `WEB_SEARCH=true`: an AgentCore Gateway plus per-query connector charges. The gateway sits in us-east-1, so its traffic is cross-region.
 - **Cognito, DynamoDB (on-demand)** — the identity/state plane; negligible at demo volume. (A `user-files` S3 bucket is provisioned but not used on the current tool path — near-zero cost.)
 
@@ -211,7 +247,9 @@ This deploys billable AWS resources. All the always-on pieces are consumption- o
 This is a **reference implementation, not production-ready as-is**. Before any real use:
 
 - **Per-user Lark tokens live in the AgentCore Identity Token Vault**, not in application code or a self-managed store. The agent fetches a user's token at call time (agent-side 3LO) and passes it to the lark-cli MCP server in a custom header; it holds no long-lived credential of its own. Treat the account hosting the vault as sensitive.
+- **Inbound identity is a signed JWT, and the by-name token APIs are denied in IAM** — so the agent cannot act as a user it wasn't handed. That closes credential theft and impersonation; it does not stop a prompt-injected agent from misusing the tools it legitimately has, within that user's own permissions. Action-layer limits in code are what address that (see the approval server).
 - **The MCP server calls Lark strictly as the user.** `LARKSUITE_CLI_DEFAULT_AS=user` — the lark-cli engine always acts with the vaulted `user_access_token`, never the bot identity, so access is scoped to what that user can do in Lark and Lark adjudicates it.
+- **A vaulted token is checked against its actor at point of use.** Consent binds a token to whatever the return-url was told, so forwarding a consent link would otherwise vault someone else's grant under your name; the agent resolves each token's real owner before using it and fails closed.
 - **Command execution is injection-safe.** The MCP server spawns lark-cli via `execFile` (no shell) with arguments passed as an array, and the user token via an environment variable — never interpolated into a command line.
 - **Web search sees no user data.** It runs on Amazon's index with `GATEWAY_IAM_ROLE`, carries no user token, and queries stay inside AWS. It does mean model output can include fetched web content — treat that as untrusted input like any other tool result. `parameterValues.domainFilter` can restrict which domains are searched.
 - **IAM is scoped but a sample.** Re-review least-privilege for your account before production.
@@ -221,10 +259,10 @@ This is a **reference implementation, not production-ready as-is**. Before any r
 
 ### Notes & limitations
 
-- **3LO is agent-side, not Gateway-mediated — because the topology requires it.** Verified @2026-08-19 the Gateway *does* perform per-user 3LO for a `CustomOauth2` provider like Lark (given its execution role carries `bedrock-agentcore:GetResourceOauth2Token` / `GetWorkloadAccessToken*` **and** `secretsmanager:GetSecretValue` on `bedrock-agentcore-identity!default/oauth2/*` — without those it returns one opaque `An internal error occurred`, which earlier notes here mistook for a missing feature). But it can only inject that token into an **addressable HTTPS** downstream: an MCP server hosted on AgentCore Runtime never receives it, because the Runtime's `/invocations` endpoint owns the `Authorization` header for its own transport auth. Our tool servers run on Runtime, so the agent fetches the token and passes it in a custom header. See `docs/agentcore-behavior.md`.
 - **Answers arrive asynchronously.** A turn that researches a topic and writes a document takes longer than any request/response window allows — `InvokeAgentRuntime` and the router's Lambda both cap out, and a turn cut off mid-way is the worst outcome, because the work often completed while the user was told it failed. So the agent accepts the work, returns immediately, and types the answer into a CardKit streaming card as it is produced — a placeholder appears at once (the first token takes several seconds: session assembly, MCP handshake, model latency), then fills in. If CardKit is unavailable the answer is posted as plain text instead, so it is never lost. Its `/ping` reports `HealthyBusy` while a turn is running, which defers *idle* reclamation (`idleRuntimeSessionTimeout`, a session-inactivity timer). It does **not** defer `maxLifetime` — the microVM's wall-clock age cap (default 8 h, configurable) that never resets — so that is the hard ceiling on a single background turn. Consent is the exception and stays synchronous, since the router drives the wait-and-retry loop around it.
 - **Consent-wait is time-bounded.** On first use the router posts the consent link, then holds and polls the vault up to `AUTH_WAIT_SECONDS` (45s) before falling back to "re-send after approving". A user who takes longer than that to approve just re-sends once; the token is already vaulted by then.
-- **Chat-only.** This variant has no web UI — the sibling `lark-agentcore-interceptor` is the web-UI variant. The Lark tools don't go through the Gateway either — the agent fetches each user's token itself, which is what a Runtime-hosted MCP server requires (see `docs/agentcore-behavior.md`). The Gateway is used only for web search, where no user identity is involved.
+- **Lark chat is the only interaction surface today.** No web UI — see [Roadmap](#roadmap).
+- **3LO is agent-side, not Gateway-mediated — because the topology requires it.** A tool server hosted on AgentCore Runtime cannot be handed a per-user token by the Gateway: `/invocations` owns the `Authorization` header for its own transport auth. So the agent fetches each user's token and passes it in a custom header. Measured evidence in `docs/agentcore-behavior.md`.
 - **One Runtime per MCP server.** `protocolConfiguration.serverProtocol` is a single value and a container exposes one MCP endpoint, so each server under `mcp-servers/` gets its own Runtime — the agent's is a third. All are built via CodeBuild (ARM64) and created out-of-band by the CLI. Each server declares its own build/runtime config in `runtime.env`, including an optional gate so it is skipped when unconfigured.
 - **A new image doesn't reach existing users by itself.** AgentCore keeps serving stored sessions from the old container, so `./deploy.sh runtime` drops the saved session ids — the next message lands on the new version.
 - **Message counts are approximate.** `/status` reads one page of Memory events (100) and reports `100+` beyond that; it counts only `conversational` payloads, since Strands also writes session/agent state events. `/clear` deletes at most `CLEAR_EVENT_LIMIT` (200) per run — deletion is one API call per event.
