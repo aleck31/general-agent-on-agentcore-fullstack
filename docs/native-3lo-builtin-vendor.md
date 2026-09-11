@@ -32,7 +32,7 @@ Lark is the system this repo wires up, but the pattern isn't Lark-specific: **on
    That exact URL goes in the IdP client's authorized redirect URIs — not your own return endpoint.
 4. **Allowlist your return URL on the workload identity.** Exact-match, byte for byte, so keep it bare:
    ```bash
-   aws bedrock-agentcore-control update-workload-identity --name lark-agent-wl \
+   aws bedrock-agentcore-control update-workload-identity --name agentcore-fullstack-wl \
      --allowed-resource-oauth2-return-urls "https://<your-return-endpoint>/return"
    ```
 5. **Append an `IDP_REGISTRY` entry** (`scripts/setup-3lo.sh`) — `{key, provider, scopes, label}`. `/auth` then reports the new system's status and `/auth <key>` consents to it, with no router or agent change.

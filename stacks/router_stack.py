@@ -46,7 +46,7 @@ class RouterStack(Stack):
 
         region = Stack.of(self).region
         account = Stack.of(self).account
-        prefix = self.node.try_get_context("resource_prefix") or "lark-agent"
+        prefix = self.node.try_get_context("resource_prefix") or "agentcore-fullstack"
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         timeout = int(self.node.try_get_context("lambda_timeout_seconds") or "60")
         memory = int(self.node.try_get_context("lambda_memory_mb") or "256")

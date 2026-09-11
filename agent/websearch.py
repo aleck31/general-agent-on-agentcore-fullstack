@@ -17,9 +17,6 @@ from __future__ import annotations
 import logging
 import os
 
-from mcp.client.streamable_http import streamablehttp_client
-from strands.tools.mcp.mcp_client import MCPClient
-
 import identity
 
 log = logging.getLogger("agent.websearch")
@@ -32,19 +29,20 @@ def available() -> bool:
     return bool(_GATEWAY_URL)
 
 
-def client_for(actor_id: str) -> MCPClient:
-    """MCP client for the search gateway, authenticated as this user.
+def connection_for(actor_id: str) -> dict:
+    """A `StreamableHttpConnection` for the search gateway, authenticated as this user.
 
     The token is per-user even though search isn't: the Gateway authorises the
     caller, and reusing the same identity keeps the audit trail consistent.
     """
     token = identity.get_user_jwt(actor_id)
-    return MCPClient(lambda: streamablehttp_client(
-        _GATEWAY_URL,
-        headers={
+    return {
+        "transport": "streamable_http",
+        "url": _GATEWAY_URL,
+        "headers": {
             "Authorization": f"Bearer {token}",
             # The Gateway is stateless and returns no session id; without this
             # header it negotiates 2025-03-26 and rejects the request (-32022).
             "MCP-Protocol-Version": _MCP_VERSION,
         },
-    ))
+    }

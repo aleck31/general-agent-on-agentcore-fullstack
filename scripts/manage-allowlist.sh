@@ -15,7 +15,7 @@ _CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}"
 [ -f .env ] && { set -a; . ./.env; set +a; }
 PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds, no named profile
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
-TABLE="${TABLE:-lark-agent-identity}"
+TABLE="${TABLE:-agentcore-fullstack-identity}"
 export AWS_REGION="$REGION"
 # Credentials already in the environment outrank .env's profile.
 [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true

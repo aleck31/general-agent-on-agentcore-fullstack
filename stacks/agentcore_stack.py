@@ -43,7 +43,7 @@ class AgentCoreStack(Stack):
 
         region = Stack.of(self).region
         account = Stack.of(self).account
-        prefix = self.node.try_get_context("resource_prefix") or "lark-agent"
+        prefix = self.node.try_get_context("resource_prefix") or "agentcore-fullstack"
 
         # --- Execution role: what the agent container may do -----------------
         execution_role_name = f"{prefix}-execution-role-{region}"

@@ -1,11 +1,16 @@
-"""Unit tests for agent logic that doesn't require live AWS or the (ARM64) deps.
+"""Unit tests for agent logic that doesn't require live AWS.
 
-Run: cd agent && uv run --with boto3 --with pytest python -m pytest test_agent.py -v
+Run: tests/run.sh (which supplies the deps), or from this directory:
+  uv run --with langchain --with langchain-aws --with langgraph \
+         --with langchain-mcp-adapters --with boto3 --with httpx --with pytest \
+         python -m pytest test_agent.py -v
 
-Note: agent_core imports strands/mcp (installed as ARM64 wheels for the Lambda/
-runtime target), which can't be imported on an x86 test host. We therefore test
-its session-id logic by importing the function in isolation, and cover identity
-(the security-critical part) directly.
+`agent_core` is imported for real. That was impossible under Strands, whose wheels
+target the ARM64 runtime, so the streaming tests used to exec slices of the source with
+a faked `_iter_deltas` — asserting against a copy of the code rather than the code. The
+LangGraph stack is pure Python, so the turn loop is now driven through an actual
+compiled graph with a scripted model. Constructing the model touches no AWS
+credentials; nothing here calls Bedrock.
 """
 
 import base64
@@ -19,6 +24,8 @@ from unittest import mock
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+import agent_core
 
 
 # ------------------------------- identity -----------------------------------
@@ -90,16 +97,9 @@ def test_session_id_deterministic_per_user():
 # earlier version raised UnboundLocalError only at runtime, in production.
 
 def _load_busy_helpers():
-    """Load busy()/_track() alone: agent_core imports strands, which isn't
-    installable on an x86 test host."""
-    import threading
-    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
-    ns = {"threading": threading, "_in_flight": 0, "_in_flight_lock": threading.Lock()}
-    for name in ("def busy(", "def _track("):
-        start = src.index(name)
-        end = src.index("\n\ndef ", start)
-        exec(src[start:end], ns)
-    return ns
+    """The real functions, with the counter reset so tests don't inherit each other."""
+    agent_core._in_flight = 0
+    return {"busy": agent_core.busy, "_track": agent_core._track}
 
 
 def test_busy_reflects_in_flight_turns():
@@ -172,51 +172,48 @@ def test_auth_marker_matches_the_mcp_server():
 
 
 def test_hit_auth_wall_reads_tool_results_not_the_final_reply():
-    """The check must inspect tool-result blocks, not the model's text answer: the
-    model paraphrases errors, so 'no user token is available' in the reply slips
-    past a string check on the reply — verified end-to-end before this fix."""
-    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
-    ns = {}
-    # The tool-result scan is the fallback path; the fast path (abort mid-stream)
-    # is covered by the streaming tests. Load the scanner directly.
-    for name in ('_NEEDS_TOKEN_MARKER = ', 'def _hit_auth_wall_from_tool_results('):
-        start = src.index(name)
-        end = src.index("\n\n\n", start)
-        exec(src[start:end], ns)
-    hit = ns["_hit_auth_wall_from_tool_results"]
+    """The check must inspect tool results, not the model's text answer: the model
+    paraphrases errors, so 'no user token is available' in the reply slips past a string
+    check on the reply — verified end-to-end before this fix."""
+    hit = agent_core._hit_auth_wall_from_tool_results
 
-    class FakeAgent:
-        def __init__(self, messages): self.messages = messages
-
-    def sess(msgs): return {"auth_url": "https://consent", "agent": FakeAgent(msgs)}
-
-    # 1. No agent → nothing to inspect, so no auth wall.
+    # 1. Nothing collected → nothing to inspect, so no auth wall.
     assert hit({"auth_url": "https://consent"}) is False
-    # 2. Text reply that paraphrases the error but no toolResult → NOT a wall.
-    #    This is exactly the case that fooled the first version of this function.
-    paraphrased = [{"role": "assistant", "content": [
-        {"text": "It looks like no user token is available — please authorize"}]}]
-    assert hit(sess(paraphrased)) is False
-    # 3. Real toolResult carrying the marker → wall.
-    real = [
-        {"role": "assistant", "content": [{"toolUse": {"toolUseId": "1", "name": "lark_whoami"}}]},
-        {"role": "user", "content": [{"toolResult": {"content": [
-            {"text": "no user token (authorize first)"}]}}]},
-    ]
-    assert hit(sess(real)) is True
-    # 4. Same tool history but the session is authorized → no wall (auth_url absent).
-    assert hit({"agent": FakeAgent(real)}) is False
+    assert hit({"auth_url": "https://consent", "tool_texts": []}) is False
+    # 2. A paraphrase of the error, not the tool's own words → NOT a wall. This is
+    #    exactly the case that fooled the first version of this function.
+    assert hit({"auth_url": "https://consent", "tool_texts": [
+        "It looks like no user token is available — please authorize"]}) is False
+    # 3. The tool result carrying the marker verbatim → wall.
+    walled = {"auth_url": "https://consent",
+              "tool_texts": ["no user token (authorize first)"]}
+    assert hit(walled) is True
+    # 4. Same tool result but the session is authorized → no wall (auth_url absent),
+    #    because then the refusal means something else and consent won't fix it.
+    assert hit({"tool_texts": ["no user token (authorize first)"]}) is False
 
 
-def test_unauthorized_session_still_connects_and_lists_tools():
+def test_unauthorized_session_passes_an_empty_token_and_still_gets_tools():
     """The token is passed as an empty header rather than skipping the connection —
     verified against the deployed Runtime, which returns the full tool list for an
     empty token. Skipping it would leave the model unaware of its Lark tools."""
-    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
-    build = src[src.index("def _build_session"):src.index("_AUTH_PROMPT =")]
-    assert 'mcp_client_for(value if kind == "token" else "")' in build
-    # auth_url must not short-circuit the connection any more.
-    assert "elif kind ==" not in build, "auth_url should no longer skip the MCP client"
+    opened = []
+
+    async def fake_open(stack, connection):
+        opened.append(connection["headers"])
+        return [_dummy_tool]
+
+    with mock.patch.object(agent_core.lark_3lo, "get_user_lark_token",
+                           return_value=("auth_url", "https://consent")), \
+         mock.patch.object(agent_core.lark_3lo, "mcp_connection_for",
+                           side_effect=lambda tok, url="": {"headers": {"tok": tok}}), \
+         mock.patch.object(agent_core, "_aopen_tools", fake_open), \
+         mock.patch.object(agent_core.websearch, "available", return_value=False):
+        s = agent_core._build_session("lark:ou_x", "", "mem1")
+
+    assert s["auth_url"] == "https://consent"      # consent is remembered, not raised
+    assert opened == [{"tok": ""}], "the server must still be connected, with no token"
+    assert s["graph"] is not None, "the model must see the Lark tools regardless"
 
 
 # ----------------------------- streaming to a card --------------------------
@@ -225,37 +222,79 @@ def test_unauthorized_session_still_connects_and_lists_tools():
 # updates are throttled (not one call per token), and any CardKit failure falls back
 # to send_text so the answer is never lost.
 
-def _fake_stream(deltas, tool_calls, on_tool_use):
-    """Yield deltas, then offer each tool call to on_tool_use — stopping if it says
-    to, exactly as the real generator does."""
-    for d in deltas:
-        yield d
-    for name in (tool_calls or []):
-        if on_tool_use and on_tool_use(name):
-            return
+from langchain_core.messages import AIMessageChunk
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.tools import tool
+from langchain_core.language_models import BaseChatModel
 
 
-def _load_stream_to_chat(fake_deltas, card, notify_sent, tool_calls=None):
-    """Exec _stream_to_chat in isolation with fakes for its module deps — importing
-    agent_core needs strands/mcp (ARM64), unavailable on the test host."""
-    import time as _time
-    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
-    start = src.index("def _stream_to_chat(")
-    end = src.index("\n\ndef reauth(", start)
-    ns = {
-        "time": _time,
-        "log": mock.Mock(),
-        "lark_notify": mock.Mock(StreamingCard=lambda chat_id: card,
-                                 send_text=lambda cid, t: notify_sent.append(t) or True),
-        # Mirrors the real signature. `tool_calls` (if given) are offered to
-        # on_tool_use after the deltas run out, so a test can exercise the abort.
-        "_iter_deltas": lambda agent, message, on_tool_use=None: _fake_stream(
-            fake_deltas, tool_calls, on_tool_use),
-        "_STREAM_MIN_CHARS": 80,
-        "_STREAM_MIN_INTERVAL": 0.6,
-    }
-    exec(src[start:end], ns)
-    return ns["_stream_to_chat"]
+@tool
+def _dummy_tool() -> str:
+    """A tool the scripted model can call. Returns lark-mcp's refusal text."""
+    return "no user token (authorize first)"
+
+
+class _ScriptedModel(BaseChatModel):
+    """Streams the turns it is handed. Content arrives as a list of typed blocks, the
+    way Bedrock Converse sends it, so the block-flattening path is exercised too."""
+
+    turns: list = []
+    calls: int = 0
+
+    @property
+    def _llm_type(self):
+        return "scripted"
+
+    def bind_tools(self, tools, **kw):
+        return self
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kw):
+        turn = self.turns[min(self.calls, len(self.turns) - 1)]
+        self.__dict__["calls"] = self.calls + 1
+        for text in turn.get("text", []):
+            yield ChatGenerationChunk(message=AIMessageChunk(
+                content=[{"type": "text", "text": text, "index": 0}]))
+        for name in turn.get("tool_calls", []):
+            yield ChatGenerationChunk(message=AIMessageChunk(
+                content=[], tool_call_chunks=[
+                    {"name": name, "args": "{}", "id": "c1", "index": 0}]))
+
+    def _generate(self, messages, stop=None, run_manager=None, **kw):
+        return ChatResult(generations=[ChatGeneration(message=AIMessageChunk(content=""))])
+
+
+_thread_seq = iter(range(1, 10_000))
+
+
+def _make_tool(name):
+    """A no-op tool under an arbitrary name, so the scripted model can call the real
+    thing (lark_list_my_docs, WebSearch___WebSearch) rather than a name the graph has
+    never heard of."""
+    from langchain_core.tools import StructuredTool
+    return StructuredTool.from_function(
+        func=lambda: "no user token (authorize first)", name=name,
+        description=f"test double for {name}")
+
+
+def _session_for(deltas, tool_calls=None, follow_up="", **extra):
+    """A session dict backed by a real compiled graph. `tool_calls` are requested after
+    the deltas, so the abort path runs exactly where it does in production."""
+    turns = [{"text": list(deltas), "tool_calls": list(tool_calls or [])}]
+    if tool_calls:
+        turns.append({"text": [follow_up] if follow_up else []})
+    tools = [_dummy_tool] + [_make_tool(n) for n in (tool_calls or [])]
+    graph = agent_core.create_agent(model=_ScriptedModel(turns=turns), tools=tools)
+    s = {"graph": graph, "tool_texts": [],
+         "config": {"configurable": {"thread_id": f"t{next(_thread_seq)}"}}}
+    s.update(extra)
+    return s
+
+
+def _patch_notify(card, notify_sent):
+    return mock.patch.object(
+        agent_core, "lark_notify",
+        mock.Mock(StreamingCard=lambda chat_id: card,
+                  send_text=lambda cid, t: notify_sent.append(t) or True))
 
 
 class FakeCard:
@@ -285,7 +324,8 @@ class FakeCard:
 # ------------------- vaulted token ownership (consent hijack) ------------------
 
 def _load_3lo_guard(owner_lookup):
-    """Exec the ownership check in isolation — lark_3lo imports strands/mcp (ARM64)."""
+    """Exec the ownership check in isolation, so the HTTP lookup can be replaced without
+    touching the module's boto3 client at import time."""
     src = open(os.path.join(os.path.dirname(__file__), "lark_3lo.py"), encoding="utf-8").read()
     start = src.index("_VERIFIED: dict[str, str] = {}")
     end = src.index("def get_user_lark_token(")
@@ -419,8 +459,9 @@ def test_stream_hands_over_every_delta_cumulatively():
     non-prefix would flash the wrong content."""
     card = FakeCard()
     deltas = ["a" * 30, "b" * 30, "c" * 30, "d" * 30]
-    fn = _load_stream_to_chat(deltas, card, [])
-    text = fn({"agent": object()}, "msg", "oc_1")
+    session = _session_for(deltas)
+    with _patch_notify(card, []):
+        text = agent_core._stream_to_chat(session, "msg", "oc_1")
     assert text == "a"*30 + "b"*30 + "c"*30 + "d"*30
     assert len(card.updates) == len(deltas)
     for u in card.updates:
@@ -432,41 +473,64 @@ def test_stream_aborts_when_an_unauthorized_session_reaches_a_lark_tool():
     """The model must not get to narrate a refusal at length before the consent card.
     Aborting at the tool call is what keeps the card the only thing the user reads."""
     card = FakeCard()
-    session = {"agent": object(), "auth_url": "https://consent"}
-    fn = _load_stream_to_chat(["让我查一下…"], card, [], tool_calls=["approval_list_pending"])
-    text = fn(session, "查待审批", "oc_1")
+    session = _session_for(["让我查一下…"], tool_calls=["approval_list_pending"],
+                           follow_up="很抱歉，我没有权限……",
+                           auth_url="https://consent")
+    with _patch_notify(card, []):
+        text = agent_core._stream_to_chat(session, "查待审批", "oc_1")
     assert session.get("walled_tool") == "approval_list_pending"
-    # The half-sentence is replaced, not left on the card.
+    # The half-sentence is replaced, not left on the card, and the model's apology for
+    # the refusal never runs at all.
     assert "让我查一下" not in text
+    assert "很抱歉" not in text
     assert "Lark" in text
 
 
 def test_stream_does_not_abort_on_websearch_when_unauthorized():
     """Search needs no Lark grant, so an unauthorized user must still get results."""
     card = FakeCard()
-    session = {"agent": object(), "auth_url": "https://consent"}
-    fn = _load_stream_to_chat(["天气是…"], card, [], tool_calls=["WebSearch"])
-    text = fn(session, "今天天气", "oc_1")
+    session = _session_for(["天气是…"], tool_calls=["WebSearch___WebSearch"],
+                           follow_up="晴天", auth_url="https://consent")
+    with _patch_notify(card, []):
+        text = agent_core._stream_to_chat(session, "今天天气", "oc_1")
     assert "walled_tool" not in session
-    assert text == "天气是…"
+    assert text == "天气是…晴天"           # the turn ran to completion
 
 
 def test_stream_does_not_abort_when_authorized():
     """An authorized session has no auth_url, so tool calls proceed normally."""
     card = FakeCard()
-    session = {"agent": object()}          # no auth_url
-    fn = _load_stream_to_chat(["结果…"], card, [], tool_calls=["lark_list_my_docs"])
-    text = fn(session, "查文档", "oc_1")
+    session = _session_for(["结果…"], tool_calls=["lark_list_my_docs"],
+                           follow_up="共 3 个文件")     # no auth_url
+    with _patch_notify(card, []):
+        text = agent_core._stream_to_chat(session, "查文档", "oc_1")
     assert "walled_tool" not in session
-    assert text == "结果…"
+    assert text == "结果…共 3 个文件"
+
+
+def test_stream_collects_tool_results_for_the_auth_wall_fallback():
+    """A turn that runs to completion still has to expose what the tools said, or the
+    fallback auth-wall check has nothing to read."""
+    card = FakeCard()
+    # No auth_url while streaming, so the abort (which normally fires first) stays out
+    # of the way and the turn runs to completion — the fallback's actual situation is a
+    # session that looked authorized until a tool refused mid-turn.
+    session = _session_for(["查询中…"], tool_calls=["lark_list_my_docs"],
+                           follow_up="失败了")
+    with _patch_notify(card, []):
+        agent_core._stream_to_chat(session, "查文档", "oc_1")
+    session["auth_url"] = "https://consent"   # the vault lookup that follows finds one
+    assert any(agent_core._NEEDS_TOKEN_MARKER in t for t in session["tool_texts"])
+    assert agent_core._hit_auth_wall(session) is True
 
 
 def test_stream_falls_back_to_text_when_card_cannot_open():
     """No cardkit:card:write scope → open() fails → the answer still arrives as text."""
     card = FakeCard(open_ok=False)
     sent = []
-    fn = _load_stream_to_chat(["hello ", "world"], card, sent)
-    text = fn({"agent": object()}, "msg", "oc_1")
+    session = _session_for(["hello ", "world"])
+    with _patch_notify(card, sent):
+        text = agent_core._stream_to_chat(session, "msg", "oc_1")
     assert text == "hello world"
     assert card.updates == []              # never tried to stream
     assert sent == ["hello world"]         # delivered as plain text instead
@@ -476,8 +540,9 @@ def test_stream_falls_back_when_an_update_fails_midway():
     """A card that dies mid-stream must still deliver the full answer via text."""
     card = FakeCard(update_ok=False)       # first update flips ok to False
     sent = []
-    fn = _load_stream_to_chat(["x" * 100, "y" * 100], card, sent)
-    text = fn({"agent": object()}, "msg", "oc_1")
+    session = _session_for(["x" * 100, "y" * 100])
+    with _patch_notify(card, sent):
+        text = agent_core._stream_to_chat(session, "msg", "oc_1")
     assert text == "x"*100 + "y"*100
     assert sent == [text]                  # fell back after the failed update
     assert card.closed_with is None        # never reached a clean close
@@ -485,41 +550,29 @@ def test_stream_falls_back_when_an_update_fails_midway():
 
 def test_fresh_session_evicts_a_cached_unauthorized_session():
     """The consent-resume replay must not reuse the cached unauthorized session: its
-    MCP clients hold an empty token, so the turn would wall again. Measured in the
+    MCP sessions hold an empty token, so the turn would wall again. Measured in the
     field — consent completed 31 s after the prompt, inside _UNAUTH_TTL, so waiting
     for expiry is not a fix."""
-    src = open(os.path.join(os.path.dirname(__file__), "agent_core.py"), encoding="utf-8").read()
-    start = src.index("def _get_session(")
-    end = src.index("\n\ndef chat_result(", start)
-    closed = []
-
-    class FakeMCP:
-        def __exit__(self, *a): closed.append(1)
-
-    sessions = {"lark:u|mem1": {"auth_url": "https://consent", "created": 1e9,
-                                "mcp": FakeMCP(), "agent": object()}}
-    built = []
+    closed, built = [], []
 
     def fake_build(actor_id, email, mem_sid, workload_token=""):
         built.append(mem_sid)
-        return {"created": 1e9, "agent": object()}   # authorized: no auth_url
+        return {"created": 1e9}                      # authorized: no auth_url
 
-    ns = {"_sessions": sessions, "_lock": __import__("threading").Lock(),
-          "time": __import__("time"), "_UNAUTH_TTL": 60, "_SESSION_TTL": 3000,
-          "_build_session": fake_build, "log": mock.Mock()}
-    exec(src[start:end], ns)
-    get = ns["_get_session"]
-
-    # Without fresh, the cached unauthorized session is returned (still inside TTL).
-    with mock.patch.object(ns["time"], "time", return_value=1e9 + 10):
-        s = get("lark:u", "", "mem1")
+    cached = {"auth_url": "https://consent", "created": 1e9, "stack": object()}
+    with mock.patch.dict(agent_core._sessions, {"lark:u|mem1": cached}, clear=True), \
+         mock.patch.object(agent_core, "_build_session", fake_build), \
+         mock.patch.object(agent_core, "_close_session", lambda s: closed.append(s)), \
+         mock.patch.object(agent_core.time, "time", return_value=1e9 + 10):
+        # Without fresh, the cached unauthorized session is returned (still inside TTL).
+        s = agent_core._get_session("lark:u", "", "mem1")
         assert s.get("auth_url") == "https://consent"
         assert built == []
 
-    # With fresh, it is evicted, its clients closed, and a new one built.
-    with mock.patch.object(ns["time"], "time", return_value=1e9 + 10):
-        s = get("lark:u", "", "mem1", fresh=True)
-    assert closed, "the stale MCP client must be closed, not leaked"
+        # With fresh, it is evicted, its MCP sessions closed, and a new one built.
+        s = agent_core._get_session("lark:u", "", "mem1", fresh=True)
+
+    assert closed == [cached], "the stale MCP sessions must be closed, not leaked"
     assert built == ["mem1"]
     assert "auth_url" not in s
 

@@ -1,6 +1,35 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.13"
+
+[[package]]
+name = "agent-on-agentcore-fullstack"
+version = "0.1.1"
+source = { virtual = "." }
+dependencies = [
+    { name = "aws-cdk-lib" },
+    { name = "cdk-nag" },
+    { name = "constructs" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "boto3" },
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aws-cdk-lib", specifier = ">=2.170.0,<3.0.0" },
+    { name = "cdk-nag", specifier = ">=2.28.0" },
+    { name = "constructs", specifier = ">=10.0.0,<11.0.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "boto3", specifier = ">=1.35.0" },
+    { name = "pytest", specifier = ">=8.0.0" },
+]
 
 [[package]]
 name = "attrs"
@@ -182,35 +211,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/33/a8/a27839ee67130e3b911ebcd2f27c9d539fae2dd4ea2e87678c19b7a48685/jsii-1.138.0.tar.gz", hash = "sha256:575a389c56e4651f33fad0e0dafdc61d001a499d3cc0630cee734fc5e0b525ae", size = 531368, upload-time = "2026-07-02T13:42:11.264Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/11/c2/9198f328f95b8bbb946de5e5b4551316818c92167893a3b8343879f0e1e4/jsii-1.138.0-py3-none-any.whl", hash = "sha256:efc66b5831c8c41e343b644f03221d71480b69c3c39dc41df15659a01ce28fbb", size = 501697, upload-time = "2026-07-02T13:42:09.704Z" },
-]
-
-[[package]]
-name = "lark-agentcore-identity"
-version = "0.9.3"
-source = { virtual = "." }
-dependencies = [
-    { name = "aws-cdk-lib" },
-    { name = "cdk-nag" },
-    { name = "constructs" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "boto3" },
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aws-cdk-lib", specifier = ">=2.170.0,<3.0.0" },
-    { name = "cdk-nag", specifier = ">=2.28.0" },
-    { name = "constructs", specifier = ">=10.0.0,<11.0.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "boto3", specifier = ">=1.35.0" },
-    { name = "pytest", specifier = ">=8.0.0" },
 ]
 
 [[package]]

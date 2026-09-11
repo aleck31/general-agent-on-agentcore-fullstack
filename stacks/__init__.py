@@ -1,4 +1,5 @@
-"""lark-agent CDK stacks package."""
+"""CDK stacks package. Resource names are prefixed with the `resource_prefix` context
+value (`agentcore-fullstack`), which each stack reads for itself."""
 
 import os
 import subprocess

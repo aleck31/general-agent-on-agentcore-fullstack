@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy lark-agent. Override the target with PROFILE=... REGION=... env vars.
+# Deploy the agent. Override the target with PROFILE=... REGION=... env vars.
 #
 # Steps (idempotent — re-runnable independently):
 #   --base      CDK base stacks (security, agentcore, router, gateway, observability)
@@ -21,7 +21,7 @@ _CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEA
 PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
 WEB_SEARCH="${_CLI_WEB_SEARCH:-${WEB_SEARCH:-false}}"
-PREFIX="lark-agent"
+PREFIX="agentcore-fullstack"
 export AWS_REGION="$REGION" UV_LINK_MODE=copy
 # Credentials already in the environment outrank .env's profile.
 [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
@@ -84,7 +84,7 @@ phase2_runtime() {
   shim="$(cfn_out "$PREFIX-shim" ShimReturnUrl)"
   # lark-cli MCP server runtime → its SigV4 MCP invocations URL (URL-encoded ARN).
   mcp_arn="$(aws bedrock-agentcore-control list-agent-runtimes \
-    --query "agentRuntimes[?agentRuntimeName=='lark_agent_mcp'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
+    --query "agentRuntimes[?agentRuntimeName=='agentcore_fullstack_mcp'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
   mcp_url="https://bedrock-agentcore.$REGION.amazonaws.com/runtimes/$(uv run python -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$mcp_arn")/invocations?qualifier=DEFAULT"
   # Approval MCP server, if ./deploy.sh approval ran. Optional by design: left empty
   # the agent simply has no approval tools, same as web search.
@@ -99,7 +99,7 @@ phase2_runtime() {
   fi
 
   [ -n "$role" ] || { echo "missing execution role output — run --base first"; exit 1; }
-  [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || { echo "lark_agent_mcp runtime not found — deploy the MCP server first (scripts/build-mcp.sh + create runtime)"; exit 1; }
+  [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || { echo "agentcore_fullstack_mcp runtime not found — deploy the MCP server first (scripts/build-mcp.sh + create runtime)"; exit 1; }
 
   # Configure once (idempotent; writes .bedrock_agentcore.yaml). Custom Dockerfile
   # in agent/ is respected. Allow the agent's own execution role to fetch per-user
@@ -114,8 +114,8 @@ phase2_runtime() {
     --env "BEDROCK_AGENTCORE_MEMORY_ID=$memory" \
     --env "LARK_MCP_URL=$mcp_url" \
     --env "SHIM_RETURN_URL=$shim" \
-    --env "LARK_OAUTH_PROVIDER=lark-agent-3lo" \
-    --env "AGENT_WORKLOAD_NAME=lark-agent-wl" \
+    --env "LARK_OAUTH_PROVIDER=agentcore-fullstack-3lo" \
+    --env "AGENT_WORKLOAD_NAME=agentcore-fullstack-wl" \
     --env "LARK_SCOPES=drive:drive docx:document offline_access" \
     --env "LARK_SECRET_ID=$PREFIX/channels/lark" \
     --env "LARK_API_DOMAIN=$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['lark_api_domain'])")" \

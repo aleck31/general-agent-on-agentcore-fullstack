@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""lark-agent on AgentCore — CDK application entry point.
+"""CDK application entry point.
 
 A single-tenant-friendly PoC that runs a simple Python agent on Bedrock
 AgentCore Runtime, reachable from Lark bot chat (webhook messages), with Lark
@@ -44,7 +44,7 @@ env = cdk.Environment(
     region=ctx("region") or os.environ.get("CDK_DEFAULT_REGION") or "us-west-2",
 )
 
-prefix = ctx("resource_prefix") or "lark-agent"
+prefix = ctx("resource_prefix") or "agentcore-fullstack"
 
 # --- Security: Cognito user pool + Secrets Manager slots ---
 security = SecurityStack(app, f"{prefix}-security", env=env)

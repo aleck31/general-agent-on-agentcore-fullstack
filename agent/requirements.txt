@@ -1,6 +1,14 @@
 aiohttp>=3.10.0
 aws-opentelemetry-distro>=0.10.0
-strands-agents>=1.45.0
+# langchain for create_agent: langgraph.prebuilt.create_react_agent is deprecated in
+# LangGraph 1.0 and goes away in 2.0.
+langchain>=1.4.0
+langgraph>=1.2.0
+langchain-aws>=1.7.0
+# AgentCoreMemorySaver (graph state, blob events) + AgentCoreMemoryStore (conversational
+# events). Not part of bedrock-agentcore, which ships a Strands integration only.
+langgraph-checkpoint-aws>=1.2.0
+langchain-mcp-adapters>=0.3.0
 bedrock-agentcore>=0.1.0
 mcp>=1.23.0
 httpx>=0.27.0

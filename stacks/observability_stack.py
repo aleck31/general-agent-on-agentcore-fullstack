@@ -18,7 +18,7 @@ class ObservabilityStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        prefix = self.node.try_get_context("resource_prefix") or "lark-agent"
+        prefix = self.node.try_get_context("resource_prefix") or "agentcore-fullstack"
 
         def lambda_metric(fn_name: str, metric: str, stat: str = "Sum") -> cw.Metric:
             return cw.Metric(

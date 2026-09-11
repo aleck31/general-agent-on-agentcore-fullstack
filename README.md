@@ -1,6 +1,6 @@
-# Lark Agent on AgentCore — a full-stack agent sample
+# General Agent on AgentCore — a full-stack agent sample
 
-A general-purpose agent on **Amazon Bedrock AgentCore**, with **Lark (Feishu) as its interaction channel**. The agent runs on AgentCore Runtime (Strands + Bedrock), keeps conversation history in AgentCore Memory, reaches its tools over MCP, and answers in Lark chat — typed into a streaming card as it is produced, because a real task outlasts any request/response window.
+A general-purpose agent on **Amazon Bedrock AgentCore**, with **Lark (Feishu) as its interaction channel**. The agent runs on AgentCore Runtime (LangGraph + Bedrock), keeps conversation history in AgentCore Memory, reaches its tools over MCP, and answers in Lark chat — typed into a streaming card as it is produced, because a real task outlasts any request/response window.
 
 Its identity foundation is the part most agent samples skip: every message resolves to `lark:{open_id}`, and any tool that touches a user's data acts **as that user**, with the user's own token from the AgentCore Identity Token Vault (OAuth 3LO). So the agent inherits both *who you are* and *what you're allowed to do*, adding nothing of its own — Lark itself adjudicates access, and there is no parallel permission layer to keep in sync.
 
@@ -10,7 +10,7 @@ That identity integration is deliberately not re-documented here. Two samples co
 
 | Capability | How |
 |---|---|
-| Conversational agent in Lark chat | Strands agent on AgentCore Runtime; webhook in, streaming card out |
+| Conversational agent in Lark chat | LangGraph agent on AgentCore Runtime; webhook in, streaming card out |
 | Memory across containers | AgentCore Memory (STM), keyed per user and per thread — a fresh microVM still remembers |
 | Tools as the calling user | MCP server running the official `lark-cli` with that user's vaulted `user_access_token` |
 | Long-running turns | The turn is accepted, runs in the background, and posts its own answer — no synchronous wait to time out |
@@ -28,7 +28,7 @@ That identity integration is deliberately not re-documented here. Two samples co
                                             └───────────────────┬────────────────────────┘
                                                                 │ the user's own token
   Lark    ──webhook──▶  Router Lambda  ──▶  Agent (AgentCore Runtime)  ──▶  Lark MCP server
-  bot chat              verify/decrypt      Strands + Memory                acts AS the user
+  bot chat              verify/decrypt      LangGraph + Memory              acts AS the user
      ▲                  resolve identity    fetches that user's token                │
      │                                                                               ▼
      └──────────────── the answer, posted when the turn finishes ───────────  Lark REST API
@@ -66,7 +66,7 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 
 ## Deploy
 
-Prereqs: `uv`, Docker, the AgentCore CLI (`npm i -g @aws/agentcore`), and AWS credentials. The deployment target lives in `.env` (`PROFILE`, `REGION`, `MODEL_ID`); command-line env vars override it (`REGION=... ./deploy.sh`). Resources deploy under the `lark-agent` prefix. The first deploy into a region runs `cdk bootstrap` automatically.
+Prereqs: `uv`, Docker, the AgentCore CLI (`npm i -g @aws/agentcore`), and AWS credentials. The deployment target lives in `.env` (`PROFILE`, `REGION`, `MODEL_ID`); command-line env vars override it (`REGION=... ./deploy.sh`). Resources deploy under the `agentcore-fullstack` prefix. The first deploy into a region runs `cdk bootstrap` automatically.
 
 ```bash
 cp .env.example .env          # deployment target (PROFILE/REGION/MODEL_ID) + Lark appId/appSecret/encryptKey/token + your open_id
@@ -81,7 +81,7 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 |---|---|
 | `./deploy.sh base` | CDK stacks (security, agentcore, router, shim, gateway, observability) |
 | `./deploy.sh mcp` | build every MCP server under `mcp-servers/` (CodeBuild ARM64) + create/update a Runtime each. `./deploy.sh mcp approval` for just one |
-| `./deploy.sh 3lo` | workload identity + the `lark-agent-3lo` OAuth credential provider |
+| `./deploy.sh 3lo` | workload identity + the `agentcore-fullstack-3lo` OAuth credential provider |
 | `./deploy.sh gateway` | Web Search gateway in us-east-1 — skipped unless `WEB_SEARCH=true` |
 | `./deploy.sh runtime` | build the agent image + deploy the agent Runtime |
 | `./deploy.sh lark` | seed Lark credentials to Secrets Manager + allowlist your `open_id` |
@@ -134,7 +134,7 @@ Two consequences worth knowing: deleting the provider **purges every user's vaul
 
    Nothing in the first group can read a user's documents, and nothing in the second is ever used to speak as the bot — `LARKSUITE_CLI_DEFAULT_AS=user` keeps the MCP server on the user's token exclusively. Widening what the agent can *do* for a user means adding user-token scopes here and to `LARK_SCOPES`; every user then re-consents once.
 3. **Events & Callbacks**: Request URL = the webhook URL from deploy output; enable Encryption; add `im.message.receive_v1`. For the approval demo also add **审批任务状态变更** (`approval_task`) — and note that ticking it here is not enough on its own, see below.
-4. **Security Settings → Redirect URLs**: add the OAuth credential provider's `callbackUrl` (`https://bedrock-agentcore.<region>.amazonaws.com/identities/oauth2/callback/<uuid>`, from `get-oauth2-credential-provider --name lark-agent-3lo`). This is where AgentCore Identity receives the 3LO code — not the shim URL.
+4. **Security Settings → Redirect URLs**: add the OAuth credential provider's `callbackUrl` (`https://bedrock-agentcore.<region>.amazonaws.com/identities/oauth2/callback/<uuid>`, from `get-oauth2-credential-provider --name agentcore-fullstack-3lo`). This is where AgentCore Identity receives the 3LO code — not the shim URL.
 5. **Publish** a version (re-publish after any scope/event change).
 
 ### Optional: the approval demo
@@ -213,7 +213,7 @@ Two structural constraints shape anything larger. **One Runtime per MCP server**
 
 Not implemented yet — listed so the current shape isn't mistaken for the intended one. Directions, not commitments:
 
-- **Agent framework: Strands → LangGraph.** The turn loop is Strands today (`agent/agent_core.py`), chosen for its AgentCore Memory and MCP integrations; the plan is to move to LangGraph for a more portable, widely-used graph model. What that touches is contained by design — the HTTP contract (`agent/server.py`), the identity layer (`lark_3lo`), the tool servers and the channel all sit outside the loop. The two real coupling points are the `AgentCoreMemorySessionManager` (Strands-specific, so history persistence needs a LangGraph equivalent or a checkpointer over Memory) and the token-stream shape that feeds the streaming card.
+- **Session-scoped persistent files, on your own S3.** The Runtime is stateless: a microVM's filesystem dies with it, and `maxLifetime` caps it at 8 h regardless. Anything the agent should keep — generated files, working data, artifacts a later turn refers to — needs storage outside the container, in a bucket you own, isolated per session. The design to follow is [acruntime-s3files-isolation](https://github.com/walkley/acruntime-s3files-isolation): mount S3 Files per session through a dedicated Access Point whose `rootDirectory` is fixed server-side to `sessions/<session_id>/`, with mount credentials scoped to that Access Point by IAM. Isolation is then enforced by AWS rather than by agent code — which matters precisely because an agent runs model-generated code. Not started; `.dev/PLAN-s3-session-storage.md` has the notes.
 - **More interaction surfaces.** Lark chat is the only entrypoint today. A web UI is the obvious next one (the sibling interceptor variant has one; this repo does not), and the router's identity resolution is deliberately channel-shaped (`resolve_user(channel, channel_user_id)`) so a second channel doesn't require reworking it.
 - **A broader tool set.** `mcp-servers/lark-cli/` exposes three tools — whoami, list-my-docs, and a raw Lark API passthrough — chosen to prove per-user access end to end, not to be complete.
 - **More downstream systems.** One OAuth provider per system is already the model; nothing but a provider and an `IDP_REGISTRY` entry is missing for the second one.
@@ -265,5 +265,5 @@ This is a **reference implementation, not production-ready as-is**. Before any r
 - **3LO is agent-side, not Gateway-mediated — because the topology requires it.** A tool server hosted on AgentCore Runtime cannot be handed a per-user token by the Gateway: `/invocations` owns the `Authorization` header for its own transport auth. So the agent fetches each user's token and passes it in a custom header. Measured evidence in `docs/agentcore-behavior.md`.
 - **One Runtime per MCP server.** `protocolConfiguration.serverProtocol` is a single value and a container exposes one MCP endpoint, so each server under `mcp-servers/` gets its own Runtime — the agent's is a third. All are built via CodeBuild (ARM64) and created out-of-band by the CLI. Each server declares its own build/runtime config in `runtime.env`, including an optional gate so it is skipped when unconfigured.
 - **A new image doesn't reach existing users by itself.** AgentCore keeps serving stored sessions from the old container, so `./deploy.sh runtime` drops the saved session ids — the next message lands on the new version.
-- **Message counts are approximate.** `/status` reads one page of Memory events (100) and reports `100+` beyond that; it counts only `conversational` payloads, since Strands also writes session/agent state events. `/clear` deletes at most `CLEAR_EVENT_LIMIT` (200) per run — deletion is one API call per event.
+- **Message counts are approximate.** `/status` reads one page of Memory events (100) and reports `100+` beyond that; it counts only `conversational` payloads, since the checkpointer also writes graph-state blobs. `/clear` deletes at most `CLEAR_EVENT_LIMIT` (200) per run — deletion is one API call per event.
 - **Token Vault exposes no metadata.** `GetResourceOauth2Token` returns just the token (or a consent URL) — no issued-at, expiry, or granted scopes — so `/auth` reports presence only.

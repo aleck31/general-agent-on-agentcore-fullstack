@@ -14,8 +14,8 @@
   "context": {
     "account": "",
     "region": "",
-    "resource_prefix": "lark-agent",
-    "default_model_id": "global.anthropic.claude-sonnet-4-6",
+    "resource_prefix": "agentcore-fullstack",
+    "default_model_id": "global.anthropic.claude-sonnet-5",
     "lark_api_domain": "https://open.larksuite.com",
     "runtime_endpoint_id": "DEFAULT",
     "registration_open": false,

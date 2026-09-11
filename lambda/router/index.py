@@ -202,8 +202,8 @@ def _secs(seconds) -> str:
 # timeout we fall back to "send your message again".
 AUTH_WAIT_SECONDS = int(os.environ.get("AUTH_WAIT_SECONDS", "45"))
 AUTH_POLL_INTERVAL = float(os.environ.get("AUTH_POLL_INTERVAL", "2"))
-LARK_OAUTH_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "lark-agent-3lo")
-AGENT_WORKLOAD_NAME = os.environ.get("AGENT_WORKLOAD_NAME", "lark-agent-wl")
+LARK_OAUTH_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "agentcore-fullstack-3lo")
+AGENT_WORKLOAD_NAME = os.environ.get("AGENT_WORKLOAD_NAME", "agentcore-fullstack-wl")
 LARK_SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
 SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # required by GetResourceOauth2Token
 

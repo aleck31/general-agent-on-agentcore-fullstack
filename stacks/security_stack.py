@@ -24,7 +24,7 @@ class SecurityStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        prefix = self.node.try_get_context("resource_prefix") or "lark-agent"
+        prefix = self.node.try_get_context("resource_prefix") or "agentcore-fullstack"
 
         # --- Cognito user pool: token factory for Lark-authenticated users ---
         # username == "lark:{open_id}"; passwords are HMAC-derived by the agent

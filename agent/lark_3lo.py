@@ -16,9 +16,9 @@ Flow per user (actor_id = "lark:{open_id}"):
        GetWorkloadAccessTokenForUserId → GetResourceOauth2Token(USER_FEDERATION)
        - token vaulted  → return ("token", <lark_user_access_token>)
        - not yet        → return ("auth_url", <url to send to the user in chat>)
-  2. with a token, mcp_client_for(token) opens an MCP client to the lark-mcp
-     Runtime over SigV4, passing the token in the custom header the sidecar
-     copies to Authorization for official lark-mcp.
+  2. with a token, mcp_connection_for(token) describes an MCP connection to the
+     lark-mcp Runtime over SigV4, passing the token in the custom header that
+     server reads and calls Lark with.
 
 Non-blocking: we never poll waiting for consent. First turn returns an auth_url
 (the agent posts it to Lark chat and ends the turn); a later turn finds the
@@ -38,12 +38,9 @@ from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 import httpx
 
-from mcp.client.streamable_http import streamablehttp_client
-from strands.tools.mcp.mcp_client import MCPClient
-
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
-_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "lark-agent-3lo")
-_WORKLOAD = os.environ.get("AGENT_WORKLOAD_NAME", "lark-agent-wl")
+_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "agentcore-fullstack-3lo")
+_WORKLOAD = os.environ.get("AGENT_WORKLOAD_NAME", "agentcore-fullstack-wl")
 _SHIM_RETURN_URL = os.environ.get("SHIM_RETURN_URL", "")  # bare, allowlisted on the workload
 _LARK_MCP_URL = os.environ.get("LARK_MCP_URL", "")        # SigV4 Runtime MCP invocations URL
 _SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
@@ -154,7 +151,11 @@ def get_user_lark_token(actor_id: str, force: bool = False,
 
 
 class _SigV4HTTPXAuth(httpx.Auth):
-    """Sign every httpx request (incl. SSE polls) with SigV4 for bedrock-agentcore."""
+    """Sign every httpx request (incl. SSE polls) with SigV4 for bedrock-agentcore.
+
+    Only `auth_flow` (sync) is defined on purpose: httpx's default `async_auth_flow`
+    iterates it directly, so the same object serves the async MCP transport — signing
+    is pure CPU and blocks nothing."""
 
     def __init__(self, creds, service: str, region: str):
         self._signer = SigV4Auth(creds, service, region)
@@ -169,14 +170,20 @@ class _SigV4HTTPXAuth(httpx.Auth):
         yield request
 
 
-def mcp_client_for(lark_token: str, url: str = "") -> MCPClient:
-    """MCP client to an MCP-server Runtime: SigV4 transport + the Lark token in the
-    custom passthrough header. Defaults to the lark-cli server; pass `url` for
-    another one (the approval server, say). Same transport either way — what differs
-    is which tools the server exposes and which identity each of them uses."""
+def mcp_connection_for(lark_token: str, url: str = "") -> dict:
+    """A langchain-mcp-adapters `StreamableHttpConnection` for an MCP-server Runtime:
+    SigV4 transport + the Lark token in the custom passthrough header. Defaults to the
+    lark-cli server; pass `url` for another one (the approval server, say). Same
+    transport either way — what differs is which tools the server exposes and which
+    identity each of them uses.
+
+    Credentials are resolved per call rather than cached: a Runtime's role credentials
+    are refreshed under us, and a signer holding an expired set fails every request."""
     creds = boto3.Session(region_name=_REGION).get_credentials()
-    auth = _SigV4HTTPXAuth(creds, "bedrock-agentcore", _REGION)
-    headers = {_CUSTOM_HEADER: lark_token}
-    return MCPClient(lambda: streamablehttp_client(
-        url or _LARK_MCP_URL, headers=headers, auth=auth, timeout=timedelta(seconds=60),
-    ))
+    return {
+        "transport": "streamable_http",
+        "url": url or _LARK_MCP_URL,
+        "headers": {_CUSTOM_HEADER: lark_token},
+        "auth": _SigV4HTTPXAuth(creds, "bedrock-agentcore", _REGION),
+        "timeout": timedelta(seconds=60),
+    }

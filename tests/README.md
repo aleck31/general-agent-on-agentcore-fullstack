@@ -12,7 +12,7 @@ No AWS needed; everything is mocked. The tests themselves live next to the code 
 
 Two constraints shape what these can cover:
 
-- `agent_core` and `websearch` import `strands`/`mcp`, whose wheels target the ARM64 runtime and don't install on a typical x86 test host. Logic from those modules is either exec'd in isolation (see `_load_busy_helpers`) or asserted against the source text.
+- `agent_core` is imported for real and its turn loop driven through an actual compiled graph with a scripted model, so `tests/run.sh` installs the LangGraph stack for that suite. This replaced an exec-a-slice-of-the-source pattern that existed only because Strands' wheels target ARM64 and wouldn't import on an x86 test host. Constructing the model touches no credentials; nothing calls Bedrock.
 - Handlers that are mostly a sequence of AWS calls (`/reset`, `/new`, `/reconnect`, `/clear`) are left to the e2e path — mocking them would largely assert the mocks. The parts that actually carry risk are covered directly instead: Memory-thread rotation, conversational-only event counting, and the IdP registry's fallback.
 
 ## E2E smoke tests — need a deployed stack

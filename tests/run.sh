@@ -10,7 +10,12 @@ set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "== agent =="
-uv run --with boto3 --with aiohttp --with pytest python -m pytest agent/test_agent.py -q
+# The LangGraph stack is pure Python, so unlike Strands it installs here and the turn
+# loop is tested through a real compiled graph rather than a copy of its source.
+uv run --with boto3 --with aiohttp --with httpx --with pytest \
+       --with langchain --with langchain-aws --with langgraph \
+       --with langchain-mcp-adapters \
+       python -m pytest agent/test_agent.py -q
 
 echo "== router =="
 uv run --with cryptography --with boto3 --with pytest python -m pytest lambda/router/test_router.py -q

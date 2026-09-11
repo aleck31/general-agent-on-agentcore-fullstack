@@ -25,7 +25,7 @@ _T_IMPORT_START = time.monotonic()
 
 from aiohttp import web
 
-import agent_core   # pulls in strands, boto3 and mcp — the bulk of start-up
+import agent_core   # pulls in langchain/langgraph, boto3 and mcp — the bulk of start-up
 
 _T_IMPORT_DONE = time.monotonic()
 

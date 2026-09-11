@@ -170,7 +170,7 @@ def _memory_id() -> str:
     it as <runtime_name>_mem-<suffix>, so it isn't known at CDK synth time)."""
     global _MEMORY_ID
     if _MEMORY_ID is None:
-        prefix = os.environ.get("MEMORY_NAME_PREFIX", "lark_agent")
+        prefix = os.environ.get("MEMORY_NAME_PREFIX", "agentcore_fullstack")
         ctl = boto3.client("bedrock-agentcore-control", region_name=_REGION)
         ids = [m["id"] for m in ctl.list_memories(maxResults=100).get("memories", [])
                if m["id"].startswith(prefix)]

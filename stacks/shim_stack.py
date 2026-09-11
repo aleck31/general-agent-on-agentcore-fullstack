@@ -29,7 +29,7 @@ class ShimStack(Stack):
                  lark_secret_name: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        prefix = self.node.try_get_context("resource_prefix") or "lark-agent"
+        prefix = self.node.try_get_context("resource_prefix") or "agentcore-fullstack"
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
 
         log_group = logs.LogGroup(

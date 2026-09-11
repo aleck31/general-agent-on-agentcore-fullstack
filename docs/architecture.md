@@ -10,7 +10,7 @@ A general-purpose agent on Amazon Bedrock AgentCore, integrated with **Lark (Fei
 |---|---|---|
 | **Channel** | how a user reaches the agent and how answers get back | `lambda/router/`, `agent/lark_notify.py` |
 | **Identity** | who this turn is, and whose credentials the tools may use | `lambda/router/cognito.py`, `agent/lark_3lo.py`, `lambda/shim/` |
-| **Reasoning** | the model, the system prompt, the turn loop | `agent/agent_core.py` (Strands today; a LangGraph migration is planned — see `README.md → Roadmap`) |
+| **Reasoning** | the model, the system prompt, the turn loop | `agent/agent_core.py` — LangGraph (`langchain.agents.create_agent`) on `ChatBedrockConverse` |
 | **Memory** | what the agent remembers, and for how long | AgentCore Memory (STM), thread id owned by the router |
 | **Tools** | what the agent can actually do, and as whom | `mcp-servers/*` (one Runtime each), plus the Web Search Gateway |
 
@@ -31,7 +31,7 @@ Each layer is separable, and the seams are deliberate: adding a tool server touc
                                    ▼
         ┌────────────────────────────────────────────────────────┐
         │  Agent container (ARM64, AgentCore Runtime)            │     AgentCore Identity
-        │   Strands agent, history in AgentCore Memory           │     Token Vault (3LO)
+        │   LangGraph agent, history in AgentCore Memory         │     Token Vault (3LO)
         │   lark_3lo: platform WAT → GetResourceOauth2Token      │◀───▶ stores / refreshes
         │   the turn runs in the background; /ping = HealthyBusy │     THIS user's token
         └───┬───────────────────────────────────────────┬────────┘            ▲
@@ -53,12 +53,12 @@ Each layer is separable, and the seams are deliberate: adding a tool server touc
 | Component | What it is | Where |
 |---|---|---|
 | Router Lambda | Lark webhook ingestion (verify + AES decrypt, resolve user, invoke runtime); mints the per-user JWT; owns both session ids; handles the chat commands | `lambda/router/` |
-| Agent container | Strands agent on Bedrock; HTTP contract (8080); AgentCore Memory for continuity; agent-side 3LO; MCP clients to the lark-cli server, the approval server when deployed, and optionally web search; runs turns in the background and posts answers to the chat itself | `agent/` |
+| Agent container | LangGraph agent on Bedrock; HTTP contract (8080); AgentCore Memory for continuity; agent-side 3LO; MCP sessions to the lark-cli server, the approval server when deployed, and optionally web search; runs turns in the background and posts answers to the chat itself | `agent/` |
 | Lark OAuth shim | RFC-6749 façade over Lark's non-standard token endpoint, plus the 3LO return endpoint | `lambda/shim/` |
 | Lark MCP server | lark-cli engine on AgentCore Runtime; calls Lark with the per-user token from a custom passthrough header | `mcp-servers/lark-cli/` |
 | Approval MCP server | Lark approvals on AgentCore Runtime — the case where the user's identity *cannot* be forwarded. Limits enforced in code, not by the model | `mcp-servers/approval/` |
-| AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `lark-agent-3lo`, workload `lark-agent-wl` |
-| AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `lark_agent_agent_mem` (STM) |
+| AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `agentcore-fullstack-3lo`, workload `agentcore-fullstack-wl` |
+| AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `agentcore_fullstack_agent_mem` (STM) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
 | AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region) | `stacks/gateway_stack.py`, `deploy.sh gateway` |
 
@@ -169,7 +169,16 @@ Delivery is scoped by subscription: Lark sends approval events only for definiti
 
 ## Conversation memory
 
-The agent is a Strands agent with an `AgentCoreMemorySessionManager` (STM) keyed by `(actor_id, memory_session_id)`. History lives in AgentCore Memory (30-day retention), so it outlives the microVM: a fresh container still reads the same thread. Per-session `(agent, MCP client)` are cached and reused across messages — rebuilding per message re-handshakes MCP and re-lists tools, ~15–20s of avoidable latency.
+History lives in AgentCore Memory (STM, 30-day retention) keyed by `(actor_id, memory_session_id)`, so it outlives the microVM: a fresh container still reads the same thread. The compiled graph and its MCP sessions are cached per session and reused across messages — rebuilding per message re-handshakes every MCP server and re-lists tools, ~15–20s of avoidable latency.
+
+**Two writers, two readers — not redundancy.** AWS's LangGraph integration ships two components that do different jobs:
+
+| | Writes | Read by |
+|---|---|---|
+| `AgentCoreMemorySaver` (checkpointer) | graph state + message history, as **blob** events | the agent itself, to resume a thread |
+| `AgentCoreMemoryStore` | each exchange as **conversational** events | the router (`/status` counts them, `/clear` deletes them) and AgentCore's long-term extraction, which never sees blobs |
+
+The conversational pair is written once per completed turn rather than from a model hook: a hook fires on every model call, so a turn with tool calls would record itself several times over. (`langchain.agents.create_agent` has no pre/post-model hooks anyway — middleware replaces them.)
 
 ### Two session ids, deliberately separate
 
@@ -185,7 +194,7 @@ Keeping them apart is what makes the chat commands possible — rotating an id i
 - `/new` → both (a genuinely fresh start)
 - `/clear` → deletes the current thread's events (the only destructive one)
 
-Earlier the agent derived the memory id from `actor_id` itself and ignored what the router sent, which welded the two dimensions together: switching instances could never start a new thread, and the router's own reads of the thread always missed. Message counts come from `ListEvents` filtered to `conversational` payloads — Strands also writes session/agent state events, which would otherwise inflate the number.
+Earlier the agent derived the memory id from `actor_id` itself and ignored what the router sent, which welded the two dimensions together: switching instances could never start a new thread, and the router's own reads of the thread always missed. Message counts come from `ListEvents` filtered to `conversational` payloads — the checkpointer also writes graph-state blobs to the same thread, which would otherwise inflate the number.
 
 Authorization is a third, orthogonal dimension: the vaulted Lark token is keyed to `lark:{open_id}`, not to either session, so rotating sessions never forces a re-consent.
 

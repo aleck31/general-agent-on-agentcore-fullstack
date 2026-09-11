@@ -18,7 +18,7 @@
 set -euo pipefail
 cd "$(cd "$(dirname "$0")" && pwd)"
 
-PREFIX="lark-agent"
+PREFIX="agentcore-fullstack"
 # .env holds the config, but an env var given on the command line has to win —
 # sourcing with `set -a` would otherwise clobber what the caller just asked for.
 _CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEARCH:-}"
