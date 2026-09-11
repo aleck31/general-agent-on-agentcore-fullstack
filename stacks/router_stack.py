@@ -40,6 +40,11 @@ class RouterStack(Stack):
         user_pool_arn: str,
         user_pool_client_id: str,
         cognito_password_secret_name: str,
+        # Per-user file mounts. Empty unless the storage stack is deployed, and the
+        # router treats that as "no file tools" rather than an error.
+        mount_ticket_key_arn: str = "",
+        s3files_file_system_id: str = "",
+        mount_path: str = "/mnt/user",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -108,6 +113,10 @@ class RouterStack(Stack):
                 "COGNITO_USER_POOL_ID": user_pool_id,
                 "COGNITO_CLIENT_ID": user_pool_client_id,
                 "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
+                # Per-user file mounts. files.enabled() is false while these are empty.
+                "MOUNT_TICKET_KEY_ID": mount_ticket_key_arn,
+                "S3FILES_FS_ID": s3files_file_system_id,
+                "MOUNT_PATH": mount_path,
             },
             log_group=log_group,
         )
@@ -145,6 +154,19 @@ class RouterStack(Stack):
         # own JWT, and a CUSTOM_JWT runtime refuses SigV4 anyway. Authorization for that
         # hop is the token, not this role.
         self.identity_table.grant_read_write_data(self.router_fn)
+
+        # Per-user file mounts, only when the storage stack exists. Two permissions, and
+        # both are deliberately narrow: signing (never verifying — the router mints
+        # tickets and the broker checks them, so neither can do the other's job) and
+        # running the bootstrap command in a session.
+        if mount_ticket_key_arn:
+            self.router_fn.add_to_role_policy(iam.PolicyStatement(
+                actions=["kms:Sign"], resources=[mount_ticket_key_arn]))
+            self.router_fn.add_to_role_policy(iam.PolicyStatement(
+                actions=["bedrock-agentcore:InvokeAgentRuntimeCommand"],
+                # The runtime id is not known at synth time on a first deploy, which is
+                # the same reason AGENTCORE_RUNTIME_ARN starts as a placeholder here.
+                resources=[f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/*"]))
         self.router_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["lambda:InvokeFunction"],

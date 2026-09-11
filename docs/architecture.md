@@ -13,6 +13,7 @@ A general-purpose agent on Amazon Bedrock AgentCore, integrated with **Lark (Fei
 | **Reasoning** | the model, the system prompt, the turn loop | `agent/agent_core.py` — LangGraph (`langchain.agents.create_agent`) on `ChatBedrockConverse` |
 | **Memory** | what the agent remembers, and for how long | AgentCore Memory (STM), thread id owned by the router |
 | **Tools** | what the agent can actually do, and as whom | `mcp-servers/*` (one Runtime each), plus the Web Search Gateway |
+| **Files** | what survives the microVM, and whose it is | `stacks/storage_stack.py`, `lambda/broker/`, `lambda/router/files.py` (optional) |
 
 Each layer is separable, and the seams are deliberate: adding a tool server touches only the last row, adding a channel only the first. `README.md → Extending the agent` lists what each addition actually costs.
 
@@ -61,6 +62,7 @@ Each layer is separable, and the seams are deliberate: adding a tool server touc
 | AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `agentcore_fullstack_agent_mem` (STM) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
 | AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region) | `stacks/gateway_stack.py`, `deploy.sh gateway` |
+| Mount broker | Turns a KMS-signed ticket into credentials scoped to one user's Access Point. Optional, with the VPC and file system it needs | `lambda/broker/`, `stacks/storage_stack.py` |
 
 ## How an answer gets back
 
@@ -167,6 +169,33 @@ Two things that are easy to get wrong. **The router does not deliver the answer*
 
 Delivery is scoped by subscription: Lark sends approval events only for definitions subscribed through `approvals/{code}/subscribe`, a **separate step from ticking the event in the console** (`./deploy.sh approvals`). Two naming inconsistencies cost an afternoon each: the event calls it `approval_code` while `tasks/query` returns `definition_code`, and `tasks/query` is a **GET** (POST answers `404 page not found`, which reads like a permissions problem).
 
+## Persistent files, per user
+
+Optional (`FILES_STORAGE=true`) and off by default, because it is the only part of this project with a fixed monthly cost. The Runtime is stateless in the way that matters: a session's filesystem dies with its microVM, and `maxLifetime` ends that microVM within 8 h regardless of activity. Conversation state is covered by Memory; **bytes** are what this adds.
+
+```
+router (the only component that knows who a turn is)
+  │  KMS-signed ticket: {sub: lark:ou_..., exp}          ← subject is the verified actor,
+  │                                                        never an argument
+  ▼  InvokeAgentRuntimeCommand → bootstrap inside the session (also starts the microVM)
+agent microVM (root)
+  │  ticket → /dev/shm, mount profile → credential_process = cred_helper.py
+  │  cred_helper → broker Lambda ─────────────────────────┐
+  ▼  mount -t s3files -o accesspoint=<ap> …  /mnt/user    │
+S3 Files ← Access Point rooted at /users/lark_<open_id>   │
+                                                          ▼
+                                        broker: verify ticket → this user's Access Point
+                                        → STS credentials pinned to that one AP ARN
+```
+
+**Why the mount happens inside the session.** `filesystemConfigurations` would let the platform mount an Access Point for us, with no root and no broker — but it is **Runtime-scoped**, and one Runtime serves every user. A single shared Access Point would put one user's files on a filesystem every other session can read; a Runtime per user would mean deploying N identical Runtimes. Since the isolation unit has to be the user and the config knob is per Runtime, the mount can only be performed at invoke time. That is also the only reason root is needed: `mount(2)` requires `CAP_SYS_ADMIN`, whereas a platform-performed mount needs no privilege in the container at all.
+
+**Two layers of isolation, neither of them agent code.** The Access Point's `rootDirectory` is fixed server-side to `/users/lark_<open_id>`, so a mount through it cannot see another prefix whatever the client asks. And the credentials the broker returns carry an STS session policy conditioned on that one Access Point ARN, so code running as root still cannot mount anything else. The agent's own execution role has no S3 permission on the bucket.
+
+**What the ticket is and is not.** It is a bearer capability: whoever holds it can get credentials for that user's files until it expires, and expiry is the only revocation. It says nothing about who asked for it — which is exactly why the signer must never take a subject as input. The router signs the actor it has already verified from the inbound JWT, and it holds `kms:Sign` while the broker holds only `kms:Verify`: neither can do the other's job.
+
+**Known edges.** Bootstrap runs once per session (claimed via a DynamoDB `MOUNT` marker) and doubles as the microVM warm-up; a microVM replaced mid-session loses the mount until the session rotates, though the bootstrap script is idempotent and safe to re-run. Access Points are a limited resource, so the user count is bounded (EFS allows 1000 per file system; s3files is assumed similar but unconfirmed). `/clear` deletes Memory events, never files. Details and the measured findings behind the container are in `.dev/adr/0007`.
+
 ## Conversation memory
 
 History lives in AgentCore Memory (STM, 30-day retention) keyed by `(actor_id, memory_session_id)`, so it outlives the microVM: a fresh container still reads the same thread. The compiled graph and its MCP sessions are cached per session and reused across messages — rebuilding per message re-handshakes every MCP server and re-lists tools, ~15–20s of avoidable latency.
@@ -200,6 +229,6 @@ Authorization is a third, orthogonal dimension: the vaulted Lark token is keyed 
 
 ## Deploy shape
 
-CDK stacks: security, agentcore, router, shim, gateway, observability. The tool path is agent-side 3LO, so the gateway stack is reduced to its service role (no mcpServer target); the shim stack is what the 3LO flow actually uses. Everything AgentCore-side is created outside CloudFormation: the **Runtimes** (agent, lark-cli MCP server, and the approval MCP server when deployed), Memory, the OAuth2 credential provider, the workload identity, and the Web Search gateway. `deploy.sh` builds them — ARM64 images via CodeBuild, resources via the AgentCore CLI / control-plane — and feeds ids back through `.cdk-state.json`.
+CDK stacks: security, agentcore, router, shim, gateway, observability, and storage when `FILES_STORAGE=true` (that one carries the VPC, so it is off by default). The tool path is agent-side 3LO, so the gateway stack is reduced to its service role (no mcpServer target); the shim stack is what the 3LO flow actually uses. Everything AgentCore-side is created outside CloudFormation: the **Runtimes** (agent, lark-cli MCP server, and the approval MCP server when deployed), Memory, the OAuth2 credential provider, the workload identity, and the Web Search gateway. `deploy.sh` builds them — ARM64 images via CodeBuild, resources via the AgentCore CLI / control-plane — and feeds ids back through `.cdk-state.json`.
 
 `AWS::BedrockAgentCore::*` types do now exist, so this is a choice rather than a limitation: the agent Runtime and Memory are created implicitly by `agentcore deploy`, which also builds the image, and replacing that official tool to move them into a stack costs more than it returns. Two consequences worth knowing: `destroy.sh` needs an explicit delete for each of these (nothing errors if one is missed — only a real teardown catches it), and the ordering `3lo`/`gateway` → `runtime` has to be maintained by hand, since the Runtime bakes in the provider name and gateway URL. See `README.md` for the deploy commands and Lark console setup.

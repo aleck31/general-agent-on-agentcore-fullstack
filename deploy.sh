@@ -10,6 +10,7 @@
 #
 # Target comes from .env (PROFILE / REGION / MODEL_ID); command-line env vars win:
 #   REGION=ap-northeast-1 ./deploy.sh
+#   FILES_STORAGE=true ./deploy.sh    per-user file mounts (creates a VPC + NAT)
 #
 # Nothing here waits for human input: the two values you have to paste into the
 # Lark console don't block the deploy, they just gate the bot at runtime, so they
@@ -22,6 +23,7 @@ PREFIX="agentcore-fullstack"
 # .env holds the config, but an env var given on the command line has to win —
 # sourcing with `set -a` would otherwise clobber what the caller just asked for.
 _CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEARCH:-}"
+_CLI_FILES="${FILES_STORAGE:-}"
 [ -f .env ] && { set -a; . ./.env; set +a; }
 PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
@@ -30,6 +32,7 @@ export AWS_REGION="$REGION"
 [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { [ -n "$PROFILE" ] && export AWS_PROFILE="$PROFILE"; } || true
 # Each step re-sources .env, so an override has to be exported to reach them.
 [ -n "$_CLI_WEB_SEARCH" ] && export WEB_SEARCH="$_CLI_WEB_SEARCH"
+[ -n "$_CLI_FILES" ] && export FILES_STORAGE="$_CLI_FILES"
 
 step() { printf '\n\033[1;36m### %s\033[0m\n' "$*"; }
 note() { printf '\033[1;33m%s\033[0m\n' "$*"; }

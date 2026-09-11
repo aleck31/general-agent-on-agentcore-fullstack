@@ -16,6 +16,7 @@ That identity integration is deliberately not re-documented here. Two samples co
 | Long-running turns | The turn is accepted, runs in the background, and posts its own answer — no synchronous wait to time out |
 | Per-user consent, self-healing | First use posts a 点击授权 link and replays the original message once consent lands; the user never re-sends |
 | Web search *(optional)* | AgentCore Gateway fronting the built-in Web Search connector — no user identity involved |
+| Persistent files per user *(optional)* | S3 Files mounted at `/mnt/user`, one Access Point per user, isolation enforced by IAM rather than by agent code |
 | Unattended decisions *(optional)* | Approval events wake a turn with nobody present; limits enforced in code, not by the model |
 | Operational visibility | Chat commands expose session routing, the serving microVM, memory thread and authorization state |
 
@@ -58,6 +59,7 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 | `agent/` | the agent container: HTTP contract + AgentCore Memory + per-user 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers into a card (`lark_notify`) |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands. Also the only component that mints per-user JWTs (`cognito.py`) |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
+| `lambda/broker/` | Mount-credential broker: verifies a KMS-signed ticket, gets-or-creates that user's Access Point, and mints credentials scoped to it |
 | `mcp-servers/` | One directory per MCP server, one Runtime each: `lark-cli/` acts as the user against Lark, `approval/` runs approval decisions on the app identity. Each declares its own build/runtime config in `runtime.env`, so adding a server needs no script change |
 | `deploy.sh` | the deploy entry point — orders the steps in `scripts/` |
 | `scripts/` | step implementations: preflight / provision (base/runtime/gateway) / build-mcp / setup-3lo / setup-lark / subscribe-approvals / manage-allowlist / destroy |
@@ -79,7 +81,7 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 
 | Step | What |
 |---|---|
-| `./deploy.sh base` | CDK stacks (security, agentcore, router, shim, gateway, observability) |
+| `./deploy.sh base` | CDK stacks (security, agentcore, router, shim, gateway, observability, plus storage when `FILES_STORAGE=true`) |
 | `./deploy.sh mcp` | build every MCP server under `mcp-servers/` (CodeBuild ARM64) + create/update a Runtime each. `./deploy.sh mcp approval` for just one |
 | `./deploy.sh 3lo` | workload identity + the `agentcore-fullstack-3lo` OAuth credential provider |
 | `./deploy.sh gateway` | Web Search gateway in us-east-1 — skipped unless `WEB_SEARCH=true` |
@@ -213,7 +215,7 @@ Two structural constraints shape anything larger. **One Runtime per MCP server**
 
 Not implemented yet — listed so the current shape isn't mistaken for the intended one. Directions, not commitments:
 
-- **Session-scoped persistent files, on your own S3.** The Runtime is stateless: a microVM's filesystem dies with it, and `maxLifetime` caps it at 8 h regardless. Anything the agent should keep — generated files, working data, artifacts a later turn refers to — needs storage outside the container, in a bucket you own, isolated per session. The design to follow is [acruntime-s3files-isolation](https://github.com/walkley/acruntime-s3files-isolation): mount S3 Files per session through a dedicated Access Point whose `rootDirectory` is fixed server-side to `sessions/<session_id>/`, with mount credentials scoped to that Access Point by IAM. Isolation is then enforced by AWS rather than by agent code — which matters precisely because an agent runs model-generated code. Not started; `.dev/PLAN-s3-session-storage.md` has the notes.
+- **A user-facing document tool.** "Save this as a doc" should create a docx in the user's own Lark Drive, where they can open and share it — the scopes and the raw API passthrough already allow it, but no named tool exposes it, so the model has to assemble the call itself. The S3 layer below is for artifacts the user never sees; it is not where a deliverable belongs.
 - **More interaction surfaces.** Lark chat is the only entrypoint today. A web UI is the obvious next one (the sibling interceptor variant has one; this repo does not), and the router's identity resolution is deliberately channel-shaped (`resolve_user(channel, channel_user_id)`) so a second channel doesn't require reworking it.
 - **A broader tool set.** `mcp-servers/lark-cli/` exposes three tools — whoami, list-my-docs, and a raw Lark API passthrough — chosen to prove per-user access end to end, not to be complete.
 - **More downstream systems.** One OAuth provider per system is already the model; nothing but a provider and an `IDP_REGISTRY` entry is missing for the second one.
@@ -238,7 +240,8 @@ This deploys billable AWS resources. All the always-on pieces are consumption- o
 - **Lambda + API Gateway** — router (webhook) + shim (OAuth RFC-6749 façade, a backend web service); effectively free at demo volume.
 - **Secrets Manager** — `$0.40/secret/month` each, and only two static secrets: the Lark credentials (`{prefix}/channels/lark`) and the Cognito password salt. No dynamic per-user secrets.
 - **Web search (optional)** — only when `WEB_SEARCH=true`: an AgentCore Gateway plus per-query connector charges. The gateway sits in us-east-1, so its traffic is cross-region.
-- **Cognito, DynamoDB (on-demand)** — the identity/state plane; negligible at demo volume. (A `user-files` S3 bucket is provisioned but not used on the current tool path — near-zero cost.)
+- **Persistent files (optional, `FILES_STORAGE=true`)** — **a NAT Gateway, ~$32/month plus data processing, which is more than everything else here put together.** It is not avoidable on this path: the mount is NFS, its endpoint is a mount target inside a VPC, so the Runtime joins that VPC and then needs a route out to Bedrock and to Lark's public API. Interface endpoints for the AWS services would cost more than the NAT. Plus S3 storage for what the agent writes, and a Lambda invocation per credential refresh (hourly per session). Off by default.
+- **Cognito, DynamoDB (on-demand)** — the identity/state plane; negligible at demo volume.
 
 `scripts/destroy.sh` removes everything `deploy.sh` created, including the OAuth credential provider and both gateways. Costs are usage-driven; an idle deployment still accrues the two microVMs' memory-time and the two static per-secret charges.
 
@@ -252,6 +255,8 @@ This is a **reference implementation, not production-ready as-is**. Before any r
 - **A vaulted token is checked against its actor at point of use.** Consent binds a token to whatever the return-url was told, so forwarding a consent link would otherwise vault someone else's grant under your name; the agent resolves each token's real owner before using it and fails closed.
 - **Command execution is injection-safe.** The MCP server spawns lark-cli via `execFile` (no shell) with arguments passed as an array, and the user token via an environment variable — never interpolated into a command line.
 - **Web search sees no user data.** It runs on Amazon's index with `GATEWAY_IAM_ROLE`, carries no user token, and queries stay inside AWS. It does mean model output can include fetched web content — treat that as untrusted input like any other tool result. `parameterValues.domainFilter` can restrict which domains are searched.
+- **Per-user files are isolated by IAM, not by agent code** — one S3 Files Access Point per user with its `rootDirectory` fixed server-side to `users/lark_<open_id>`, and mount credentials that an STS session policy pins to that one Access Point. The agent's execution role holds **no** S3 permission on the bucket, and the router (the only component that establishes who a turn is) is the only thing that can sign a mount ticket — it signs the verified actor and never accepts a subject as input.
+- **Enabling files storage makes the agent container run as root**, on an Amazon Linux base, because `mount(2)` needs `CAP_SYS_ADMIN` and the per-user Access Point cannot be declared on the Runtime. That gives up the non-root execution the container otherwise has; nothing else in the image needs root. A mount also means an injected turn can read and write that user's own files — the same blast radius the Lark tools already have, but worth knowing before switching it on.
 - **IAM is scoped but a sample.** Re-review least-privilege for your account before production.
 - **Webhook verification is fail-closed** — a missing/invalid signature or a timestamp outside the replay window is rejected before decryption. Don't relax this.
 - **AES-CBC webhook decryption** is Lark's fixed scheme (not our choice); authenticity is guaranteed by the upstream signature check, not by the cipher mode.

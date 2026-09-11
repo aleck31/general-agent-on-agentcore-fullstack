@@ -104,6 +104,21 @@ def drop_session(user_id: str) -> None:
 _PENDING_AUTH_TTL = int(os.environ.get("PENDING_AUTH_TTL_SECONDS", "600"))  # 10 min
 
 
+def mount_needs_bootstrap(user_id: str, session_id: str) -> bool:
+    """True when this session has not had a file mount set up yet, and claim it.
+
+    The marker is per session because the mount lives in the microVM, not in the user's
+    account: a rotated session id means a new microVM and a new mount. It does not catch
+    a microVM replaced mid-session — the bootstrap script is idempotent, but nothing here
+    notices the mount has gone until the session rotates."""
+    key = {"PK": f"USER#{user_id}", "SK": "MOUNT"}
+    item = _table.get_item(Key=key).get("Item") or {}
+    if item.get("sessionId") == session_id:
+        return False
+    _table.put_item(Item={**key, "sessionId": session_id, "at": int(time.time())})
+    return True
+
+
 def park_pending_auth(user_id: str, message: str, chat_id: str) -> None:
     """Remember what the user was trying to do, to replay after they authorize.
     One per user (overwrites) — a second attempt supersedes the first."""

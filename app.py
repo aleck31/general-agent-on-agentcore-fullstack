@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """CDK application entry point.
 
-A single-tenant-friendly PoC that runs a simple Python agent on Bedrock
-AgentCore Runtime, reachable from Lark bot chat (webhook messages), with Lark
-as the identity provider. Per-user Lark tokens live in the AgentCore Identity
-Token Vault (3LO) and are injected by the Gateway into an MCP-server target —
-the agent never holds a downstream credential.
+A general-purpose agent on Bedrock AgentCore Runtime, reachable from Lark bot chat, with
+Lark as the identity provider. Per-user Lark tokens live in the AgentCore Identity Token
+Vault (3LO); the agent fetches the calling user's token and passes it to the tool servers
+in a custom header, holding no downstream credential of its own.
 
 Deployment is hybrid:
-  Phase 1 (CDK):  Security, AgentCore base (Role/ECR/S3), Router,
-                  Gateway, Observability
-  Phase 2 (CLI):  AgentCore Runtime + Gateway created/updated by deploy.sh
-                  (control-plane APIs), IDs fed back into cdk.json context
+  CDK:  security, agentcore base (role/ECR/S3), shim, router, gateway, observability,
+        and storage when files_storage=true
+  CLI:  the AgentCore Runtimes, Memory, the OAuth provider and the Web Search gateway,
+        created by deploy.sh through control-plane APIs; ids fed back via .cdk-state.json
 """
 
 import json
@@ -26,6 +25,7 @@ from stacks.router_stack import RouterStack
 from stacks.gateway_stack import GatewayStack
 from stacks.shim_stack import ShimStack
 from stacks.observability_stack import ObservabilityStack
+from stacks.storage_stack import StorageStack
 
 app = cdk.App()
 
@@ -45,6 +45,11 @@ env = cdk.Environment(
 )
 
 prefix = ctx("resource_prefix") or "agentcore-fullstack"
+
+# Context values arrive as strings when passed with -c, and the string "false" is truthy,
+# so compare rather than test.
+def _flag(name: str) -> bool:
+    return str(ctx(name)).strip().lower() == "true"
 
 # --- Security: Cognito user pool + Secrets Manager slots ---
 security = SecurityStack(app, f"{prefix}-security", env=env)
@@ -74,10 +79,26 @@ shim = ShimStack(
     env=env,
 )
 
+# --- Storage: S3 Files + per-user mount broker (opt-in) ---
+# Off unless files_storage=true, because this is the one stack with a fixed monthly cost
+# (a NAT Gateway, which the NFS mount forces — see .dev/adr/0007). Everything else here
+# is consumption-priced, so creating this by accident would be the expensive mistake.
+# Declared before the router, which needs its key and file system id.
+storage = None
+if _flag("files_storage"):
+    storage = StorageStack(
+        app,
+        f"{prefix}-storage",
+        user_files_bucket=agentcore.user_files_bucket,
+        env=env,
+    )
+
 # --- Router: Lark webhook ingestion (HTTP API + Lambda + DynamoDB identity) ---
 router = RouterStack(
     app,
     f"{prefix}-router",
+    mount_ticket_key_arn=storage.ticket_key.key_arn if storage else "",
+    s3files_file_system_id=storage.file_system.ref if storage else "",
     runtime_arn=agentcore.runtime_arn,
     runtime_endpoint_qualifier=ctx("runtime_endpoint_id") or "DEFAULT",
     lark_secret_name=security.lark_secret.secret_name,

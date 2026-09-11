@@ -17,10 +17,15 @@ cd "$ROOT"
 
 # Deployment target: command-line env vars win over .env, which wins over defaults.
 _CLI_PROFILE="${PROFILE:-}" _CLI_REGION="${REGION:-}" _CLI_WEB_SEARCH="${WEB_SEARCH:-}"
+_CLI_FILES="${FILES_STORAGE:-}"
 [ -f .env ] && { set -a; . ./.env; set +a; }
 PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
 WEB_SEARCH="${_CLI_WEB_SEARCH:-${WEB_SEARCH:-false}}"
+# Persistent per-user files. Off by default because it is the only part of this project
+# with a fixed monthly cost: the mount is NFS, so the Runtime has to sit in a VPC and
+# needs a NAT to keep reaching Bedrock and Lark. See .dev/adr/0007.
+FILES_STORAGE="${_CLI_FILES:-${FILES_STORAGE:-false}}"
 PREFIX="agentcore-fullstack"
 export AWS_REGION="$REGION" UV_LINK_MODE=copy
 # Credentials already in the environment outrank .env's profile.
@@ -58,8 +63,17 @@ base_cdk_stacks() {
   }
 
   log "Base — CDK stacks"
-  $CDK deploy "$PREFIX-security" "$PREFIX-agentcore" "$PREFIX-router" \
-             "$PREFIX-gateway" "$PREFIX-shim" "$PREFIX-observability" \
+  local stacks=("$PREFIX-security" "$PREFIX-agentcore" "$PREFIX-router"
+                "$PREFIX-gateway" "$PREFIX-shim" "$PREFIX-observability")
+  # The storage stack only exists when the flag is on (app.py skips it otherwise), so
+  # naming it unconditionally would fail the deploy rather than skip it.
+  if [ "$FILES_STORAGE" = "true" ]; then
+    stacks+=("$PREFIX-storage")
+    echo "  files storage: on (VPC + NAT will be created)"
+  else
+    echo "  files storage: off"
+  fi
+  $CDK deploy "${stacks[@]}" -c "files_storage=$FILES_STORAGE" \
              --require-approval never --outputs-file cdk.out/outputs.json
 }
 
@@ -101,15 +115,37 @@ phase2_runtime() {
   [ -n "$role" ] || { echo "missing execution role output — run --base first"; exit 1; }
   [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || { echo "agentcore_fullstack_mcp runtime not found — deploy the MCP server first (scripts/build-mcp.sh + create runtime)"; exit 1; }
 
+  # Files storage: the mount is NFS, so the Runtime has to join the storage stack's VPC.
+  # These stay empty when the feature is off, and every use of them below is guarded.
+  local subnets="" runtime_sg="" fs_id="" broker_fn="" vpc_args=()
+  if [ "$FILES_STORAGE" = "true" ]; then
+    subnets="$(cfn_out "$PREFIX-storage" RuntimeSubnetIds)"
+    runtime_sg="$(cfn_out "$PREFIX-storage" RuntimeSecurityGroupId)"
+    fs_id="$(cfn_out "$PREFIX-storage" FileSystemId)"
+    broker_fn="$(cfn_out "$PREFIX-storage" BrokerFunctionName)"
+    [ -n "$subnets" ] && [ "$subnets" != "None" ] || {
+      echo "storage stack outputs missing — run --base with FILES_STORAGE=true first"; exit 1; }
+    vpc_args=(--vpc --subnets "$subnets" --security-groups "$runtime_sg")
+    echo "  files storage: VPC mode, subnets $subnets"
+  fi
+
   # Configure once (idempotent; writes .bedrock_agentcore.yaml). Custom Dockerfile
   # in agent/ is respected. Allow the agent's own execution role to fetch per-user
   # tokens and invoke the lark-cli MCP runtime (granted out-of-band / in agentcore stack).
+  #
+  # Note the network mode is only settled here, on first configure. Switching an existing
+  # deployment between PUBLIC and VPC is done by the update below, which sends the whole
+  # network configuration explicitly.
   if [ ! -f .bedrock_agentcore.yaml ]; then
     agentcore configure -e agent/server.py -n "${PREFIX//-/_}_agent" \
-      --execution-role "$role" -dt container -p HTTP -r "$REGION" --non-interactive
+      --execution-role "$role" -dt container -p HTTP -r "$REGION" --non-interactive \
+      "${vpc_args[@]}"
   fi
 
   agentcore deploy --auto-update-on-conflict \
+    --env "MOUNT_PATH=${fs_id:+/mnt/user}" \
+    --env "S3FILES_FS_ID=$fs_id" \
+    --env "MOUNT_BROKER_FN=$broker_fn" \
     --env "BEDROCK_MODEL_ID=$model" \
     --env "BEDROCK_AGENTCORE_MEMORY_ID=$memory" \
     --env "LARK_MCP_URL=$mcp_url" \
@@ -153,6 +189,18 @@ phase2_runtime() {
     art="$(_rt_get agentRuntimeArtifact)"
     net="$(_rt_get networkConfiguration)"
     envvars="$(_rt_get environmentVariables)"
+    # With files storage on, the network configuration is *set* rather than preserved —
+    # a runtime that already exists in PUBLIC mode has to be moved into the VPC, and
+    # reading its current config back would keep it where it is. The S3 gateway endpoint
+    # is service-managed and free (a gateway endpoint, not an interface one).
+    if [ "$FILES_STORAGE" = "true" ]; then
+      net="$(SUBNETS="$subnets" SG="$runtime_sg" uv run python -c '
+import json, os
+print(json.dumps({"networkMode": "VPC", "networkModeConfig": {
+    "subnets": [s for s in os.environ["SUBNETS"].split(",") if s],
+    "securityGroups": [os.environ["SG"]],
+    "requireServiceS3Endpoint": True}}))')"
+    fi
     # Fail loudly rather than deploy a runtime stripped of its configuration.
     [ "$envvars" = "{}" ] && { echo "  aborting: runtime reports no environment variables to preserve"; exit 1; }
     aws bedrock-agentcore-control update-agent-runtime --agent-runtime-id "$rid" \

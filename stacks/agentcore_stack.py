@@ -225,7 +225,12 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # --- Optional S3 for per-user files (kept minimal; agent may use it) --
+        # --- Per-user files. Reached through the mount, never with this role: the agent
+        # deliberately holds no S3 permission on this bucket. Access is granted only to
+        # the S3 Files file system role (scoped to users/*) and, per call, to credentials
+        # the broker scopes to one Access Point — see .dev/adr/0007. An earlier version
+        # granted this role read/write on the whole bucket, which handed every session's
+        # code every user's files.
         self.user_files_bucket = s3.Bucket(
             self,
             "UserFilesBucket",
@@ -237,7 +242,6 @@ class AgentCoreStack(Stack):
             auto_delete_objects=True,
             lifecycle_rules=[s3.LifecycleRule(expiration=Duration.days(365))],
         )
-        self.user_files_bucket.grant_read_write(self.execution_role)
 
         # --- Container image (ARM64) ------------------------------------------
         # Built from ./agent. deploy.sh reads this URI to create/update the runtime.

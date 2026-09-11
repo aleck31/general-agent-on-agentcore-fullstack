@@ -71,6 +71,14 @@ probe cognito        aws cognito-idp list-user-pools --max-results 1
 probe iam            aws iam list-roles --max-items 1
 [ "$WEB_SEARCH" != "true" ] || probe "agentcore(us-east-1)" \
   aws bedrock-agentcore-control list-gateways --region us-east-1 --max-results 1
+# Files storage reaches three services nothing else here touches, and s3files is new
+# enough that an old CLI simply has no such command — which is worth catching before a
+# deploy that creates a VPC.
+if [ "${FILES_STORAGE:-false}" = "true" ]; then
+  probe s3files aws s3files list-file-systems --max-results 1
+  probe kms     aws kms list-keys --limit 1
+  probe ec2     aws ec2 describe-vpcs --max-items 1
+fi
 [ -z "$denied" ] || printf '\033[1;33m%s\033[0m\n' "  warning: no read access to:$denied
   The deploy writes to these — expect it to fail unless that is just a read-only denial."
 
