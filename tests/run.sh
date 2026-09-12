@@ -14,7 +14,7 @@ echo "== agent =="
 # loop is tested through a real compiled graph rather than a copy of its source.
 uv run --with boto3 --with aiohttp --with httpx --with pytest \
        --with langchain --with langchain-aws --with langgraph \
-       --with langchain-mcp-adapters \
+       --with langchain-mcp-adapters --with langgraph-checkpoint-aws \
        python -m pytest agent/test_agent.py -q
 
 echo "== cred helper =="

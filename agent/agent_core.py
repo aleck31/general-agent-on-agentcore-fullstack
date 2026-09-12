@@ -6,17 +6,21 @@ per session and cached — not rebuilt per message. Rebuilding per message re-ha
 every MCP server and re-lists tools, which adds ~15–20s of latency. AgentCore gives
 each session its own microVM, so the cache holds essentially one entry per container.
 
-Memory follows the two components AWS documents for LangGraph, which do different jobs:
-  - AgentCoreMemorySaver  — the checkpointer. Graph state and message history, stored
-    as blob events, keyed by (actor_id, thread_id). This is what the agent reads back,
-    so history survives idle-termination and a new microVM.
-  - AgentCoreMemoryStore  — writes each exchange as *conversational* events. Nothing
-    here reads them: they exist because the router counts and clears them (/status,
-    /clear read `conversational` payloads) and because AgentCore's long-term
-    extraction only sees that shape, never blobs.
-We write the conversational pair once per completed turn rather than from a model hook:
-a hook fires on every model call, so a turn with tool calls would record itself several
-times over.
+Memory is two independent backends, because the two jobs have different requirements
+(see .dev/adr/0008):
+  - DynamoDBSaver — the checkpointer, i.e. the conversation itself. Full graph state
+    (messages with their tool calls and results, channels, pending writes), addressed by
+    thread_id alone — the sha256 of the actor. Nothing about the container is part of the
+    key, so a turn cut off at the 15-minute invoke cap resumes in a brand-new microVM.
+    Written per superstep, so the durable record advances *during* a turn: there is no
+    shutdown hook on a microVM, and a design that flushes at the end loses the turn.
+  - AgentCoreMemoryStore — long-term memory only, written once per completed turn as
+    *conversational* events. Extraction and semantic retrieval are the things AgentCore
+    Memory does that a plain table does not. The router also counts and clears these
+    (/status, /clear read `conversational` payloads), so dropping them zeroes that count
+    silently.
+Once per completed turn rather than from a model hook: a hook fires on every model call,
+so a turn with tool calls would record itself several times over.
 
 Per-user Lark access (agent-side 3LO): for each end-user the agent fetches that user's
 vaulted Lark token from AgentCore Identity (GetResourceOauth2Token, USER_FEDERATION)
@@ -57,6 +61,10 @@ log = logging.getLogger("agent.core")
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
 _MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-5")
 _MEMORY_ID = os.environ.get("BEDROCK_AGENTCORE_MEMORY_ID", "")
+_CHECKPOINT_TABLE = os.environ.get("CHECKPOINT_TABLE", "")
+_CHECKPOINT_BUCKET = os.environ.get("CHECKPOINT_BUCKET", "")
+# One thread per user, rotated only by /reset, so the state has to expire on its own.
+_CHECKPOINT_TTL = int(os.environ.get("CHECKPOINT_TTL_DAYS", "365")) * 86400
 # Empty unless ./deploy.sh mcp approval ran — the approval tools are opt-in.
 _APPROVAL_MCP_URL = os.environ.get("APPROVAL_MCP_URL", "")
 _SYSTEM = os.environ.get(
@@ -116,17 +124,85 @@ def _session_id_for(actor_id: str) -> str:
     return "sess-" + hashlib.sha256(actor_id.encode()).hexdigest()[:32]
 
 
-def _memory_components():
-    """(checkpointer, store), or (None, None) if Memory isn't configured. Built per
-    session rather than once: both hold a boto3 client, and a stale one outliving its
-    credentials is the failure this avoids."""
+# Shared only by the fallback: an InMemorySaver rebuilt with every session would drop
+# history every time the cache expires (50 min), which is worse than the degradation the
+# fallback is there to provide.
+_fallback_saver = None
+
+
+def _checkpointer():
+    """The conversation's durable state, in DynamoDB.
+
+    Not AgentCoreMemorySaver: that one carries a mandatory 3-365 day event expiry, bills
+    per write, and needs the Memory resource to exist at all. Fidelity is identical —
+    both go through JsonPlusSerializer and produce the same CheckpointTuple — so the
+    choice is only about the dependency surface. AgentCore Memory is still used, for
+    long-term records; see _store().
+
+    Built per session rather than once, because it holds a boto3 client and a stale one
+    outliving its credentials is the failure that avoids."""
+    global _fallback_saver
+    if not _CHECKPOINT_TABLE:
+        # Tests, and any runtime that predates provision writing the env var. A session
+        # still works; history just dies with the container.
+        if _fallback_saver is None:
+            from langgraph.checkpoint.memory import InMemorySaver
+            log.warning("CHECKPOINT_TABLE unset: history will not outlive this container")
+            _fallback_saver = InMemorySaver()
+        return _fallback_saver
+    from langgraph_checkpoint_aws import DynamoDBSaver
+    return DynamoDBSaver(
+        table_name=_CHECKPOINT_TABLE,
+        region_name=_REGION,
+        ttl_seconds=_CHECKPOINT_TTL,
+        # Compress first so spilling to S3 stays the exception: DynamoDB caps an item at
+        # 400 KB, and one unbounded thread per user would otherwise reach it.
+        enable_checkpoint_compression=True,
+        s3_offload_config=(
+            {"bucket_name": _CHECKPOINT_BUCKET, "key_prefix": "state"}
+            if _CHECKPOINT_BUCKET else None),
+    )
+
+
+def _store():
+    """Long-term memory, or None until the Memory resource exists. Keyword-only args,
+    despite what the devguide example shows."""
     if not _MEMORY_ID:
-        return None, None
-    from langgraph_checkpoint_aws import AgentCoreMemorySaver, AgentCoreMemoryStore
-    saver = AgentCoreMemorySaver(_MEMORY_ID, region_name=_REGION)
-    # Keyword-only, despite what the devguide example shows.
-    store = AgentCoreMemoryStore(memory_id=_MEMORY_ID, region_name=_REGION)
-    return saver, store
+        return None
+    from langgraph_checkpoint_aws import AgentCoreMemoryStore
+    return AgentCoreMemoryStore(memory_id=_MEMORY_ID, region_name=_REGION)
+
+
+_INTERRUPTED_TOOL = "The previous attempt was interrupted before this tool returned."
+
+
+async def _arepair_interrupted_turn(graph, config: dict) -> int:
+    """Answer any tool call the previous turn was killed before completing.
+
+    Checkpoints are written per superstep, so a turn cut off between "the model emitted
+    tool_calls" and "the tool returned" leaves the trailing AIMessage with calls that have
+    no matching ToolMessage. Bedrock then rejects every subsequent request — each toolUse
+    must have a toolResult — which is the worst failure available here: the history is
+    intact but permanently unreachable, and it looks like the agent broke rather than like
+    a turn was interrupted. LangGraph could resume the pending task itself, but only via
+    ainvoke(None), and we always arrive carrying a new user message.
+
+    Only the trailing message is repaired. That is the only place an interrupted turn can
+    leave one, and appending is only a valid fix there — a toolResult has to follow its
+    toolUse, so a dangling call deeper in the history is a different bug that this must not
+    paper over."""
+    state = await graph.aget_state(config)
+    messages = (getattr(state, "values", None) or {}).get("messages") or []
+    last = messages[-1] if messages else None
+    pending = [tc for tc in (getattr(last, "tool_calls", None) or []) if tc.get("id")] \
+        if isinstance(last, AIMessage) else []
+    if not pending:
+        return 0
+    await graph.aupdate_state(config, {"messages": [
+        ToolMessage(content=_INTERRUPTED_TOOL, tool_call_id=tc["id"],
+                    name=tc.get("name") or "tool")
+        for tc in pending]})
+    return len(pending)
 
 
 async def _aopen_tools(stack: AsyncExitStack, connection: dict) -> list:
@@ -196,7 +272,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         except Exception:  # noqa: BLE001 — search is optional, Lark tools are not
             log.exception("web search unavailable for %s", actor_id)
 
-    saver, store = _memory_components()
+    saver, store = _checkpointer(), _store()
     # langchain.agents.create_agent, not langgraph.prebuilt.create_react_agent: the
     # latter is deprecated as of LangGraph 1.0 and slated for removal in 2.0 (AWS's
     # devguide example still imports it). Note there are no pre/post model hooks on
@@ -204,11 +280,23 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     # record is written at turn end instead.
     graph = create_agent(model=_model, tools=tools, system_prompt=_SYSTEM,
                          checkpointer=saver, store=store)
+    # thread_id is the whole checkpoint address (chosen by the router, so /reset can
+    # rotate it) — DynamoDBSaver derives its partition key from it alone, and since it is
+    # the sha256 of the actor, per-user isolation follows from the key. The agent never
+    # picks it. actor_id is carried for AgentCoreMemorySaver, which rejects a config
+    # without it, so switching back stays a one-line change.
+    config = {"configurable": {"thread_id": mem_sid, "actor_id": actor_id}}
+    # Building a session is exactly the moment a replaced microVM picks up a thread whose
+    # last turn may have been killed mid tool call, so repair before the first invoke.
+    try:
+        repaired = await _arepair_interrupted_turn(graph, config)
+        if repaired:
+            log.info("answered %d tool call(s) left by an interrupted turn", repaired)
+    except Exception:  # noqa: BLE001 — a failed repair must not cost the user a session
+        log.warning("could not check for an interrupted turn", exc_info=True)
     return {
         "graph": graph, "stack": stack, "store": store,
-        # thread_id is the Memory session (chosen by the router, so /reset can rotate
-        # it); actor_id is required by the saver, not optional.
-        "config": {"configurable": {"thread_id": mem_sid, "actor_id": actor_id}},
+        "config": config,
         "actor_id": actor_id, "mem_sid": mem_sid,
         "created": time.time(),
         "auth_url": auth_url, "identity_error": identity_error,
@@ -389,6 +477,12 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
                 _record_turn(s, message, answer)
         except Exception as e:  # noqa: BLE001 — the caller is already gone
             log.exception("async turn failed for %s", actor_id)
+            # This session stays cached, so a turn that died mid tool call would make every
+            # later turn fail too. Repair here as well as at build time.
+            try:
+                _run(_arepair_interrupted_turn(s["graph"], s["config"]), timeout=30)
+            except Exception:  # noqa: BLE001
+                log.warning("could not repair the interrupted turn", exc_info=True)
             lark_notify.send_text(chat_id, f"Sorry, that didn't work out ({type(e).__name__}).")
         finally:
             # Clear the router's marker whatever happened — leaving it on a failed turn

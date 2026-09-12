@@ -19,6 +19,7 @@ from aws_cdk import (
     Stack,
     RemovalPolicy,
     Duration,
+    aws_dynamodb as dynamodb,
     aws_iam as iam,
     aws_s3 as s3,
     aws_ecr_assets as ecr_assets,
@@ -278,6 +279,59 @@ class AgentCoreStack(Stack):
             ],
         )
 
+        # --- Conversation checkpoints (LangGraph graph state) -----------------
+        # One table for all users. Isolation is the partition key, which DynamoDBSaver
+        # derives from thread_id alone — and thread_id is the sha256 of the actor, chosen
+        # by the router from a verified identity, never by the agent. A table per user
+        # would put a CreateTable on the request path and cap the deployment at the
+        # regional 2,500-table quota, for no isolation the partition key doesn't give.
+        #
+        # Separate from the router's identity table deliberately: that one holds the
+        # identity control plane (SESSION/MEMSESSION/MOUNT/PENDING_AUTH), and the process
+        # running model output has no business writing there. Key prefixes wouldn't
+        # collide (CHECKPOINT_/WRITES_ vs USER#) — the reason is privilege, not layout.
+        self.checkpoint_table = dynamodb.Table(
+            self,
+            "CheckpointTable",
+            table_name=f"{prefix}-checkpoints",
+            # PK/SK/ttl are all fixed by DynamoDBSaver, which writes those literal names.
+            partition_key=dynamodb.Attribute(
+                name="PK", type=dynamodb.AttributeType.STRING),
+            sort_key=dynamodb.Attribute(
+                name="SK", type=dynamodb.AttributeType.STRING),
+            time_to_live_attribute="ttl",
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.DESTROY,  # PoC
+        )
+
+        # State over ~350 KB spills to S3, leaving only a reference in the item, because
+        # DynamoDB caps an item at 400 KB and one thread per user grows without bound.
+        # A dedicated bucket, not the user-files one: that bucket grants this role nothing
+        # by design (.dev/adr/0007), its mandatory versioning would retain a copy of every
+        # superstep overwrite, and its 365-day expiry would strip a payload out from under
+        # a live reference.
+        self.checkpoint_bucket = s3.Bucket(
+            self,
+            "CheckpointBucket",
+            bucket_name=f"{prefix}-checkpoints-{account}-{region}",
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+            removal_policy=RemovalPolicy.DESTROY,  # PoC
+            auto_delete_objects=True,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="expire-after-checkpoint-ttl",
+                    # Deliberately longer than the table's TTL: a payload outliving its
+                    # reference wastes storage, the reverse breaks a checkpoint.
+                    expiration=Duration.days(400),
+                    abort_incomplete_multipart_upload_after=Duration.days(7)),
+            ],
+        )
+
+        self.checkpoint_table.grant_read_write_data(self.execution_role)
+        self.checkpoint_bucket.grant_read_write(self.execution_role)
+
         # --- Container image (ARM64) ------------------------------------------
         # Built from ./agent. deploy.sh reads this URI to create/update the runtime.
         self.agent_image = ecr_assets.DockerImageAsset(
@@ -296,3 +350,5 @@ class AgentCoreStack(Stack):
         CfnOutput(self, "ExecutionRoleArn", value=self.execution_role.role_arn)
         CfnOutput(self, "AgentImageUri", value=self.agent_image.image_uri)
         CfnOutput(self, "UserFilesBucketName", value=self.user_files_bucket.bucket_name)
+        CfnOutput(self, "CheckpointTableName", value=self.checkpoint_table.table_name)
+        CfnOutput(self, "CheckpointBucketName", value=self.checkpoint_bucket.bucket_name)

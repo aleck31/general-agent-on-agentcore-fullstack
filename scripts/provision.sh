@@ -110,9 +110,11 @@ phase2_runtime() {
   log "Runtime — create/update the agent Runtime from the CDK-published image"
 
   local role image model memory shim mcp_arn mcp_url pool client pwsecret ws_url
-  local approval_url approval_arn issuer
+  local approval_url approval_arn issuer ckpt_table ckpt_bucket
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
   image="$(cfn_out "$PREFIX-agentcore" AgentImageUri)"
+  ckpt_table="$(cfn_out "$PREFIX-agentcore" CheckpointTableName)"
+  ckpt_bucket="$(cfn_out "$PREFIX-agentcore" CheckpointBucketName)"
   pool="$(cfn_out "$PREFIX-security" UserPoolId)"
   client="$(cfn_out "$PREFIX-security" UserPoolClientId)"
   issuer="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)"
@@ -137,6 +139,10 @@ phase2_runtime() {
 
   [ -n "$role" ] || { echo "missing execution role output — run --base first"; exit 1; }
   [ -n "$image" ] || { echo "missing agent image output — run --base first"; exit 1; }
+  # Not fatal: the agent falls back to in-process state and keeps answering. Loud, because
+  # the symptom is "the bot forgot everything after a timeout", which reads as a bug.
+  [ -n "$ckpt_table" ] && [ "$ckpt_table" != "None" ] || \
+    echo "  WARNING: no checkpoint table output — conversations will not survive a new microVM"
   [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || {
     echo "${PREFIX//-/_}_mcp runtime not found — run ./deploy.sh mcp first"; exit 1; }
 
@@ -160,12 +166,18 @@ phase2_runtime() {
     SUBNETS="$subnets" SG="$runtime_sg" MODEL="$model" MEMORY="$memory" MCP_URL="$mcp_url" \
     SHIM="$shim" POOL="$pool" PWSECRET="$pwsecret" WS_URL="$ws_url" \
     APPROVAL_URL="$approval_url" FS_ID="$fs_id" BROKER_FN="$broker_fn" PREFIX="$PREFIX" \
+    CKPT_TABLE="$ckpt_table" CKPT_BUCKET="$ckpt_bucket" \
     LARK_DOMAIN="$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['lark_api_domain'])")" \
     uv run python - <<'PYEOF'
 import json, os
 e = os.environ
 env = {
     "BEDROCK_MODEL_ID": e["MODEL"],
+    # Conversation state. Without the table the agent still answers, but history dies
+    # with the container — so a missing output here is a real regression, not an option.
+    "CHECKPOINT_TABLE": e["CKPT_TABLE"],
+    "CHECKPOINT_BUCKET": e["CKPT_BUCKET"],
+    # Long-term memory only; empty until the Memory resource exists.
     "BEDROCK_AGENTCORE_MEMORY_ID": e["MEMORY"],
     "LARK_MCP_URL": e["MCP_URL"],
     "SHIM_RETURN_URL": e["SHIM"],
@@ -214,12 +226,11 @@ PYEOF
 import json, os
 p = json.loads(os.environ["P"]); p.pop("agentRuntimeName", None)
 p["agentRuntimeId"] = os.environ["RID"]
-# Update-only: the service rejects requireServiceS3Endpoint at creation time. Setting it
-# here gives AgentCore a service-managed S3 gateway endpoint, which costs nothing (a
-# gateway endpoint, not an interface one) and keeps its own S3 traffic off the NAT.
-nmc = (p.get("networkConfiguration") or {}).get("networkModeConfig")
-if nmc:
-    nmc["requireServiceS3Endpoint"] = True
+# No requireServiceS3Endpoint: rejected at creation, and "agents created after
+# 2026-06-08 cannot modify requireServiceS3Endpoint" on update — so for anything built
+# now it is unreachable, not update-only as an earlier reading of the error suggested.
+# Leaving it in broke every runtime update while the first deploy still succeeded,
+# because only the update path sent it.
 print(json.dumps(p))')" >/dev/null
     echo "  updated $rname ($rid)"
   else

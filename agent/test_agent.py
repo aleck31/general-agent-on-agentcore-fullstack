@@ -90,6 +90,97 @@ def test_session_id_deterministic_per_user():
     assert sid("lark:ou_abc").startswith("sess-")
 
 
+# ------------------------------- checkpointer -------------------------------
+# The conversation lives in the checkpointer, so the two ways this can go wrong are both
+# silent: picking the fallback in a real deployment (history dies with the microVM, which
+# reads as "the bot forgot everything") or mis-wiring the offload (a long conversation
+# hits DynamoDB's 400 KB item cap mid-turn).
+
+def test_checkpointer_falls_back_to_one_shared_in_process_saver():
+    """No table configured — a session must still work, and the fallback has to be shared:
+    a fresh InMemorySaver per session build would drop history every cache expiry."""
+    with mock.patch.object(agent_core, "_CHECKPOINT_TABLE", ""), \
+         mock.patch.object(agent_core, "_fallback_saver", None):
+        first = agent_core._checkpointer()
+        second = agent_core._checkpointer()
+    from langgraph.checkpoint.memory import InMemorySaver
+    assert isinstance(first, InMemorySaver)
+    assert first is second
+
+
+def test_checkpointer_uses_dynamodb_with_offload_when_configured():
+    with mock.patch.object(agent_core, "_CHECKPOINT_TABLE", "tbl"), \
+         mock.patch.object(agent_core, "_CHECKPOINT_BUCKET", "bkt"), \
+         mock.patch("langgraph_checkpoint_aws.DynamoDBSaver") as saver:
+        agent_core._checkpointer()
+    kwargs = saver.call_args.kwargs
+    assert kwargs["table_name"] == "tbl"
+    assert kwargs["ttl_seconds"] == agent_core._CHECKPOINT_TTL
+    # Compression keeps the spill rare; the spill keeps a long thread from failing hard.
+    assert kwargs["enable_checkpoint_compression"] is True
+    assert kwargs["s3_offload_config"]["bucket_name"] == "bkt"
+
+
+def test_checkpointer_omits_offload_when_no_bucket():
+    """Passing a config with an empty bucket name would fail at write time, deep inside
+    the saver, instead of simply not offloading."""
+    with mock.patch.object(agent_core, "_CHECKPOINT_TABLE", "tbl"), \
+         mock.patch.object(agent_core, "_CHECKPOINT_BUCKET", ""), \
+         mock.patch("langgraph_checkpoint_aws.DynamoDBSaver") as saver:
+        agent_core._checkpointer()
+    assert saver.call_args.kwargs["s3_offload_config"] is None
+
+
+def _repair(messages):
+    """Drive the real repair against a graph whose state is `messages`, returning the
+    count and whatever it appended."""
+    import asyncio
+    appended = []
+
+    class _Graph:
+        async def aget_state(self, config):
+            return type("S", (), {"values": {"messages": messages}})()
+
+        async def aupdate_state(self, config, values):
+            appended.extend(values["messages"])
+
+    n = asyncio.run(agent_core._arepair_interrupted_turn(_Graph(), {}))
+    return n, appended
+
+
+def test_interrupted_tool_call_is_answered_so_the_thread_stays_usable():
+    """Bedrock rejects a toolUse with no toolResult, so without this the whole thread
+    becomes permanently unusable after one killed turn — history intact, unreachable."""
+    from langchain_core.messages import AIMessage as AI, HumanMessage
+    dangling = AI(content="", tool_calls=[
+        {"name": "lark_list_my_docs", "args": {}, "id": "call-1"}])
+    n, appended = _repair([HumanMessage("hi"), dangling])
+    assert n == 1
+    assert appended[0].tool_call_id == "call-1"
+
+
+def test_repair_is_a_no_op_on_a_completed_turn():
+    from langchain_core.messages import AIMessage as AI, HumanMessage
+    n, appended = _repair([HumanMessage("hi"), AI(content="done")])
+    assert (n, appended) == (0, [])
+
+
+def test_repair_ignores_a_dangling_call_that_is_not_trailing():
+    """A toolResult must follow its toolUse, so appending cannot fix a call buried in the
+    history — silently 'repairing' it would corrupt the order instead."""
+    from langchain_core.messages import AIMessage as AI, HumanMessage
+    buried = AI(content="", tool_calls=[{"name": "t", "args": {}, "id": "old"}])
+    n, appended = _repair([buried, HumanMessage("hi"), AI(content="done")])
+    assert (n, appended) == (0, [])
+
+
+def test_long_term_store_is_absent_until_memory_exists():
+    """The Store is long-term memory only now. It must be optional: the checkpointer is
+    what carries the conversation, so no Memory resource may not break a turn."""
+    with mock.patch.object(agent_core, "_MEMORY_ID", ""):
+        assert agent_core._store() is None
+
+
 # ------------------------------- busy tracking ------------------------------
 # /ping must report HealthyBusy while a background turn runs, or AgentCore
 # reclaims the container and kills it. The counter is shared mutable state
