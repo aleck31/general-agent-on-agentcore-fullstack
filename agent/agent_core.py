@@ -78,7 +78,57 @@ _SESSION_TTL = int(os.environ.get("SESSION_TTL_SECONDS", "3000"))  # 50 min
 # consents we want the next turn to pick up the token.
 _UNAUTH_TTL = int(os.environ.get("UNAUTH_SESSION_TTL_SECONDS", "60"))
 
-_model = ChatBedrockConverse(model=_MODEL_ID, region_name=_REGION)
+# Prompt caching. Bedrock's is explicit: with no cachePoint block in the request nothing
+# is cached, so this is not something we inherit by default. `cache_control` is read only
+# from per-call kwargs — `model_kwargs` gets rerouted to `additional_model_request_fields`
+# and `.bind(cache_control=…)` is lost when create_agent calls bind_tools (both measured)
+# — so injecting it into the request is the only reliable route.
+#
+# 1h rather than the 5m default because it matches _SESSION_TTL: the cached prefix then
+# lives as long as the session that keeps reusing it. The write costs 2.0x base input
+# instead of 1.25x, but reads are 0.1x either way, so a session of more than a couple of
+# turns is comfortably ahead — and a single turn with two tool calls already reaches
+# break-even on its own.
+_CACHE_TTL = os.environ.get("PROMPT_CACHE_TTL", "1h")   # "5m" | "1h" | "" disables
+
+
+class _CachingChatBedrockConverse(ChatBedrockConverse):
+    """ChatBedrockConverse that asks for prompt caching on every request.
+
+    langchain-aws does the placement AWS documents — after the system prompt, after the
+    tool definitions, and a rolling pair at the end of the message list, up to Bedrock's
+    limit of four. All we supply is the intent.
+
+    Before tuning this, know that the 1,024-token minimum for Sonnet 5 is cumulative over
+    tools + system + messages in that order. Measured against the deployed servers, our
+    tool definitions are ~1,618 tokens with the approval server and ~400 without it, and
+    the system prompt is ~32 — so on a minimal deployment the tools checkpoint earns
+    nothing until the conversation itself grows past the minimum.
+    """
+
+    cache_ttl: str = "1h"
+
+    def _with_cache(self, kwargs: dict) -> dict:
+        # An explicit per-call value wins: a caller asking for something specific should
+        # not be silently overridden.
+        if self.cache_ttl and "cache_control" not in kwargs:
+            kwargs["cache_control"] = {"ttl": self.cache_ttl}
+        return kwargs
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return super()._generate(messages, stop=stop, run_manager=run_manager,
+                                 **self._with_cache(kwargs))
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        return super()._stream(messages, stop=stop, run_manager=run_manager,
+                               **self._with_cache(kwargs))
+
+
+# The class defines no _agenerate/_astream, so the async paths run these in a thread —
+# overriding the two synchronous entry points covers streaming and non-streaming, sync
+# and async alike.
+_model = _CachingChatBedrockConverse(model=_MODEL_ID, region_name=_REGION,
+                                     cache_ttl=_CACHE_TTL)
 
 # session_id -> {graph, config, stack, created, ...}. One microVM ≈ one session.
 _sessions: dict[str, dict] = {}

@@ -211,6 +211,16 @@ Not `AgentCoreMemorySaver` for the checkpoint: fidelity is identical (both seria
 
 A turn killed between "the model emitted `tool_calls`" and "the tool returned" leaves a trailing `AIMessage` whose calls have no matching `ToolMessage`, which Bedrock then rejects on every later request — history intact but unreachable. The agent repairs that on session build and after a failed turn, appending a synthetic result for each unanswered call. Only the trailing message is repaired: a `toolResult` has to follow its `toolUse`, so appending cannot fix a dangling call buried deeper in the history.
 
+### Prompt caching
+
+Bedrock's prompt cache is explicit: with no `cachePoint` block in the request, nothing is cached. `agent_core._CachingChatBedrockConverse` injects `cache_control` into every request, and langchain-aws then places the checkpoints where AWS documents them — after the system prompt, after the tool definitions, and a rolling pair at the end of the message list, within Bedrock's limit of four.
+
+Injection has to happen at the request: `model_kwargs` is rerouted to `additional_model_request_fields`, and `.bind(cache_control=…)` is dropped when `create_agent` calls `bind_tools` (both measured against langchain-aws 1.7).
+
+The TTL is 1h rather than the 5m default, matching `_SESSION_TTL` so the cached prefix lives as long as the session reusing it. A 1h write costs 2.0x base input against 1.25x for 5m, while reads are 0.1x either way, so caching wins once reads exceed ~1.11x writes. Measured on a three-turn session: 7,064 cache-read tokens against 3,840 written, a ratio of 1.84 — already past break-even, and the ratio improves as a conversation lengthens.
+
+What to know before tuning: Sonnet 5's 1,024-token minimum per checkpoint is cumulative over tools + system + messages **in that order**. Measured against the deployed servers, the tool definitions are ~1,618 tokens with the approval server (the approval tools alone are ~1,331) and ~400 without it, and the system prompt is ~32 — so on a minimal deployment the tools checkpoint earns nothing until the conversation itself grows past the minimum. `PROMPT_CACHE_TTL=""` disables caching, which matters because a checkpoint that always misses still costs the write premium.
+
 ### Two session ids, deliberately separate
 
 | Id | Decides | Owned by | Stored |

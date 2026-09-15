@@ -736,3 +736,70 @@ def test_clear_history_reports_failure_rather_than_claiming_success():
     with mock.patch.object(agent_core, "_checkpointer", return_value=broken):
         r = agent_core.clear_history("lark:ou_x", "sess-1")
     assert r["deleted"] is False and r["error"] == "RuntimeError"
+
+
+# --------------------------- prompt caching ----------------------------------
+# Bedrock caches nothing without a cachePoint block, and the only route that works is a
+# per-call kwarg: model_kwargs is rerouted to additional_model_request_fields, and
+# .bind(cache_control=...) is dropped when create_agent calls bind_tools. Both measured —
+# so these tests exist to catch the day a library change breaks the injection silently.
+
+class _CaptureClient:
+    def __init__(self):
+        self.params = {}
+
+    def converse(self, **kw):
+        self.params = kw
+        return {"output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}}
+
+
+def _invoke_capturing(**ctor):
+    from langchain_core.messages import SystemMessage
+    client = _CaptureClient()
+    m = agent_core._CachingChatBedrockConverse(
+        model="global.anthropic.claude-sonnet-5", region_name="us-west-2",
+        client=client, **ctor)
+    m.bind_tools([{"name": "t", "description": "d",
+                   "input_schema": {"type": "object", "properties": {}}}]).invoke(
+        [SystemMessage("sys"), HumanMessage("a"), HumanMessage("b")])
+    p = client.params
+    return {
+        "system": sum(1 for b in p.get("system", []) if "cachePoint" in b),
+        "tools": sum(1 for t in p.get("toolConfig", {}).get("tools", []) if "cachePoint" in t),
+        "messages": sum(1 for msg in p.get("messages", [])
+                        for b in (msg.get("content") or [])
+                        if isinstance(b, dict) and "cachePoint" in b),
+        "ttls": [b["cachePoint"].get("ttl") for b in p.get("system", []) if "cachePoint" in b],
+    }
+
+
+def test_cache_points_reach_the_request_on_system_tools_and_messages():
+    got = _invoke_capturing(cache_ttl="1h")
+    assert got["system"] == 1 and got["tools"] == 1 and got["messages"] >= 1
+    assert got["ttls"] == ["1h"]
+
+
+def test_five_minute_ttl_is_sent_without_an_explicit_ttl_field():
+    """Bedrock's default window is 5m, and langchain-aws omits the field for it rather
+    than sending a redundant value — so an absent ttl here is correct, not a bug."""
+    assert _invoke_capturing(cache_ttl="5m")["ttls"] == [None]
+
+
+def test_empty_ttl_disables_caching_entirely():
+    """An escape hatch that must really disable it: a cachePoint still costs a 1.25-2x
+    write on every request that misses."""
+    got = _invoke_capturing(cache_ttl="")
+    assert (got["system"], got["tools"], got["messages"]) == (0, 0, 0)
+
+
+def test_an_explicit_per_call_cache_control_is_not_overridden():
+    from langchain_core.messages import SystemMessage
+    client = _CaptureClient()
+    m = agent_core._CachingChatBedrockConverse(
+        model="global.anthropic.claude-sonnet-5", region_name="us-west-2",
+        client=client, cache_ttl="1h")
+    m.invoke([SystemMessage("sys"), HumanMessage("a")], cache_control={"ttl": "5m"})
+    assert [b["cachePoint"].get("ttl") for b in client.params["system"]
+            if "cachePoint" in b] == [None]      # 5m → field omitted
