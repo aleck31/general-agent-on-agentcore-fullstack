@@ -163,19 +163,43 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # Agent-side 3LO + downstream MCP. The agent fetches THIS user's Lark token
-        # from the Identity Token Vault, then invokes the lark-cli MCP Runtime with it.
-        # These data-plane actions don't support resource-level scoping.
+        # Downstream MCP servers, scoped to this project's runtimes. `InvokeAgentRuntime`
+        # does take resource-level permissions — an earlier comment here claimed it does
+        # not, which was wrong: verified with a session policy naming one runtime ARN,
+        # where the named runtime answered 200 and a sibling returned 403. Without this
+        # the container could invoke any Runtime in the account, so the in-process tool
+        # list was the only thing keeping it to ours — and that list lives in the same
+        # process as the model output (see .dev/adr/0008).
+        #
+        # A name prefix rather than exact ARNs because the AWS-assigned suffix is only
+        # known after provision.sh creates each Runtime, and this stack has to exist
+        # first — it owns the execution role they are created with. `runtime-endpoint`
+        # is a separate resource type, hence both patterns.
+        rt_prefix = prefix.replace("-", "_")
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "bedrock-agentcore:InvokeAgentRuntime",
+                    "bedrock-agentcore:InvokeAgentRuntimeForUser",
+                ],
+                resources=[
+                    f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{rt_prefix}_*",
+                    f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{rt_prefix}_*/runtime-endpoint/*",
+                ],
+            )
+        )
+
+        # Agent-side 3LO: the agent fetches THIS user's Lark token from the Identity
+        # Token Vault. Left unscoped — unlike the invoke actions above, the resource
+        # types for these were not verified, and the impersonation surface is closed by
+        # the explicit Deny below rather than by resource scoping. The Gateway is in
+        # us-east-1 (the only region offering the search connector), so its ARN is not
+        # derivable from this stack's region.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
                     "bedrock-agentcore:GetWorkloadAccessToken",
                     "bedrock-agentcore:GetResourceOauth2Token",
-                    "bedrock-agentcore:InvokeAgentRuntime",
-                    "bedrock-agentcore:InvokeAgentRuntimeForUser",
-                    # Web search reaches the agent through a Gateway (in us-east-1,
-                    # the only region offering the connector), so the caller needs
-                    # this on top of the Gateway role's own permissions.
                     "bedrock-agentcore:InvokeGateway",
                 ],
                 resources=["*"],
@@ -329,6 +353,11 @@ class AgentCoreStack(Stack):
             ],
         )
 
+        # Objects only. DynamoDBSaver also tries to set a lifecycle policy on this bucket
+        # at startup and logs "Failed to configure S3 lifecycle: AccessDenied" when it
+        # cannot — leave it that way. The rule above is deliberately longer than the
+        # table's TTL, and granting PutBucketLifecycleConfiguration would let a container
+        # running model output rewrite it. The warning is expected, not a misconfiguration.
         self.checkpoint_table.grant_read_write_data(self.execution_role)
         self.checkpoint_bucket.grant_read_write(self.execution_role)
 
