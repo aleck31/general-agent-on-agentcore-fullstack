@@ -121,6 +121,22 @@ async def handle_invocations(request: web.Request) -> web.Response:
     if action == "warmup":
         return web.json_response({"ready": True})
 
+    # Thread bookkeeping for /status and /clear. Here rather than in the router because
+    # the conversation is LangGraph state now — reading or deleting it needs the
+    # checkpointer, and agent_core is the only module allowed to know about the framework.
+    if action in ("history_stats", "clear_history"):
+        actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
+        mem_sid = payload.get("memorySessionId", "")
+        fn = (agent_core.history_stats if action == "history_stats"
+              else agent_core.clear_history)
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, fn, actor_id, mem_sid)
+            return web.json_response(result)
+        except Exception as e:
+            log.exception("%s failed", action)
+            return web.json_response({"error": str(e)})
+
     if action == "reauth":
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
         idp = payload.get("message", "") or "lark"   # router sends the idp key here

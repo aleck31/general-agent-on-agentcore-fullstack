@@ -11,7 +11,7 @@ A general-purpose agent on Amazon Bedrock AgentCore, integrated with **Lark (Fei
 | **Channel** | how a user reaches the agent and how answers get back | `lambda/router/`, `agent/lark_notify.py` |
 | **Identity** | who this turn is, and whose credentials the tools may use | `lambda/router/cognito.py`, `agent/lark_3lo.py`, `lambda/shim/` |
 | **Reasoning** | the model, the system prompt, the turn loop | `agent/agent_core.py` — LangGraph (`langchain.agents.create_agent`) on `ChatBedrockConverse` |
-| **Memory** | what the agent remembers, and for how long | AgentCore Memory (STM), thread id owned by the router |
+| **Memory** | what the agent remembers, and for how long | DynamoDB checkpoints (conversation) + AgentCore Memory (long-term); thread id owned by the router |
 | **Tools** | what the agent can actually do, and as whom | `mcp-servers/*` (one Runtime each), plus the Web Search Gateway |
 | **Files** | what survives the microVM, and whose it is | `stacks/storage_stack.py`, `lambda/broker/`, `lambda/router/files.py` (optional) |
 
@@ -23,7 +23,7 @@ Each layer is separable, and the seams are deliberate: adding a tool server touc
                     ┌──────────────────────────────┐        ┌──────────────────────────┐
   Lark message ───▶ │  Router Lambda               │◀──────▶│  DynamoDB identity table │
    (webhook)        │  verify / AES-decrypt        │        │  SESSION    → runtime id │
-                    │  resolve → lark:{open_id}    │        │  MEMSESSION → memory id  │
+                    │  resolve → lark:{open_id}    │        │  MEMSESSION → thread id  │
                     │  chat commands (/auth …)     │        │  ALLOW      → allowlist  │
                     └──────────────┬───────────────┘        └──────────────────────────┘
                      POST /invocations, Authorization: Bearer <user's JWT>
@@ -32,7 +32,7 @@ Each layer is separable, and the seams are deliberate: adding a tool server touc
                                    ▼
         ┌────────────────────────────────────────────────────────┐
         │  Agent container (ARM64, AgentCore Runtime)            │     AgentCore Identity
-        │   LangGraph agent, history in AgentCore Memory         │     Token Vault (3LO)
+        │   LangGraph agent, conversation checkpointed to DynamoDB│     Token Vault (3LO)
         │   lark_3lo: platform WAT → GetResourceOauth2Token      │◀───▶ stores / refreshes
         │   the turn runs in the background; /ping = HealthyBusy │     THIS user's token
         └───┬───────────────────────────────────────────┬────────┘            ▲
@@ -54,12 +54,12 @@ Each layer is separable, and the seams are deliberate: adding a tool server touc
 | Component | What it is | Where |
 |---|---|---|
 | Router Lambda | Lark webhook ingestion (verify + AES decrypt, resolve user, invoke runtime); mints the per-user JWT; owns both session ids; handles the chat commands | `lambda/router/` |
-| Agent container | LangGraph agent on Bedrock; HTTP contract (8080); AgentCore Memory for continuity; agent-side 3LO; MCP sessions to the lark-cli server, the approval server when deployed, and optionally web search; runs turns in the background and posts answers to the chat itself | `agent/` |
+| Agent container | LangGraph agent on Bedrock; HTTP contract (8080); DynamoDB checkpoints for continuity; agent-side 3LO; MCP sessions to the lark-cli server, the approval server when deployed, and optionally web search; runs turns in the background and posts answers to the chat itself | `agent/` |
 | Lark OAuth shim | RFC-6749 façade over Lark's non-standard token endpoint, plus the 3LO return endpoint | `lambda/shim/` |
 | Lark MCP server | lark-cli engine on AgentCore Runtime; calls Lark with the per-user token from a custom passthrough header | `mcp-servers/lark-cli/` |
 | Approval MCP server | Lark approvals on AgentCore Runtime — the case where the user's identity *cannot* be forwarded. Limits enforced in code, not by the model | `mcp-servers/approval/` |
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `agentcore-fullstack-3lo`, workload `agentcore-fullstack-wl` |
-| AgentCore Memory | Per-user conversation history, keyed by `(actor_id, memory_session_id)` | `agentcore_fullstack_agent_mem` (STM) |
+| Checkpoint table | Per-user conversation state, partition key derived from `thread_id` | `agentcore-fullstack-checkpoints` (+ an S3 bucket for state over ~350 KB) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
 | AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region) | `stacks/gateway_stack.py`, `deploy.sh gateway` |
 | Mount broker | Turns a KMS-signed ticket into credentials scoped to one user's Access Point. Optional, with the VPC and file system it needs | `lambda/broker/`, `stacks/storage_stack.py` |
@@ -70,7 +70,7 @@ Answers come back asynchronously. A turn that researches something and writes it
 
 The reply is streamed rather than posted in one go: a CardKit card with `streaming_mode` goes out immediately as a placeholder, then the accumulated text is written into it so it types out. The write happens on the card's own thread and coalesces to the newest text — a CardKit write costs ~470 ms (measured, 361–606 ms), so doing it inline stalled the loop for longer than the interval it was throttled to, and the text arrived in jerks. Now the token loop is paced by the model (~40 chars/s measured for Sonnet 4.6) and the visible cadence by Lark's round trip, instead of the two throttling each other.
 
-What the placeholder actually covers is session assembly, not model latency: raw Bedrock returns a first token in 1.0–1.5 s, while a first turn spends ~7 s before that — ~4 s of MCP handshakes across two servers and ~2 s loading Memory history. Subsequent turns in the same session skip the handshake (the agent and its MCP clients are cached). All of this uses the app's tenant token: it is the bot speaking. A CardKit failure (missing `cardkit:card:write`, an update rejected mid-stream) degrades to a single plain-text post.
+What the placeholder actually covers is session assembly, not model latency: raw Bedrock returns a first token in 1.0–1.5 s, while a first turn spends ~7 s before that — ~4 s of MCP handshakes across two servers and ~2 s loading the checkpoint. Subsequent turns in the same session skip the handshake (the agent and its MCP clients are cached). All of this uses the app's tenant token: it is the bot speaking. A CardKit failure (missing `cardkit:card:write`, an update rejected mid-stream) degrades to a single plain-text post.
 
 `/ping` reports `HealthyBusy` for the duration, which is what stops AgentCore from reclaiming the container mid-turn; that defers idle reclamation (the session-inactivity timer `idleRuntimeSessionTimeout`) but not `maxLifetime` — the microVM's wall-clock age cap (default 8 h, configurable 60–28800 s) which never resets on activity, so it is the hard ceiling on one background turn. The router's async self-invocation also disables Lambda's default retries — a timeout counts as a function error there, so retries would replay the whole turn and duplicate both the work and the reply.
 
@@ -198,32 +198,36 @@ S3 Files ← Access Point rooted at /users/lark_<open_id>   │
 
 ## Conversation memory
 
-History lives in AgentCore Memory (STM, 30-day retention) keyed by `(actor_id, memory_session_id)`, so it outlives the microVM: a fresh container still reads the same thread. The compiled graph and its MCP sessions are cached per session and reused across messages — rebuilding per message re-handshakes every MCP server and re-lists tools, ~15–20s of avoidable latency.
+The conversation is LangGraph graph state in a DynamoDB table, addressed by `thread_id` alone — and `thread_id` is derived from the user, never from the container. So a turn cut off at the 15-minute invoke cap resumes in a brand-new microVM. Checkpoints are written **per superstep**, so the durable record advances *during* a turn: a microVM gets no shutdown hook, and any design that flushes at the end loses the turn that was interrupted. The compiled graph and its MCP sessions are cached per session and reused across messages — rebuilding per message re-handshakes every MCP server and re-lists tools, ~15–20s of avoidable latency.
 
-**Two writers, two readers — not redundancy.** AWS's LangGraph integration ships two components that do different jobs:
+**Two backends, two jobs** (see `.dev/adr/0008` for why each):
 
-| | Writes | Read by |
+| | Holds | Read by |
 |---|---|---|
-| `AgentCoreMemorySaver` (checkpointer) | graph state + message history, as **blob** events | the agent itself, to resume a thread |
-| `AgentCoreMemoryStore` | each exchange as **conversational** events | the router (`/status` counts them, `/clear` deletes them) and AgentCore's long-term extraction, which never sees blobs |
+| `DynamoDBSaver` (checkpointer) | full graph state — messages with their tool calls and results, channels, pending writes | the agent, to resume a thread; `/status` and `/clear` via the agent |
+| AgentCore Memory (`AgentCoreMemoryStore`) | long-term records only | long-term recall, when a Memory resource exists |
 
-The conversational pair is written once per completed turn rather than from a model hook: a hook fires on every model call, so a turn with tool calls would record itself several times over. (`langchain.agents.create_agent` has no pre/post-model hooks anyway — middleware replaces them.)
+Not `AgentCoreMemorySaver` for the checkpoint: fidelity is identical (both serialize through `JsonPlusSerializer` and produce the same `CheckpointTuple`), but it carries a mandatory 3–365 day event expiry, bills per write, and cannot be reached at all unless the Memory resource exists. DynamoDB sets its own TTL, needs no extra resource, and spills state over ~350 KB to S3 so one unbounded thread per user cannot hit the 400 KB item cap.
+
+A turn killed between "the model emitted `tool_calls`" and "the tool returned" leaves a trailing `AIMessage` whose calls have no matching `ToolMessage`, which Bedrock then rejects on every later request — history intact but unreachable. The agent repairs that on session build and after a failed turn, appending a synthetic result for each unanswered call. Only the trailing message is repaired: a `toolResult` has to follow its `toolUse`, so appending cannot fix a dangling call buried deeper in the history.
 
 ### Two session ids, deliberately separate
 
 | Id | Decides | Owned by | Stored |
 |---|---|---|---|
 | **runtime session id** | which microVM serves the request (AgentCore binds them 1:1, but the binding is not permanent — the microVM is replaced on idle/lifetime limits while the id lives on) | router | DynamoDB `USER#{id} / SESSION` |
-| **memory session id** | which conversation thread the agent reads and appends to | router, passed to the agent as `memorySessionId` | DynamoDB `USER#{id} / MEMSESSION` |
+| **checkpoint thread id** | which conversation thread the agent reads and appends to (still sent as `memorySessionId`) | router, passed to the agent as `memorySessionId` | DynamoDB `USER#{id} / MEMSESSION` |
 
 Keeping them apart is what makes the chat commands possible — rotating an id is instant and non-destructive, so each command just switches ids rather than deleting anything:
 
-- `/reset` → new memory thread, same instance (start over, old events kept)
-- `/reconnect` → new instance, same memory thread (proves memory outlives the container)
+- `/reset` → new thread, same instance (start over, old state kept)
+- `/reconnect` → new instance, same thread (proves the conversation outlives the container)
 - `/new` → both (a genuinely fresh start)
-- `/clear` → deletes the current thread's events (the only destructive one)
+- `/clear` → deletes the current thread's checkpoints (the only destructive one)
 
-Earlier the agent derived the memory id from `actor_id` itself and ignored what the router sent, which welded the two dimensions together: switching instances could never start a new thread, and the router's own reads of the thread always missed. Message counts come from `ListEvents` filtered to `conversational` payloads — the checkpointer also writes graph-state blobs to the same thread, which would otherwise inflate the number.
+Earlier the agent derived the thread id from `actor_id` itself and ignored what the router sent, which welded the two dimensions together: switching instances could never start a new thread, and the router's own reads of the thread always missed.
+
+`/status`'s message count and `/clear` are answered by the **agent**, not the router (`history_stats` / `clear_history` actions). Reading or deleting the conversation now means decoding a checkpoint, and `agent/agent_core.py` is the only module allowed to know about the framework — so the router stayed a channel adapter instead of gaining the whole LangGraph stack, and dropped its Memory permissions with it.
 
 Authorization is a third, orthogonal dimension: the vaulted Lark token is keyed to `lark:{open_id}`, not to either session, so rotating sessions never forces a re-consent.
 

@@ -218,17 +218,9 @@ class RouterStack(Stack):
             )
         )
 
-        # /status counts the Memory thread's messages; /clear deletes its events.
-        self.router_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "bedrock-agentcore:ListMemories",
-                    "bedrock-agentcore:ListEvents",
-                    "bedrock-agentcore:DeleteEvent",
-                ],
-                resources=["*"],
-            )
-        )
+        # Nothing here for /status or /clear any more: the conversation is LangGraph
+        # state, so the agent answers both over InvokeAgentRuntime and the router needs
+        # no Memory permissions of its own (dropped ListMemories/ListEvents/DeleteEvent).
 
         CfnOutput(self, "ApiUrl", value=self.http_api.url or "")
         CfnOutput(self, "WebhookLarkUrl", value=(self.http_api.url or "") + "webhook/lark")

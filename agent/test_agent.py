@@ -27,6 +27,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import agent_core
 
+# Message classes are used throughout; agent_core already pulls them in.
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
 
 # ------------------------------- identity -----------------------------------
 
@@ -670,3 +673,66 @@ def test_fresh_session_evicts_a_cached_unauthorized_session():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------- thread bookkeeping ------------------------------
+# /status and /clear moved here from the router when the conversation became LangGraph
+# state. Both must answer without building a session — that would re-handshake every MCP
+# server for what is a bookkeeping question.
+
+def _fake_saver(messages=None, deleted=None):
+    class _S:
+        def __init__(self):
+            self.deleted = deleted
+
+        async def aget_tuple(self, config):
+            if messages is None:
+                return None
+            return type("T", (), {"checkpoint": {"channel_values": {"messages": messages}}})()
+
+        async def adelete_thread(self, thread_id):
+            self.deleted = thread_id
+    return _S()
+
+
+def test_history_stats_counts_only_user_and_assistant_messages():
+    from langchain_core.messages import AIMessage as AI, ToolMessage as TM
+    msgs = [HumanMessage("q"), AI(content="", tool_calls=[{"name": "t", "args": {}, "id": "1"}]),
+            TM(content="r", tool_call_id="1"), AI(content="a")]
+    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
+        assert agent_core.history_stats("lark:ou_x", "sess-1") == {"messages": 3}
+
+
+def test_history_stats_reports_zero_for_an_untouched_thread():
+    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(None)):
+        assert agent_core.history_stats("lark:ou_x", "sess-1") == {"messages": 0}
+
+
+def test_history_stats_degrades_instead_of_failing_status():
+    """/status must still render if the checkpoint cannot be read."""
+    broken = mock.Mock()
+    broken.aget_tuple.side_effect = RuntimeError("no table")
+    with mock.patch.object(agent_core, "_checkpointer", return_value=broken):
+        assert agent_core.history_stats("lark:ou_x", "sess-1")["unavailable"] is True
+
+
+def test_clear_history_deletes_the_thread_and_drops_the_cached_session():
+    """A surviving cached session holds a compiled graph whose next turn would write on
+    top of a thread the user was told is gone."""
+    saver = _fake_saver()
+    closed = []
+    agent_core._sessions["lark:ou_x|sess-1"] = {"stack": None, "created": 0}
+    with mock.patch.object(agent_core, "_checkpointer", return_value=saver), \
+         mock.patch.object(agent_core, "_close_session", closed.append):
+        assert agent_core.clear_history("lark:ou_x", "sess-1") == {"deleted": True}
+    assert saver.deleted == "sess-1"
+    assert "lark:ou_x|sess-1" not in agent_core._sessions
+    assert len(closed) == 1
+
+
+def test_clear_history_reports_failure_rather_than_claiming_success():
+    broken = mock.Mock()
+    broken.adelete_thread.side_effect = RuntimeError("boom")
+    with mock.patch.object(agent_core, "_checkpointer", return_value=broken):
+        r = agent_core.clear_history("lark:ou_x", "sess-1")
+    assert r["deleted"] is False and r["error"] == "RuntimeError"

@@ -1,6 +1,6 @@
 # General Agent on AgentCore — a full-stack agent sample
 
-A general-purpose agent on **Amazon Bedrock AgentCore**, with **Lark (Feishu) as its interaction channel**. The agent runs on AgentCore Runtime (LangGraph + Bedrock), keeps conversation history in AgentCore Memory, reaches its tools over MCP, and answers in Lark chat — typed into a streaming card as it is produced, because a real task outlasts any request/response window.
+A general-purpose agent on **Amazon Bedrock AgentCore**, with **Lark (Feishu) as its interaction channel**. The agent runs on AgentCore Runtime (LangGraph + Bedrock), checkpoints conversation state to DynamoDB, reaches its tools over MCP, and answers in Lark chat — typed into a streaming card as it is produced, because a real task outlasts any request/response window.
 
 Its identity foundation is the part most agent samples skip: every message resolves to `lark:{open_id}`, and any tool that touches a user's data acts **as that user**, with the user's own token from the AgentCore Identity Token Vault (OAuth 3LO). So the agent inherits both *who you are* and *what you're allowed to do*, adding nothing of its own — Lark itself adjudicates access, and there is no parallel permission layer to keep in sync.
 
@@ -11,7 +11,7 @@ That identity integration is deliberately not re-documented here. Two samples co
 | Capability | How |
 |---|---|
 | Conversational agent in Lark chat | LangGraph agent on AgentCore Runtime; webhook in, streaming card out |
-| Memory across containers | AgentCore Memory (STM), keyed per user and per thread — a fresh microVM still remembers |
+| Memory across containers | DynamoDB checkpoints, addressed by a thread id derived from the user — a fresh microVM still remembers, and a turn cut off at the 15-minute cap resumes |
 | Tools as the calling user | MCP server running the official `lark-cli` with that user's vaulted `user_access_token` |
 | Long-running turns | The turn is accepted, runs in the background, and posts its own answer — no synchronous wait to time out |
 | Per-user consent, self-healing | First use posts a 点击授权 link and replays the original message once consent lands; the user never re-sends |
@@ -29,7 +29,7 @@ That identity integration is deliberately not re-documented here. Two samples co
                                             └───────────────────┬────────────────────────┘
                                                                 │ the user's own token
   Lark    ──webhook──▶  Router Lambda  ──▶  Agent (AgentCore Runtime)  ──▶  Lark MCP server
-  bot chat              verify/decrypt      LangGraph + Memory              acts AS the user
+  bot chat              verify/decrypt      LangGraph + DynamoDB            acts AS the user
      ▲                  resolve identity    fetches that user's token                │
      │                                                                               ▼
      └──────────────── the answer, posted when the turn finishes ───────────  Lark REST API
@@ -56,7 +56,7 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 | `app.py`, `cdk.json` | CDK app (uv-managed deps) — 6 stacks. Deployment state goes to `.cdk-state.json`, not here |
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
 | `stacks/` | security, agentcore, router, shim, gateway, observability |
-| `agent/` | the agent container: HTTP contract + AgentCore Memory + per-user 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers into a card (`lark_notify`) |
+| `agent/` | the agent container: HTTP contract + DynamoDB checkpoints + per-user 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers into a card (`lark_notify`) |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands. Also the only component that mints per-user JWTs (`cognito.py`) |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
 | `lambda/broker/` | Mount-credential broker: verifies a KMS-signed ticket, gets-or-creates that user's Access Point, and mints credentials scoped to it |
@@ -186,13 +186,13 @@ Send these to the bot instead of a question. `/help` lists them in-chat.
 |---|---|
 | `/auth` | Authorization status per IdP — one OAuth provider per downstream system |
 | `/auth <idp>` | Authorize (or re-authorize) that IdP; always starts a fresh 3LO flow, so it is idempotent |
-| `/status` | Identity, session routing key, the microVM serving it (id + age + how long it has served this session), Memory thread id, message count, last activity |
-| `/new` | New Memory thread **and** new runtime instance — a fully fresh start |
-| `/reset` | New Memory thread, same runtime instance — history starts over, old events kept |
+| `/status` | Identity, session routing key, the microVM serving it (id + age + how long it has served this session), checkpoint thread id, message count, last activity |
+| `/new` | New thread **and** new runtime instance — a fully fresh start |
+| `/reset` | New thread, same runtime instance — history starts over, old state kept |
 | `/clear` | Actually delete this thread's events (unlike `/reset`, which just stops reading them) |
-| `/reconnect` | New runtime instance, same Memory thread — shows that memory outlives the container |
+| `/reconnect` | New runtime instance, same thread — shows that the conversation outlives the container |
 
-The three session commands exist because **the runtime session and the Memory thread are independent ids**: the first decides which microVM serves you, the second decides which conversation history the agent reads. The router owns both (DynamoDB `SESSION` / `MEMSESSION` items) and rotates them in the three meaningful combinations — rotating is just "switch to a new id", so all of them are instant. `/clear` is the only one that deletes data.
+The three session commands exist because **the runtime session and the checkpoint thread are independent ids**: the first decides which microVM serves you, the second decides which conversation history the agent reads. The router owns both (DynamoDB `SESSION` / `MEMSESSION` items) and rotates them in the three meaningful combinations — rotating is just "switch to a new id", so all of them are instant. `/clear` is the only one that deletes data.
 
 `/status` is written for developers evaluating AgentCore rather than for end users, so it deliberately exposes the compute layer: the session id is a routing key that outlives any one microVM, and AgentCore replaces the microVM underneath it on idle or lifetime limits without the id changing. Showing the microVM's own id alongside two durations — its age, and how long it has served this session — makes that turnover visible. Both are in seconds so they can be compared directly: equal values mean this microVM started for you, a much larger age means an existing one took over. See `docs/agentcore-behavior.md` for how these are obtained and, more importantly, which seemingly obvious signals are *not* trustworthy.
 
@@ -236,7 +236,9 @@ This deploys billable AWS resources. All the always-on pieces are consumption- o
 - **Bedrock model invocations** — the main usage-sensitive line; priced per input/output token on the model in `default_model_id`. A chatty demo is cents-to-dollars; a load test is not.
 - **AgentCore Runtime ×2–3** — the agent and the lark-cli MCP server always, plus the approval MCP server if `AGENT_DECIDE_APPROVAL_CODES` is set. Each is metered per-second: CPU (`~$0.0895/vCPU-hour`) only during active processing, memory (`~$0.00945/GB-hour`) continuously while the microVM is alive. So each extra MCP server adds idle memory-time even when nothing calls it — which is why the approval one is gated on that variable rather than always deployed, and why grouping tools by trust boundary has a running cost.
 - **AgentCore Identity Token Vault (3LO)** — stores/refreshes/injects each user's Lark token natively. No separate per-user Secrets Manager charge (unlike the interceptor variant).
-- **AgentCore Memory (STM)** — billed per event *written* (`~$0.25 per 1,000` create-event calls), **not** for retention duration.
+- **DynamoDB + S3 (checkpoints)** — on-demand writes, one item per superstep, with state over ~350 KB spilled to S3. Table TTL expires old threads; nothing is billed for retention beyond storage.
+
+- **AgentCore Memory** — long-term records only. Billed per event *written* (`~$0.25 per 1,000`), per record stored per month, and per *retrieval* (`~$0.50 per 1,000`) — retrieval is the expensive one, so it is queried on demand rather than every turn.
 - **Lambda + API Gateway** — router (webhook) + shim (OAuth RFC-6749 façade, a backend web service); effectively free at demo volume.
 - **Secrets Manager** — `$0.40/secret/month` each, and only two static secrets: the Lark credentials (`{prefix}/channels/lark`) and the Cognito password salt. No dynamic per-user secrets.
 - **Web search (optional)** — only when `WEB_SEARCH=true`: an AgentCore Gateway plus per-query connector charges. The gateway sits in us-east-1, so its traffic is cross-region.

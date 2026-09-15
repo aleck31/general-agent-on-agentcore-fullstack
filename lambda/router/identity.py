@@ -177,22 +177,6 @@ def claim_approval_task(task_id: str) -> bool:
         raise
 
 
-_MEMORY_ID: str | None = None
-
-
-def _memory_id() -> str:
-    """The agent's Memory id, discovered by name prefix (the AgentCore CLI creates
-    it as <runtime_name>_mem-<suffix>, so it isn't known at CDK synth time)."""
-    global _MEMORY_ID
-    if _MEMORY_ID is None:
-        prefix = os.environ.get("MEMORY_NAME_PREFIX", "agentcore_fullstack")
-        ctl = boto3.client("bedrock-agentcore-control", region_name=_REGION)
-        ids = [m["id"] for m in ctl.list_memories(maxResults=100).get("memories", [])
-               if m["id"].startswith(prefix)]
-        _MEMORY_ID = ids[0] if ids else ""
-    return _MEMORY_ID
-
-
 def session_info(user_id: str) -> dict:
     """Current session id + lastActivity, or {} when no session is stored."""
     item = _table.get_item(Key={"PK": f"USER#{user_id}", "SK": "SESSION"}).get("Item") or {}
@@ -222,71 +206,3 @@ def rotate_memory_session(user_id: str) -> str:
     _table.put_item(Item={"PK": f"USER#{user_id}", "SK": "MEMSESSION",
                           "memorySessionId": mem_sid, "createdAt": int(time.time())})
     return mem_sid
-
-
-_COUNT_PAGE = 100          # ListEvents caps maxResults at 100
-_COUNT_MAX_PAGES = 5       # ~500 messages before /status starts reporting "N+"
-
-# Strands writes its session/agent state as blob events carrying a stateType
-# metadata key; real conversation events carry no metadata at all. Filtering on
-# that server-side is what makes the count exact: maxResults is a *scan* window,
-# so unfiltered pages spend their budget on state events and stop early — which is
-# why a 70-message thread used to report "67+".
-_CONVERSATIONAL_ONLY = {
-    "eventMetadata": [{"left": {"metadataKey": "stateType"}, "operator": "NOT_EXISTS"}]
-}
-
-
-def count_events(actor_id: str, session_id: str) -> tuple[int, bool]:
-    """(messages, capped) for this Memory thread, counting only conversation events.
-
-    Walks up to _COUNT_MAX_PAGES so ordinary threads report an exact number; capped
-    is True only past that, where an exact count isn't worth the API calls."""
-    memory_id = _memory_id()
-    if not memory_id or not session_id:
-        return 0, False
-    core = boto3.client("bedrock-agentcore", region_name=_REGION)
-    n = 0
-    token = None
-    for _ in range(_COUNT_MAX_PAGES):
-        kwargs = dict(memoryId=memory_id, actorId=actor_id, sessionId=session_id,
-                      maxResults=_COUNT_PAGE, filter=_CONVERSATIONAL_ONLY)
-        if token:
-            kwargs["nextToken"] = token
-        page = core.list_events(**kwargs)
-        n += sum(1 for ev in page.get("events", [])
-                 if any("conversational" in p for p in ev.get("payload") or []))
-        token = page.get("nextToken")
-        if not token:
-            return n, False
-    return n, True
-
-
-# Deleting is one API call per event, so cap it — the caller reports what is left.
-_CLEAR_LIMIT = int(os.environ.get("CLEAR_EVENT_LIMIT", "200"))
-
-
-def clear_history(actor_id: str, session_id: str) -> tuple[int, bool]:
-    """Really delete this Memory thread's events (unlike rotating to a new thread,
-    which just stops reading the old one). Returns (deleted, more_left)."""
-    memory_id = _memory_id()
-    if not memory_id or not session_id:
-        return 0, False
-    core = boto3.client("bedrock-agentcore", region_name=_REGION)
-    deleted = 0
-    while deleted < _CLEAR_LIMIT:
-        # No filter here: /clear removes state events too. Payloads are dead weight
-        # when all we need is the eventId.
-        page = core.list_events(memoryId=memory_id, actorId=actor_id,
-                               sessionId=session_id, maxResults=100,
-                               includePayloads=False)
-        events = page.get("events", [])
-        if not events:
-            return deleted, False
-        for ev in events:
-            if deleted >= _CLEAR_LIMIT:
-                return deleted, True
-            core.delete_event(memoryId=memory_id, actorId=actor_id,
-                              sessionId=session_id, eventId=ev["eventId"])
-            deleted += 1
-    return deleted, True

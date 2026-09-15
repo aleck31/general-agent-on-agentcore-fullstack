@@ -617,6 +617,59 @@ def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
     return text
 
 
+def _thread_config(actor_id: str, mem_sid: str) -> dict:
+    return {"configurable": {"thread_id": mem_sid or _session_id_for(actor_id),
+                             "actor_id": actor_id}}
+
+
+def history_stats(actor_id: str, mem_sid: str = "") -> dict:
+    """How many messages this thread holds → {"messages": n}.
+
+    The router used to count `conversational` events itself, which it can no longer do:
+    the conversation is graph state in DynamoDB now, and decoding it means the whole
+    LangGraph stack. Answering here instead keeps agent_core the only framework-coupled
+    module (the router stays a thin channel adapter) and costs one checkpoint read rather
+    than the paged ListEvents walk it replaces.
+
+    Tool messages are excluded: the old count was of user/assistant exchanges, and that
+    is what /status reports."""
+    try:
+        tup = _run(_checkpointer().aget_tuple(_thread_config(actor_id, mem_sid)),
+                   timeout=30)
+    except Exception:  # noqa: BLE001 — /status must answer even if this part cannot
+        log.warning("could not read thread stats", exc_info=True)
+        return {"messages": 0, "unavailable": True}
+    values = (tup.checkpoint.get("channel_values") if tup else None) or {}
+    return {"messages": sum(
+        1 for m in (values.get("messages") or [])
+        if isinstance(m, (HumanMessage, AIMessage)))}
+
+
+def clear_history(actor_id: str, mem_sid: str = "") -> dict:
+    """Delete this thread's stored state → {"deleted": bool}.
+
+    Really deletes, unlike /reset which rotates to a new thread and leaves the old one
+    readable. Also drops the cached session, because it holds a compiled graph whose next
+    turn would otherwise write on top of a thread the user believes is gone.
+
+    Long-term memory is NOT touched yet: no Memory resource exists, so there is nothing
+    to delete. When one does, its records belong in here too — a user asking to clear
+    history does not mean "except the parts extracted from it"."""
+    config = _thread_config(actor_id, mem_sid)
+    thread_id = config["configurable"]["thread_id"]
+    with _lock:
+        for key in [k for k in _sessions if k.endswith(f"|{thread_id}")]:
+            s = _sessions.pop(key, None)
+            if s:
+                _close_session(s)
+    try:
+        _run(_checkpointer().adelete_thread(thread_id), timeout=60)
+    except Exception as e:  # noqa: BLE001
+        log.warning("could not clear thread %s", thread_id, exc_info=True)
+        return {"deleted": False, "error": type(e).__name__}
+    return {"deleted": True}
+
+
 def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
     """Start a fresh 3LO flow for `idp` even when a token is already vaulted →
     {auth_url}. Authorization is per-IdP; only "lark" is wired up so far (add a module

@@ -65,6 +65,18 @@ _RUNTIME_URL = (f"https://bedrock-agentcore.{AWS_REGION}.amazonaws.com/runtimes/
 
 # ------------------------------- invoke agent -------------------------------
 
+def thread_stats(session_id: str, user_id: str, actor_id: str, mem_sid: str) -> tuple[int, bool]:
+    """(messages, capped) for this thread, answered by the agent.
+
+    The conversation is LangGraph state in DynamoDB now, so counting it means decoding a
+    checkpoint — the agent owns that. `capped` is kept in the signature the callers already
+    use, but is always False: a checkpoint read is exact, unlike the paged ListEvents walk
+    this replaces, which gave up after a few pages."""
+    r = invoke_agent(session_id, user_id, actor_id, "", action="history_stats",
+                     mem_sid=mem_sid)
+    return int(r.get("messages") or 0), False
+
+
 def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
                  action: str = "chat", mem_sid: str = "",
                  budget: float | None = None, chat_id: str = "",
@@ -507,21 +519,27 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
     # just starts a new thread and leaves the old data in place.
     if cmd == "/clear":
         mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
-        n, more = identity.clear_history(actor_id, mem_sid)
-        logger.info("history deleted for %s: %d events (more=%s)", actor_id, n, more)
-        lark.send_message(
-            chat_id, f"已删除对话记录 {n} 条{'（仍有剩余，可再执行一次 /clear）' if more else ''}。")
+        rt_sid = identity.get_or_create_session(user_id)
+        n, _ = thread_stats(rt_sid, user_id, actor_id, mem_sid)
+        r = invoke_agent(rt_sid, user_id, actor_id, "", action="clear_history",
+                         mem_sid=mem_sid)
+        ok = bool(r.get("deleted"))
+        logger.info("history cleared for %s: deleted=%s (%d messages)", actor_id, ok, n)
+        lark.send_message(chat_id, f"已删除对话记录（{n} 条消息）。" if ok
+                          else "删除对话记录失败，请稍后再试。")
         return
-    # /reconnect — new runtime instance, same Memory thread. Demonstrates that
-    # AgentCore Memory outlives the container: a fresh microVM still remembers.
+    # /reconnect — new runtime instance, same checkpoint thread. Demonstrates that the
+    # conversation outlives the container: a fresh microVM still remembers, because the
+    # thread is addressed by user identity, not by which microVM served it.
     if cmd == "/reconnect":
         identity.drop_session(user_id)
         mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
-        n, capped = identity.count_events(actor_id, mem_sid)
+        n, capped = thread_stats(identity.get_or_create_session(user_id),
+                                 user_id, actor_id, mem_sid)
         logger.info("runtime session dropped (memory kept) for %s", actor_id)
         lark.send_message(
             chat_id, f"已切换运行实例，对话记录保留（{n}{'+' if capped else ''} 条）"
-                     "——记忆存放在 AgentCore Memory，不随容器生命周期消失。")
+                     "——对话状态存放在 DynamoDB，不随容器生命周期消失。")
         return
     # /auth [idp] — authorization is per-IdP (one OAuth provider per downstream
     # system). Bare /auth lists each IdP's status; /auth <idp> starts a fresh 3LO
@@ -558,7 +576,7 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
         info = identity.session_info(user_id)
         rt_sid = info.get("sessionId", "")
         mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
-        events, capped = identity.count_events(actor_id, mem_sid)
+        events, capped = thread_stats(rt_sid, user_id, actor_id, mem_sid)
         last = info.get("lastActivity", 0)
         last_str = (datetime.datetime.fromtimestamp(last, datetime.timezone.utc)
                     .strftime("%Y-%m-%d %H:%M UTC") if last else "—")
