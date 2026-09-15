@@ -680,3 +680,20 @@ def test_vault_check_uses_the_jwt_namespace():
     ac.get_workload_access_token_for_jwt.assert_called_once()
     assert ac.get_workload_access_token_for_jwt.call_args.kwargs["userToken"] == "JWT-FOR-U"
     assert not ac.get_workload_access_token_for_user_id.called
+
+
+def test_credential_load_failure_is_not_cached():
+    """A failed secret read must not disable the container for its whole life: seeding or
+    rotating the Lark secret would then need a cold start, presenting as
+    "no encryptKey configured" long after the secret is correct."""
+    import lark
+    lark._creds_cache = None
+    with mock.patch.object(lark, "_SECRET_ID", "s"), \
+         mock.patch.object(lark, "_secrets") as sm:
+        sm.get_secret_value.side_effect = ValueError("not json")
+        assert lark.get_credentials() == ("", "", "", "")
+        assert lark._creds_cache is None          # nothing poisoned
+        sm.get_secret_value.side_effect = None
+        sm.get_secret_value.return_value = {"SecretString": '{"encryptKey":"k"}'}
+        assert lark.get_credentials()[3] == "k"   # next call recovers
+    lark._creds_cache = None

@@ -50,8 +50,12 @@ def get_credentials() -> tuple[str, str, str, str]:
             raw = _secrets.get_secret_value(SecretId=_SECRET_ID)["SecretString"]
             _creds_cache = json.loads(raw)
         except Exception as e:  # noqa: BLE001
+            # Deliberately not cached: caching the failure disables the container for its
+            # whole life, so seeding or rotating the secret needs a cold start to take
+            # effect — which presents as "no encryptKey configured" long after the secret
+            # is correct. Retrying next invocation costs one API call on a broken path.
             log.error("failed to load Lark credentials: %s", e)
-            _creds_cache = {}
+            return ("", "", "", "")
     c = _creds_cache
     return (c.get("appId", ""), c.get("appSecret", ""),
             c.get("verificationToken", ""), c.get("encryptKey", ""))
