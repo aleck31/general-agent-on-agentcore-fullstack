@@ -101,22 +101,9 @@ base_cdk_stacks() {
 phase_memory() {
   log "Memory — long-term store"
 
-  # Long-term records only. The conversation itself is LangGraph state in DynamoDB (see
-  # .dev/adr/0008), so nothing here holds the transcript: this resource exists for records
-  # the agent decides are worth keeping across threads.
-  #
-  # No memoryStrategies on purpose. Measured against the service: BatchCreateMemoryRecords
-  # accepts records with `memoryStrategyId` omitted, and RetrieveMemoryRecords then returns
-  # them by semantic score — identical score to the same record written under a semantic or
-  # summary strategy, so the embedding happens regardless. Declaring a strategy would only
-  # add cost and constraints: a *custom* strategy is rejected outright without a
-  # memoryExecutionRoleArn ("memory contains one or more Custom strategies"), and a built-in
-  # one runs AWS-managed extraction we do not want, billed per record stored per month.
-  # Extraction is the thing we are deliberately not using — what to remember is our
-  # decision, not a by-product of every turn.
-  #
-  # eventExpiryDuration is REQUIRED (3-365 days). 365 because short-term events are billed
-  # per write, not per day retained, so a longer window costs nothing.
+  # Long-term records only; the conversation lives in DynamoDB. No memoryStrategies on
+  # purpose — direct writes are embedded and scored without one, and a custom strategy is
+  # rejected without an execution role. eventExpiryDuration is required. See .dev/adr/0008.
   local mname="${PREFIX//-/_}_ltm" mid
   # list-memories returns no `name` — only `id`, which is "<name>-<suffix>". Matching on
   # name would never hit, and this step would create a new memory on every run.

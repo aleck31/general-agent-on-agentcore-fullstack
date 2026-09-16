@@ -11,6 +11,7 @@ Identity: lark:{open_id} — the same identity the web UI resolves to.
 from __future__ import annotations
 
 import datetime
+import base64
 import json
 import logging
 import os
@@ -284,6 +285,16 @@ def wait_for_consent(actor_id: str) -> bool:
 
 # --------------------------- consent completion -----------------------------
 
+def _jwt_claim(token: str, name: str) -> str:
+    """One claim out of an unverified JWT, for logging which identity was used."""
+    try:
+        body = token.split(".")[1]
+        body += "=" * (-len(body) % 4)
+        return str(json.loads(base64.urlsafe_b64decode(body)).get(name, ""))
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
 def complete_consent(actor_id: str, session_uri: str) -> None:
     """Bind a finished 3LO consent to this user's signed identity.
 
@@ -292,11 +303,19 @@ def complete_consent(actor_id: str, session_uri: str) -> None:
     consent session belongs to the JWT-derived vault namespace, and naming the user by
     string instead fails with `AccessDeniedException: Invalid or expired session`, which
     reads like a timing problem and is really a namespace mismatch (measured)."""
-    agentcore.complete_resource_token_auth(
+    jwt = cognito.user_jwt(actor_id)
+    resp = agentcore.complete_resource_token_auth(
         sessionUri=session_uri,
-        userIdentifier={"userToken": cognito.user_jwt(actor_id)},
+        userIdentifier={"userToken": jwt},
     )
-    logger.info("consent completed for %s", actor_id)
+    # This call returning without raising is NOT evidence that a grant was stored: a
+    # consent completed here has been observed to leave the vault empty for every reader
+    # (both namespaces, every scope set), so log what identity and session it actually
+    # bound. Claims only — never the token.
+    logger.info("consent completed for %s: session=%s jwt_sub=%s jwt_username=%s resp=%s",
+                actor_id, session_uri[-24:], _jwt_claim(jwt, "sub"),
+                _jwt_claim(jwt, "username"),
+                {k: v for k, v in resp.items() if k != "ResponseMetadata"})
 
 
 # ----------------------------- consent resume -------------------------------

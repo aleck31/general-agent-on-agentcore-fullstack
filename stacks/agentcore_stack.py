@@ -145,10 +145,9 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # AgentCore Memory — long-term records only, written and read directly by the
-        # remember/recall tools. No event actions: the conversation lives in the checkpoint
-        # table, so nothing writes events any more, and dropping CreateEvent/ListEvents
-        # keeps the agent unable to store transcripts here even by accident.
+        # AgentCore Memory — long-term records only, via the remember/recall tools. No event
+        # actions on purpose: that leaves the agent structurally unable to store transcripts
+        # here, which is where the conversation would otherwise leak in.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
@@ -161,18 +160,9 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # Downstream MCP servers, scoped to this project's runtimes. `InvokeAgentRuntime`
-        # does take resource-level permissions — an earlier comment here claimed it does
-        # not, which was wrong: verified with a session policy naming one runtime ARN,
-        # where the named runtime answered 200 and a sibling returned 403. Without this
-        # the container could invoke any Runtime in the account, so the in-process tool
-        # list was the only thing keeping it to ours — and that list lives in the same
-        # process as the model output (see .dev/adr/0008).
-        #
-        # A name prefix rather than exact ARNs because the AWS-assigned suffix is only
-        # known after provision.sh creates each Runtime, and this stack has to exist
-        # first — it owns the execution role they are created with. `runtime-endpoint`
-        # is a separate resource type, hence both patterns.
+        # Downstream MCP servers, scoped to this project's runtimes. A name prefix, not exact
+        # ARNs: the AWS-assigned suffix only exists after provision.sh runs, and this stack
+        # owns the role it runs with. Verified scopable, and why it matters: .dev/adr/0008.
         rt_prefix = prefix.replace("-", "_")
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
@@ -302,16 +292,9 @@ class AgentCoreStack(Stack):
         )
 
         # --- Conversation checkpoints (LangGraph graph state) -----------------
-        # One table for all users. Isolation is the partition key, which DynamoDBSaver
-        # derives from thread_id alone — and thread_id is the sha256 of the actor, chosen
-        # by the router from a verified identity, never by the agent. A table per user
-        # would put a CreateTable on the request path and cap the deployment at the
-        # regional 2,500-table quota, for no isolation the partition key doesn't give.
-        #
-        # Separate from the router's identity table deliberately: that one holds the
-        # identity control plane (SESSION/MEMSESSION/MOUNT/PENDING_AUTH), and the process
-        # running model output has no business writing there. Key prefixes wouldn't
-        # collide (CHECKPOINT_/WRITES_ vs USER#) — the reason is privilege, not layout.
+        # One table for all users; isolation is the partition key, derived from thread_id.
+        # Kept separate from the router's identity table for privilege, not layout.
+        # Why not per-user tables, and the quota that rules them out: .dev/adr/0008.
         self.checkpoint_table = dynamodb.Table(
             self,
             "CheckpointTable",

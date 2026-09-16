@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import os
 from datetime import timedelta
@@ -99,6 +100,18 @@ def _belongs_to(token: str, actor_id: str) -> bool:
     return True
 
 
+def _claims(token: str) -> dict:
+    """Non-secret claims of an unverified JWT, for identifying which principal it is."""
+    try:
+        body = token.split(".")[1]
+        body += "=" * (-len(body) % 4)
+        c = json.loads(base64.urlsafe_b64decode(body))
+        return {k: c[k] for k in ("sub", "aud", "iss", "wid", "workloadId", "username")
+                if k in c}
+    except Exception:  # noqa: BLE001
+        return {"undecodable": True}
+
+
 def get_user_lark_token(actor_id: str, force: bool = False,
                         workload_token: str = "") -> tuple[str, str]:
     """Return ("token", <lark token>) if vaulted, else ("auth_url", <url>).
@@ -119,6 +132,11 @@ def get_user_lark_token(actor_id: str, force: bool = False,
     """
     if workload_token:
         wat = workload_token
+        # Which identity the platform's token actually carries. A consent opened under this
+        # identity has been observed to complete successfully and then be unreadable by
+        # every namespace we query, so the open question is whether this differs from the
+        # identity GetWorkloadAccessTokenForJWT derives from the same JWT. Claims only.
+        log.info("workload token claims: %s", _claims(wat))
     else:
         log.warning("no platform workload token for %s — falling back to ForUserId",
                     actor_id)

@@ -75,17 +75,9 @@ _SESSION_TTL = int(os.environ.get("SESSION_TTL_SECONDS", "3000"))  # 50 min
 # consents we want the next turn to pick up the token.
 _UNAUTH_TTL = int(os.environ.get("UNAUTH_SESSION_TTL_SECONDS", "60"))
 
-# Prompt caching. Bedrock's is explicit: with no cachePoint block in the request nothing
-# is cached, so this is not something we inherit by default. `cache_control` is read only
-# from per-call kwargs — `model_kwargs` gets rerouted to `additional_model_request_fields`
-# and `.bind(cache_control=…)` is lost when create_agent calls bind_tools (both measured)
-# — so injecting it into the request is the only reliable route.
-#
-# 1h rather than the 5m default because it matches _SESSION_TTL: the cached prefix then
-# lives as long as the session that keeps reusing it. The write costs 2.0x base input
-# instead of 1.25x, but reads are 0.1x either way, so a session of more than a couple of
-# turns is comfortably ahead — and a single turn with two tool calls already reaches
-# break-even on its own.
+# Bedrock caches nothing without a cachePoint block, and `cache_control` is only read from
+# per-call kwargs — hence the subclass below rather than a constructor argument.
+# Placement, TTL choice and the measured break-even: docs/architecture.md.
 _CACHE_TTL = os.environ.get("PROMPT_CACHE_TTL", "1h")   # "5m" | "1h" | "" disables
 
 
@@ -128,20 +120,9 @@ _model = _CachingChatBedrockConverse(model=_MODEL_ID, region_name=_REGION,
                                      cache_ttl=_CACHE_TTL)
 
 # --------------------------- bounding an endless thread ----------------------
-# A thread is per-user and permanent (only /reset rotates it), so `messages` only grows,
-# and DynamoDBSaver has no prune. Summarisation is the only place to bound it: it rewrites
-# the state (RemoveMessage(REMOVE_ALL_MESSAGES) + summary + kept tail), so the checkpoint
-# itself shrinks rather than just the payload sent to the model.
-#
-# Trigger late, on purpose. With prompt caching on, re-reading a long history costs 0.1x,
-# so cost is not what binds — the context window is. Summarising is not free either: it
-# pays a full-price pass over the history being condensed AND invalidates the cached prefix
-# once, because the prefix is what it rewrites. Trimming a little every turn would pay that
-# invalidation on every turn, which is exactly the way to make caching worthless.
-#
-# `tokens` rather than `fraction`: the token clause compares against either an approximate
-# count or the model's own reported usage, with no dependency on a registry knowing this
-# model's context window.
+# The thread is permanent per user and DynamoDBSaver has no prune, so summarisation is the
+# only bound. Threshold-triggered, never per turn: it rewrites the cached prefix.
+# Why late, and why `tokens` over `fraction`: .dev/adr/0008.
 _SUMMARIZE_AT_TOKENS = int(os.environ.get("SUMMARIZE_AT_TOKENS", "120000"))  # 0 disables
 _SUMMARIZE_KEEP = int(os.environ.get("SUMMARIZE_KEEP_MESSAGES", "20"))
 
