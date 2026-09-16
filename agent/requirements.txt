@@ -9,6 +9,11 @@ langchain-aws>=1.7.0
 # events). Not part of bedrock-agentcore, which ships a Strands integration only.
 langgraph-checkpoint-aws>=1.2.0
 langchain-mcp-adapters>=0.3.0
+# AG-UI for the browser path. fastapi is not in ag-ui-langgraph's declared deps but its
+# __init__ imports it unconditionally, so the package cannot be imported without it; we
+# serve the events from aiohttp, not FastAPI.
+ag-ui-langgraph>=0.0.45
+fastapi>=0.115.0
 bedrock-agentcore>=0.1.0
 mcp>=1.23.0
 httpx>=0.27.0

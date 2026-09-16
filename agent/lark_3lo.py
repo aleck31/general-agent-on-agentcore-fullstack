@@ -112,6 +112,38 @@ def _claims(token: str) -> dict:
         return {"undecodable": True}
 
 
+def actor_from_workload_token(workload_token: str) -> tuple[str, str]:
+    """Who this request is, derived rather than declared → ("actor", "lark:{open_id}").
+
+    The browser talks to the Runtime directly on the AG-UI path, so nothing it sends may
+    name a user: it would be naming whose conversation and whose files to open. The
+    workload token the platform derived from the verified JWT already scopes the vault
+    lookup, and Lark itself says who the resulting token belongs to.
+
+    Returns ("needs_consent", "") when nothing is vaulted — the actor is unknowable then,
+    and a web turn cannot start a consent flow because completing one requires the actor
+    in `state`. Authorising once in Lark chat is the way in."""
+    try:
+        resp = _agentcore.get_resource_oauth2_token(
+            workloadIdentityToken=workload_token,
+            resourceCredentialProviderName=_PROVIDER,
+            scopes=_SCOPES,
+            oauth2Flow="USER_FEDERATION",
+            **({"resourceOauth2ReturnUrl": _SHIM_RETURN_URL} if _SHIM_RETURN_URL else {}),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("could not resolve the caller from the workload token")
+        return "error", ""
+    token = resp.get("accessToken")
+    if not token:
+        return "needs_consent", ""
+    owner = _token_owner(token)
+    if not owner:
+        log.error("vaulted token has no establishable owner — refusing it")
+        return "error", ""
+    return "actor", f"lark:{owner}"
+
+
 def get_user_lark_token(actor_id: str, force: bool = False,
                         workload_token: str = "") -> tuple[str, str]:
     """Return ("token", <lark token>) if vaulted, else ("auth_url", <url>).

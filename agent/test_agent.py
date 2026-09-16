@@ -900,3 +900,48 @@ def test_summarisation_rewrites_state_so_the_checkpoint_shrinks():
     import inspect
     src = inspect.getsource(SummarizationMiddleware.before_model)
     assert "RemoveMessage" in src and "REMOVE_ALL_MESSAGES" in src
+
+
+# --------------------------- AG-UI (browser path) ----------------------------
+# The browser talks to the Runtime directly here, so the one invariant that matters is that
+# nothing it sends can name a user: threadId decides whose conversation and whose files.
+
+def test_agui_requests_are_told_apart_from_the_router_protocol():
+    import agui
+    assert agui.is_agui_request({"threadId": "t", "messages": []}) is True
+    assert agui.is_agui_request({"runId": "r"}) is True
+    # The router always sends an action, even alongside a thread id.
+    assert agui.is_agui_request({"action": "chat", "memorySessionId": "m"}) is False
+    assert agui.is_agui_request({}) is False
+
+
+def test_agui_ignores_a_client_supplied_thread_id():
+    """A browser naming someone else's thread would read their conversation. The value is
+    overwritten from the session, which comes from the actor the platform vouched for."""
+    import agui, inspect
+    src = inspect.getsource(agui.handle)
+    assert '"threadId": session["mem_sid"]' in src
+    # And the actor itself is derived, never read from the payload.
+    assert "actor_from_workload_token" in src
+    assert 'payload.get("actorId")' not in src
+
+
+def test_the_actor_is_derived_from_the_vaulted_token_owner():
+    """Lark is asked who the token belongs to; an unestablishable owner is refused rather
+    than assumed."""
+    import lark_3lo
+    with mock.patch.object(lark_3lo, "_agentcore") as ac, \
+         mock.patch.object(lark_3lo, "_token_owner", return_value="ou_alice"):
+        ac.get_resource_oauth2_token.return_value = {"accessToken": "lark-tok"}
+        assert lark_3lo.actor_from_workload_token("WAT") == ("actor", "lark:ou_alice")
+    with mock.patch.object(lark_3lo, "_agentcore") as ac, \
+         mock.patch.object(lark_3lo, "_token_owner", return_value=""):
+        ac.get_resource_oauth2_token.return_value = {"accessToken": "lark-tok"}
+        assert lark_3lo.actor_from_workload_token("WAT") == ("error", "")
+
+
+def test_an_unconsented_caller_gets_needs_consent_not_a_guess():
+    import lark_3lo
+    with mock.patch.object(lark_3lo, "_agentcore") as ac:
+        ac.get_resource_oauth2_token.return_value = {"authorizationUrl": "https://x"}
+        assert lark_3lo.actor_from_workload_token("WAT") == ("needs_consent", "")

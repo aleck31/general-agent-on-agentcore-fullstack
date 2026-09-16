@@ -617,6 +617,53 @@ def _iter_deltas(graph, message: str, config: dict, on_tool_use=None,
         yield item
 
 
+async def arun_in_thread(fn, *args):
+    """Run a blocking call off the caller's event loop."""
+    return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
+
+
+async def aget_session(actor_id: str, workload_token: str = "") -> dict:
+    """The cached session for this actor, fetched without blocking the caller's loop.
+    Session building opens MCP connections, which is seconds of I/O."""
+    return await arun_in_thread(_get_session, actor_id, "",
+                               _session_id_for(actor_id), False, workload_token)
+
+
+def track_in_flight(delta: int) -> None:
+    """Mark a turn in flight so /ping reports HealthyBusy and the container is not
+    reclaimed mid-answer."""
+    _track(delta)
+
+
+async def aiter_on_agent_loop(agen_factory):
+    """Yield from an async generator that must run on _LOOP, into another loop.
+
+    The graph's MCP sessions are bound to the loop that opened them, so anything awaiting
+    them has to run on _LOOP — but an aiohttp handler runs on the server's own loop. The
+    hand-off is a thread-safe queue, the same bridge _iter_deltas uses for its synchronous
+    consumer."""
+    q: queue.Queue = queue.Queue()
+
+    async def _pump() -> None:
+        try:
+            async for item in agen_factory():
+                q.put(item)
+        except Exception as e:  # noqa: BLE001 — re-raised in the consumer
+            q.put(e)
+        finally:
+            q.put(_STREAM_END)
+
+    asyncio.run_coroutine_threadsafe(_pump(), _LOOP)
+    loop = asyncio.get_running_loop()
+    while True:
+        item = await loop.run_in_executor(None, q.get)
+        if item is _STREAM_END:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
 def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
     """Run the turn, typing the answer into a streaming card as it is produced, and
     return the full text. If the card can't be created or an update fails (e.g. the

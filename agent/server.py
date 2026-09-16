@@ -26,6 +26,7 @@ _T_IMPORT_START = time.monotonic()
 from aiohttp import web
 
 import agent_core   # pulls in langchain/langgraph, boto3 and mcp — the bulk of start-up
+import agui
 
 _T_IMPORT_DONE = time.monotonic()
 
@@ -84,6 +85,16 @@ async def handle_invocations(request: web.Request) -> web.Response:
 
     action = payload.get("action", "chat")
 
+    # A browser on the AG-UI path posts a RunAgentInput, which carries no `action`. It is
+    # answered as an SSE event stream; everything below is the router's JSON protocol.
+    if agui.is_agui_request(payload):
+        wt = next((request.headers[h] for h in (
+            "x-amzn-bedrock-agentcore-runtime-workload-accesstoken",
+            "x-amz-bedrock-agentcore-identity-wat",
+            "workloadaccesstoken",
+        ) if request.headers.get(h)), "")
+        return await agui.handle(request, payload, wt)
+
     # AgentCore passes the runtime session id on every request (verified), which is
     # what lets this process report per-session age rather than only its own.
     sid = request.headers.get("x-amzn-bedrock-agentcore-runtime-session-id", "")
@@ -120,6 +131,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
 
     if action == "warmup":
         return web.json_response({"ready": True})
+
 
     # Thread bookkeeping for /status and /clear. Here rather than in the router because
     # the conversation is LangGraph state now — reading or deleting it needs the
