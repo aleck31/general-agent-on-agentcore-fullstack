@@ -147,6 +147,31 @@ def get_tenant_token() -> str:
 
 # ----------------------------- messaging ------------------------------------
 
+def open_id_from_auth_code(code: str) -> str:
+    """Exchange an h5 `tt.requestAuthCode` code for the signer's open_id, or "".
+
+    The web entrypoint's whole identity step. The code is single-use and issued by Lark to
+    this app inside the Lark client, so a caller cannot forge one for somebody else — which
+    is exactly why the browser may send a code and may not send an open_id."""
+    token = get_tenant_token()
+    if not (token and code):
+        return ""
+    url = f"{_API_DOMAIN}/open-apis/authen/v1/oidc/access_token"
+    body = json.dumps({"grant_type": "authorization_code", "code": code}).encode()
+    try:
+        req = urllib.request.Request(url, data=body, method="POST", headers={
+            "Content-Type": "application/json", "Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+    except Exception as e:  # noqa: BLE001
+        log.warning("h5 code exchange failed: %s", e)
+        return ""
+    if result.get("code") != 0:
+        log.warning("h5 code exchange refused (lark_code=%s)", result.get("code"))
+        return ""
+    return (result.get("data") or {}).get("open_id", "")
+
+
 _MAX_TEXT_LEN = 20000
 
 

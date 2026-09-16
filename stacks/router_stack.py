@@ -45,6 +45,7 @@ class RouterStack(Stack):
         mount_ticket_key_arn: str = "",
         s3files_file_system_id: str = "",
         mount_path: str = "/mnt/user",
+        web_allowed_origins: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -117,6 +118,8 @@ class RouterStack(Stack):
                 "MOUNT_TICKET_KEY_ID": mount_ticket_key_arn,
                 "S3FILES_FS_ID": s3files_file_system_id,
                 "MOUNT_PATH": mount_path,
+                # Origins allowed to trade an h5 code for a JWT. Empty = no browser may.
+                "WEB_ALLOWED_ORIGINS": web_allowed_origins,
             },
             log_group=log_group,
         )
@@ -137,6 +140,11 @@ class RouterStack(Stack):
         )
         self.http_api.add_routes(
             path="/health", methods=[apigwv2.HttpMethod.GET], integration=integration,
+        )
+        # The web entrypoint's identity step: an h5 authorization code in, a user JWT out.
+        self.http_api.add_routes(
+            path="/web/session", methods=[apigwv2.HttpMethod.POST],
+            integration=integration,
         )
 
         # throttling on default stage
@@ -222,6 +230,7 @@ class RouterStack(Stack):
         # state, so the agent answers both over InvokeAgentRuntime and the router needs
         # no Memory permissions of its own (dropped ListMemories/ListEvents/DeleteEvent).
 
-        CfnOutput(self, "ApiUrl", value=self.http_api.url or "")
+        self.api_url = self.http_api.url or ""
+        CfnOutput(self, "ApiUrl", value=self.api_url)
         CfnOutput(self, "WebhookLarkUrl", value=(self.http_api.url or "") + "webhook/lark")
         CfnOutput(self, "IdentityTableName", value=self.identity_table.table_name)

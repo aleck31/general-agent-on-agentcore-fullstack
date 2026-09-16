@@ -26,6 +26,7 @@ from stacks.gateway_stack import GatewayStack
 from stacks.shim_stack import ShimStack
 from stacks.observability_stack import ObservabilityStack
 from stacks.storage_stack import StorageStack
+from stacks.webui_stack import WebUiStack
 
 app = cdk.App()
 
@@ -104,6 +105,10 @@ router = RouterStack(
     # would also deadlock on removal, since the producer cannot drop an export the router
     # still imports.
     s3files_file_system_id=ctx("files_file_system_id") or "",
+    # The page's origin, so it may trade an h5 code for a JWT. Travels through
+    # .cdk-state.json because CloudFront assigns the domain — the same route the file
+    # system id takes, and it breaks the cycle between this stack and the WebUI one.
+    web_allowed_origins=ctx("web_origin") or "",
     runtime_arn=agentcore.runtime_arn,
     runtime_endpoint_qualifier=ctx("runtime_endpoint_id") or "DEFAULT",
     lark_secret_name=security.lark_secret.secret_name,
@@ -114,6 +119,21 @@ router = RouterStack(
     cognito_password_secret_name=security.cognito_password_secret.secret_name,
     env=env,
 )
+
+# --- WebUI: static web chat on S3 + CloudFront (opt-in) ---
+# Off unless webui=true: the page only works inside the Lark client, which needs an h5 app
+# registered against the distribution's domain — deploying it without that yields a page
+# nobody can sign in to.
+webui = None
+if _flag("webui"):
+    webui = WebUiStack(
+        app,
+        f"{prefix}-webui",
+        router_api_url=router.api_url,
+        # From .env, which deploy.sh sources — the page needs it for requestAuthCode.
+        lark_app_id=os.environ.get("LARK_APP_ID", ""),
+        env=env,
+    )
 
 # --- Gateway: demo tool Lambda + Gateway IAM (mcpServer target wired in Phase 3) ---
 gateway = GatewayStack(app, f"{prefix}-gateway", env=env)

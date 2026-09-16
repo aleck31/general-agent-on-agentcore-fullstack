@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<!--
+  Web chat for the agent, served as one static file.
+
+  Two hops, and the split is the point:
+    1. POST {code} to the router's /web/session — the code comes from Lark's h5 SDK, so the
+       router can establish who is asking rather than be told. It answers with a user JWT.
+    2. POST an AG-UI RunAgentInput straight to the AgentCore Runtime with that JWT, and read
+       the answer as an SSE stream. No backend sits in this hop: the Runtime's endpoint
+       answers CORS itself and streams through.
+
+  The page never sends an open_id or a thread id — the agent derives both. See
+  docs/architecture.md.
+-->
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent</title>
+<!-- Deploy-time values (router URL, Lark app id); written by the WebUI stack. -->
+<script src="config.js"></script>
+<script src="https://lf1-cdn-tos.bytegoofy.com/goofy/locality/openplatform/h5sdk/1.5.22/h5sdk.js"></script>
+<style>
+  :root { color-scheme: light dark; --edge: color-mix(in oklab, currentColor 14%, transparent); }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.6 -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+         display: flex; flex-direction: column; height: 100vh; }
+  header { padding: .7rem 1rem; border-bottom: 1px solid var(--edge); font-weight: 600;
+           display: flex; gap: .6rem; align-items: baseline; }
+  header small { font-weight: 400; opacity: .6; }
+  #log { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: .8rem; }
+  .msg { max-width: 46rem; padding: .6rem .85rem; border-radius: .8rem; white-space: pre-wrap;
+         overflow-wrap: anywhere; }
+  .me { align-self: flex-end; background: color-mix(in oklab, currentColor 12%, transparent); }
+  .bot { align-self: flex-start; border: 1px solid var(--edge); }
+  .tool { align-self: flex-start; font-size: 13px; opacity: .7; font-style: italic; }
+  .err { align-self: flex-start; color: #c0392b; }
+  form { display: flex; gap: .5rem; padding: .8rem 1rem; border-top: 1px solid var(--edge); }
+  input { flex: 1; padding: .6rem .8rem; border-radius: .6rem; border: 1px solid var(--edge);
+          background: transparent; color: inherit; font: inherit; }
+  button { padding: .6rem 1.1rem; border-radius: .6rem; border: 0; font: inherit;
+           background: currentColor; color: Canvas; cursor: pointer; }
+  button[disabled] { opacity: .45; cursor: default; }
+</style>
+</head>
+<body>
+<header>Agent <small id="who">connecting…</small></header>
+<div id="log"></div>
+<form id="f"><input id="q" placeholder="说点什么…" autocomplete="off" disabled>
+  <button id="send" disabled>发送</button></form>
+
+<script>
+const log = document.getElementById('log');
+const say = (cls, text) => {
+  const el = document.createElement('div');
+  el.className = 'msg ' + cls; el.textContent = text;
+  log.append(el); log.scrollTop = log.scrollHeight; return el;
+};
+
+// The router's base URL is injected at deploy time so the page needs no build step.
+const ROUTER = window.ROUTER_BASE || '';
+let session = null;
+
+async function connect() {
+  try {
+    const code = await larkAuthCode();
+    const r = await fetch(ROUTER + '/web/session', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code}),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
+    session = await r.json();
+    document.getElementById('who').textContent = '已连接';
+    document.getElementById('q').disabled = false;
+    document.getElementById('send').disabled = false;
+  } catch (e) {
+    document.getElementById('who').textContent = '未连接';
+    say('err', '无法建立会话：' + e.message + '\n（这个页面需要在 Lark 客户端内打开）');
+  }
+}
+
+// Lark's h5 SDK hands out a single-use code; that is the whole identity step.
+function larkAuthCode() {
+  return new Promise((resolve, reject) => {
+    if (!window.h5sdk || !window.tt) return reject(new Error('不在 Lark 客户端内'));
+    window.h5sdk.ready(() => window.tt.requestAuthCode({
+      appId: window.LARK_APP_ID,
+      success: (res) => resolve(res.code),
+      fail: (err) => reject(new Error('requestAuthCode: ' + JSON.stringify(err))),
+    }));
+  });
+}
+
+const uuid = () => crypto.randomUUID();
+// One runtime session id per page load: it decides which microVM serves this tab.
+const runtimeSession = 'web-' + uuid() + uuid().slice(0, 8);
+
+async function ask(text) {
+  const url = `https://bedrock-agentcore.${session.region}.amazonaws.com/runtimes/`
+            + `${encodeURIComponent(session.runtimeArn)}/invocations`
+            + `?qualifier=${encodeURIComponent(session.qualifier)}`;
+  // threadId is sent because the protocol requires the field; the agent overwrites it with
+  // the caller's own thread, so its value here carries no authority.
+  const body = {threadId: 'web', runId: uuid(), messages: [{id: uuid(), role: 'user', content: text}],
+                tools: [], context: [], state: {}, forwardedProps: {}};
+  const res = await fetch(url, {method: 'POST', body: JSON.stringify(body), headers: {
+    'Content-Type': 'application/json', 'Accept': 'text/event-stream',
+    'Authorization': 'Bearer ' + session.token,
+    'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id': runtimeSession,
+  }});
+
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = '', bubble = null;
+  for (;;) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream: true});
+    const frames = buf.split('\n\n'); buf = frames.pop();
+    for (const frame of frames) {
+      const line = frame.split('\n').find(l => l.startsWith('data: '));
+      if (!line) continue;
+      let ev; try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+      if (ev.type === 'TEXT_MESSAGE_START') bubble = say('bot', '');
+      else if (ev.type === 'TEXT_MESSAGE_CONTENT' && bubble) {
+        bubble.textContent += ev.delta || '';
+        log.scrollTop = log.scrollHeight;
+      } else if (ev.type === 'TOOL_CALL_START') say('tool', '· ' + (ev.toolCallName || 'tool'));
+      else if (ev.type === 'RUN_ERROR') say('err', ev.message || '出错了');
+    }
+  }
+}
+
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const q = document.getElementById('q'), btn = document.getElementById('send');
+  const text = q.value.trim(); if (!text || !session) return;
+  q.value = ''; say('me', text);
+  q.disabled = btn.disabled = true;
+  try { await ask(text); } catch (err) { say('err', String(err)); }
+  q.disabled = btn.disabled = false; q.focus();
+});
+
+connect();
+</script>
+</body>
+</html>

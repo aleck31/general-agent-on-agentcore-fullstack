@@ -647,6 +647,45 @@ def _resp(status: int, body: dict) -> dict:
             "body": json.dumps(body)}
 
 
+# The browser holds this for the token's lifetime, so keep it short: it is authority to act
+# as that user against the Runtime. Same authority a Lark turn already carries, now in a tab.
+_WEB_ALLOWED_ORIGINS = os.environ.get("WEB_ALLOWED_ORIGINS", "")
+
+
+def _cors(origin: str) -> dict:
+    """CORS for the page's own origin only. The Runtime's endpoint answers `*` itself, but
+    this route hands out a credential, so it is allowlisted."""
+    allowed = [o.strip() for o in _WEB_ALLOWED_ORIGINS.split(",") if o.strip()]
+    if origin and origin in allowed:
+        return {"Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Headers": "content-type",
+                "Access-Control-Allow-Methods": "POST,OPTIONS"}
+    return {}
+
+
+def _web_session(body: str) -> dict:
+    """{code} -> {token, runtimeArn, region, threadId}. The code proves who is asking."""
+    try:
+        payload = json.loads(body or "{}")
+    except Exception:  # noqa: BLE001
+        return _resp(400, {"error": "invalid JSON"})
+    open_id = lark.open_id_from_auth_code(payload.get("code", ""))
+    if not open_id:
+        return _resp(401, {"error": "could not establish identity from that code"})
+    actor_id = f"lark:{open_id}"
+    user_id, _ = identity.resolve_user("lark", open_id)
+    if not user_id or not identity.is_user_allowed("lark", open_id):
+        logger.info("web session refused for %s (allowlist)", actor_id)
+        return _resp(403, {"error": "not allowlisted"})
+    logger.info("web session issued for %s", actor_id)
+    return _resp(200, {
+        "token": cognito.user_jwt(actor_id),
+        "runtimeArn": RUNTIME_ARN,
+        "region": os.environ.get("AWS_REGION", ""),
+        "qualifier": QUALIFIER,
+    })
+
+
 def handler(event, context):
     # Async self-invocation path
     if event.get("_async_dispatch"):
@@ -685,6 +724,12 @@ def handler(event, context):
 
     if path.endswith("/health"):
         return _resp(200, {"status": "ok"})
+
+    # Web entrypoint: trade a Lark h5 authorization code for a token the browser can use to
+    # call the Runtime directly. The router stays the only place that mints user JWTs, and
+    # the code is what makes the identity verified rather than claimed.
+    if path.endswith("/web/session") and method == "POST":
+        return _web_session(body)
 
     if not path.endswith("/webhook/lark"):
         return _resp(404, {"error": "not found"})

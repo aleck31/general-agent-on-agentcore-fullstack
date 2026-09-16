@@ -6,11 +6,12 @@
 #   --memory    AgentCore Memory for long-term records (implied by --runtime)
 #   --runtime   create/update the AgentCore Runtime from the built image (CLI)
 #   --gateway   Web Search gateway in us-east-1 (only when WEB_SEARCH=true)
+#   --webui     static web chat on S3 + CloudFront (only when WEBUI=true)
 #   (no arg)    run all steps in order
 #
 # Step implementation — normally invoked through ./deploy.sh in the repo root,
 # which owns the ordering. Callable directly when iterating on one phase:
-# Usage: [PROFILE=p REGION=r] scripts/provision.sh [--base|--memory|--runtime|--gateway]
+# Usage: [PROFILE=p REGION=r] scripts/provision.sh [--base|--memory|--runtime|--gateway|--webui]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -307,6 +308,25 @@ print(json.dumps(p))')" >/dev/null
   echo "  dropped $n session(s)"
 }
 
+phase_webui() {
+  log "WebUI — static web chat on S3 + CloudFront"
+  if [ "${WEBUI:-false}" != "true" ]; then
+    echo "  webui: off (set WEBUI=true in .env)"; return 0
+  fi
+  $CDK deploy "$PREFIX-webui" -c webui=true -c "files_storage=$FILES_STORAGE" \
+             --require-approval never
+  local url
+  url="$(cfn_out "$PREFIX-webui" WebUiUrl)"
+  # The router must allow this origin to trade an h5 code for a JWT, and CloudFront only
+  # assigns the domain now — so it travels through .cdk-state.json and the router is
+  # re-deployed, the same route the file system id takes.
+  ctx_set web_origin "$url"
+  $CDK deploy "$PREFIX-router" -c webui=true -c "files_storage=$FILES_STORAGE" \
+             --exclusively --require-approval never
+  log "Web chat: $url  (register this domain on the Lark h5 app)"
+}
+
+
 phase3_gateway() {
   # The Web Search connector is only offered in us-east-1, while everything else
   # here runs in $REGION — so this gateway lives there and the agent calls it
@@ -397,8 +417,9 @@ case "${1:-all}" in
   # Memory first: the runtime is created with BEDROCK_AGENTCORE_MEMORY_ID baked into its
   # environment, and UpdateAgentRuntime replaces rather than patches.
   --runtime)  phase_memory; phase2_runtime ;;
+  --webui)    phase_webui ;;
   --gateway)  phase3_gateway ;;
-  all|"")     base_cdk_stacks; phase_memory; phase2_runtime; phase3_gateway
+  all|"")     base_cdk_stacks; phase_memory; phase2_runtime; phase3_gateway; phase_webui
               log "Webhook URL (register in Lark): $(cfn_out "$PREFIX-router" WebhookLarkUrl)" ;;
-  *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--memory|--runtime|--gateway]"; exit 1 ;;
+  *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--memory|--runtime|--gateway|--webui]"; exit 1 ;;
 esac
