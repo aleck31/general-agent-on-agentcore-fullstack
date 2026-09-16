@@ -137,6 +137,16 @@ async def handle_invocations(request: web.Request) -> web.Response:
             log.exception("%s failed", action)
             return web.json_response({"error": str(e)})
 
+    if action == "auth_status":
+        actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, agent_core.auth_status, actor_id, workload_token)
+            return web.json_response(result)
+        except Exception as e:
+            log.exception("auth_status failed")
+            return web.json_response({"error": str(e)})
+
     if action == "reauth":
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
         idp = payload.get("message", "") or "lark"   # router sends the idp key here

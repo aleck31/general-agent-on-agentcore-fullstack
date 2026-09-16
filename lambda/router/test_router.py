@@ -339,46 +339,9 @@ def test_take_pending_auth_reads_the_item_from_the_delete_itself():
     assert dele.call_args.kwargs.get("ReturnValues") == "ALL_OLD"
 
 
-def test_fast_path_claims_before_replaying():
-    """When the user consents inside the polling window, the router and the shim both
-    want to replay. The claim decides which one does."""
-    import index, identity
-    with mock.patch.object(identity, "get_or_create_session", return_value="ses_x"), \
-         mock.patch.object(identity, "get_or_create_memory_session", return_value="mem_x"), \
-         mock.patch.object(index.lark, "add_reaction", return_value=""), \
-         mock.patch.object(index.lark, "send_link_message", return_value=True), \
-         mock.patch.object(index.lark, "send_message", return_value=True), \
-         mock.patch.object(index, "wait_for_consent", return_value=True), \
-         mock.patch.object(identity, "take_pending_auth",
-                           return_value={"message": "m", "chatId": "oc_1"}) as claim, \
-         mock.patch.object(index, "invoke_agent",
-                           side_effect=[{"needs_auth": True, "auth_url": "https://x"},
-                                        {"accepted": True}]) as inv:
-        index._dispatch_turn("u1", "lark:ou_a", "查文档", "oc_1")
-    assert claim.call_count == 1
-    assert inv.call_count == 2                      # the walled turn, then the replay
-    # The replay must rebuild the session: the cached one is still marked unauthorized
-    # (consent lands well inside UNAUTH_SESSION_TTL), so reusing it walls again.
-    assert inv.call_args.kwargs.get("fresh_session") is True
-
-
-def test_fast_path_does_not_replay_when_the_claim_is_lost():
-    """The shim got there first and is already replaying — a second run would duplicate
-    every side effect, in a different session, with no dedup on the agent side."""
-    import index, identity
-    with mock.patch.object(identity, "get_or_create_session", return_value="ses_x"), \
-         mock.patch.object(identity, "get_or_create_memory_session", return_value="mem_x"), \
-         mock.patch.object(index.lark, "add_reaction", return_value=""), \
-         mock.patch.object(index.lark, "send_link_message", return_value=True), \
-         mock.patch.object(index.lark, "send_message", return_value=True) as send, \
-         mock.patch.object(index, "wait_for_consent", return_value=True), \
-         mock.patch.object(identity, "take_pending_auth", return_value=None), \
-         mock.patch.object(index, "invoke_agent",
-                           return_value={"needs_auth": True, "auth_url": "https://x"}) as inv:
-        index._dispatch_turn("u1", "lark:ou_a", "查文档", "oc_1")
-    assert inv.call_count == 1                      # only the original walled turn
-    assert send.call_count == 0                     # and no stray reply
-
+# The synchronous consent-wait is gone (it polled a vault the router cannot read), so the
+# shim's /return is the only replay path. The atomic claim above is what still stops a
+# double replay if anything else ever races it.
 
 def test_resume_replays_the_parked_message():
     import index, identity
@@ -433,7 +396,7 @@ def test_approval_event_dispatches_a_turn_addressed_to_the_approver():
     import index, identity
     with mock.patch.object(identity, "claim_approval_task", return_value=True), \
          mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
-         mock.patch.object(index, "user_token_vaulted", return_value=True), \
+         mock.patch.object(identity, "park_pending_auth"), \
          mock.patch.object(index, "_dispatch_turn") as disp:
         index.process_approval_event(_approval_event())
     assert disp.call_count == 1
@@ -489,29 +452,18 @@ def test_approval_event_for_an_unknown_user_stays_silent():
 
 
 def test_approval_event_parks_the_turn_when_the_approver_has_not_consented():
-    """The approval server refuses to decide without that person's own grant, so the
-    turn will wall. Parking is what lets consent-resume replay it after they authorize
-    — otherwise an unattended turn is simply lost."""
+    """The approval server refuses to decide without that person's own grant, so the turn
+    may wall. Parking is what lets consent-resume replay it — otherwise an unattended turn
+    is simply lost. Unconditional: only the agent knows whether a grant exists, and an
+    unnecessary park expires by TTL."""
     import index, identity
     with mock.patch.object(identity, "claim_approval_task", return_value=True), \
          mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
-         mock.patch.object(index, "user_token_vaulted", return_value=False), \
          mock.patch.object(identity, "park_pending_auth") as park, \
          mock.patch.object(index, "_dispatch_turn"):
         index.process_approval_event(_approval_event())
     assert park.call_count == 1
     assert park.call_args.args[2] == "ou_alice"      # DM target, not a chat
-
-
-def test_approval_event_does_not_park_for_an_authorized_approver():
-    import index, identity
-    with mock.patch.object(identity, "claim_approval_task", return_value=True), \
-         mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
-         mock.patch.object(index, "user_token_vaulted", return_value=True), \
-         mock.patch.object(identity, "park_pending_auth") as park, \
-         mock.patch.object(index, "_dispatch_turn"):
-        index.process_approval_event(_approval_event())
-    assert park.call_count == 0
 
 
 def test_legacy_schema_event_is_routed_to_the_approval_path():
@@ -594,19 +546,15 @@ def test_complete_consent_names_the_user_by_token_not_by_id():
         sessionUri="sess-uri", userIdentifier={"userToken": "JWT-FOR-U"})
 
 
-def test_vault_check_uses_the_jwt_namespace():
-    """The vault key follows the token's `sub`, so the router must ask ForJWT. Checking
-    ForUserId would consult a different namespace and report "never consented" forever,
-    leaving the user in an endless consent loop."""
-    import index
-    with mock.patch.object(index.cognito, "user_jwt", return_value="JWT-FOR-U"), \
-         mock.patch.object(index, "agentcore") as ac:
-        ac.get_workload_access_token_for_jwt.return_value = {"workloadAccessToken": "WAT"}
-        ac.get_resource_oauth2_token.return_value = {"accessToken": "lark-token"}
-        assert index.user_token_vaulted("lark:ou_u") is True
-    ac.get_workload_access_token_for_jwt.assert_called_once()
-    assert ac.get_workload_access_token_for_jwt.call_args.kwargs["userToken"] == "JWT-FOR-U"
-    assert not ac.get_workload_access_token_for_user_id.called
+def test_the_router_never_queries_the_vault_itself():
+    """It cannot: a grant is vaulted against the workload identity the Runtime derives from
+    the inbound JWT, and one re-derived here reads a different namespace and reports "no"
+    forever — an endless consent loop while the agent's own calls succeed. Measured, see
+    docs/agentcore-behavior.md. An earlier test asserted the opposite as correct."""
+    import index, inspect
+    src = inspect.getsource(index)
+    assert "get_resource_oauth2_token" not in src
+    assert "get_workload_access_token_for_jwt" not in src
 
 
 def test_credential_load_failure_is_not_cached():
@@ -624,3 +572,20 @@ def test_credential_load_failure_is_not_cached():
         sm.get_secret_value.return_value = {"SecretString": '{"encryptKey":"k"}'}
         assert lark.get_credentials()[3] == "k"   # next call recovers
     lark._creds_cache = None
+
+
+def test_auth_status_is_answered_by_the_agent_not_the_vault():
+    """The router cannot read the grant: it lives under the workload identity the Runtime
+    derives from the inbound JWT, so a locally re-derived one always reports "no"."""
+    import index
+    with mock.patch.object(index, "invoke_agent",
+                           return_value={"lark": True}) as inv:
+        assert index.user_authorized("ses_x", "u1", "lark:ou_a", "lark") is True
+    assert inv.call_args.kwargs["action"] == "auth_status"
+
+
+def test_auth_status_treats_a_missing_key_as_unauthorized():
+    """An agent error must not read as authorised."""
+    import index
+    with mock.patch.object(index, "invoke_agent", return_value={"error": "boom"}):
+        assert index.user_authorized("ses_x", "u1", "lark:ou_a", "lark") is False

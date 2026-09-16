@@ -214,8 +214,6 @@ def _secs(seconds) -> str:
 # How long the async Lambda holds, waiting for the user to finish 3LO consent.
 # Bounded by the Lambda timeout (see the agentcore read_timeout above); on
 # timeout we fall back to "send your message again".
-AUTH_WAIT_SECONDS = int(os.environ.get("AUTH_WAIT_SECONDS", "45"))
-AUTH_POLL_INTERVAL = float(os.environ.get("AUTH_POLL_INTERVAL", "2"))
 LARK_OAUTH_PROVIDER = os.environ.get("LARK_OAUTH_PROVIDER", "agentcore-fullstack-3lo")
 AGENT_WORKLOAD_NAME = os.environ.get("AGENT_WORKLOAD_NAME", "agentcore-fullstack-wl")
 LARK_SCOPES = os.environ.get("LARK_SCOPES", "drive:drive docx:document offline_access").split()
@@ -238,49 +236,15 @@ def _load_idps() -> dict:
 IDPS = _load_idps()
 
 
-def user_token_vaulted(actor_id: str, idp_key: str = "lark") -> bool:
-    """True once this user's token for `idp_key` is in the Token Vault (consent
-    complete). Same USER_FEDERATION sequence the agent uses; presence check only.
-    ResourceOauth2ReturnUrl is required even for a presence check — without a
-    valid token AgentCore refuses the call rather than returning empty.
+def user_authorized(session_id: str, user_id: str, actor_id: str,
+                    idp_key: str = "lark") -> bool:
+    """Whether this user has authorised `idp_key`, answered by the agent.
 
-    Keyed ForJWT, matching what the agent sees. The vault namespace follows the
-    token's `sub`, so a ForUserId-derived check would look in a different namespace
-    and report "not consented" forever."""
-    idp = IDPS.get(idp_key)
-    if not idp:
-        return False
-    try:
-        wat = agentcore.get_workload_access_token_for_jwt(
-            workloadName=AGENT_WORKLOAD_NAME, userToken=cognito.user_jwt(actor_id),
-        )["workloadAccessToken"]
-        kwargs = dict(
-            workloadIdentityToken=wat,
-            resourceCredentialProviderName=idp["provider"],
-            scopes=idp["scopes"],
-            oauth2Flow="USER_FEDERATION",
-        )
-        if SHIM_RETURN_URL:
-            kwargs["resourceOauth2ReturnUrl"] = SHIM_RETURN_URL
-        resp = agentcore.get_resource_oauth2_token(**kwargs)
-        has = bool(resp.get("accessToken"))
-        logger.info("vault check %s (%s): token=%s authUrl=%s", actor_id, idp_key,
-                    has, bool(resp.get("authorizationUrl")))
-        return has
-    except Exception:
-        logger.exception("vault check failed for %s (%s)", actor_id, idp_key)
-        return False
-
-
-def wait_for_consent(actor_id: str) -> bool:
-    """Poll the vault until the token appears or AUTH_WAIT_SECONDS elapses."""
-    import time
-    deadline = time.monotonic() + AUTH_WAIT_SECONDS
-    while time.monotonic() < deadline:
-        if user_token_vaulted(actor_id):
-            return True
-        time.sleep(AUTH_POLL_INTERVAL)
-    return False
+    The router cannot answer it: a consent is vaulted against the workload identity the
+    Runtime derives from the inbound JWT, and re-deriving one here reads a different
+    namespace and always reports "no" (see docs/agentcore-behavior.md)."""
+    r = invoke_agent(session_id, user_id, actor_id, "", action="auth_status")
+    return bool(r.get(idp_key))
 
 
 # --------------------------- consent completion -----------------------------
@@ -425,10 +389,9 @@ def process_approval_event(ev: dict, context=None) -> None:
     message = _approval_prompt(instance_code, task_id, open_id, approval_code)
     # No chat here — an approval event carries none — so the approver's open_id is the
     # delivery address, which the senders read as "DM this person".
-    if not user_token_vaulted(actor_id):
-        # The approval server refuses to decide without this person's own grant, so the
-        # turn will wall. Park it, and consent-resume replays it once they authorize.
-        identity.park_pending_auth(user_id, message, open_id)
+    # Park unconditionally: only the agent can tell whether this person has a grant, and
+    # asking costs an invocation. An unnecessary park expires by TTL.
+    identity.park_pending_auth(user_id, message, open_id)
     logger.info("approval: dispatching task %s for %s", task_id, actor_id)
     _dispatch_turn(user_id, actor_id, message, open_id, context=context)
 
@@ -567,8 +530,9 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
         arg = agent_message[5:].strip().lower()
         if not arg:
             lines = ["各 IdP 的授权状态："]
+            session_id = identity.get_or_create_session(user_id)
             for key, idp in IDPS.items():
-                ok = user_token_vaulted(actor_id, key)
+                ok = user_authorized(session_id, user_id, actor_id, key)
                 lines.append(f"  {'✅' if ok else '❌'} {key} ({idp.get('label', key)})"
                              f"{'' if ok else ' — 发送 /auth ' + key + ' 授权'}")
             lark.send_message(chat_id, "\n".join(lines))
@@ -618,8 +582,7 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
     # so the shim's /return can replay it once consent lands. Only for unauthorized
     # users: an authorized turn won't wall, and parking every message would be waste.
     # Left to expire by TTL if this turn needs no Lark tool after all.
-    if not user_token_vaulted(actor_id):
-        identity.park_pending_auth(user_id, agent_message, chat_id)
+    identity.park_pending_auth(user_id, agent_message, chat_id)
     _dispatch_turn(user_id, actor_id, agent_message, chat_id, message_id, context)
 
 
@@ -649,8 +612,8 @@ def _dispatch_turn(user_id: str, actor_id: str, agent_message: str, chat_id: str
         result = invoke_agent(session_id, user_id, actor_id, agent_message,
                               action="chat_async", mem_sid=mem_sid, chat_id=chat_id,
                               message_id=message_id, reaction_id=reaction_id)
-        # First-use 3LO: post the consent link, then hold and poll the vault so
-        # the user gets an answer without re-sending (bounded by AUTH_WAIT_SECONDS).
+        # First-use 3LO: post the consent link. The turn is already parked, so the
+        # shim's /return replays it when consent lands — the user does not re-send.
         if result.get("needs_auth"):
             auth_url = result.get("auth_url")
             if auth_url:
@@ -658,31 +621,9 @@ def _dispatch_turn(user_id: str, actor_id: str, agent_message: str, chat_id: str
                     chat_id, "需要访问你的 Lark 账号，请先授权：", "点击授权", auth_url)
             else:  # no structured url — fall back to the agent's text
                 lark.send_message(chat_id, result.get("reply", ""))
-            logger.info("awaiting consent for %s (<= %ds)", actor_id, AUTH_WAIT_SECONDS)
-            if wait_for_consent(actor_id):
-                # Claim the parked turn before replaying it. The shim's callback races
-                # us the moment consent lands — it claims and replays too — so whoever
-                # polls the token first would otherwise run the turn a second time, in
-                # a different session, with the side effects duplicated. Whoever wins
-                # the claim runs it; the loser stops here.
-                if identity.take_pending_auth(user_id) is None:
-                    logger.info("consent complete for %s; already claimed elsewhere",
-                                actor_id)
-                    return
-                logger.info("consent complete for %s; re-invoking", actor_id)
-                # Waiting for consent already spent part of the budget.
-                left = (context.get_remaining_time_in_millis() / 1000 - 10
-                        if context else READ_TIMEOUT)
-                result = invoke_agent(session_id, user_id, actor_id, agent_message,
-                                      action="chat_async", mem_sid=mem_sid,
-                                      budget=left, chat_id=chat_id,
-                                      message_id=message_id, reaction_id=reaction_id,
-                                      fresh_session=True)
-            else:
-                logger.info("consent wait timed out for %s", actor_id)
-                return  # link already sent; user finishes later and re-sends
-        if result.get("accepted"):
-            logger.info("agent accepted the turn for %s; it will push the reply", actor_id)
+            # No synchronous wait here. It used to poll the vault, which the router
+            # cannot read (docs/agentcore-behavior.md), so it only ever timed out. The
+            # shim's /return replays the parked turn, claiming it atomically.
             return
         reply = result.get("reply", "")
     except ReadTimeoutError:

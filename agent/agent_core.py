@@ -718,6 +718,16 @@ def clear_history(actor_id: str, mem_sid: str = "") -> dict:
     return {"deleted": True}
 
 
+def auth_status(actor_id: str, workload_token: str = "") -> dict:
+    """Which IdPs this user has authorised → {"lark": bool}.
+
+    Only the agent can answer this. A consent is vaulted against the workload identity the
+    Runtime derives from the inbound JWT, and re-deriving one from a fresh JWT for the same
+    user reads a different namespace — see docs/agentcore-behavior.md."""
+    kind, _ = lark_3lo.get_user_lark_token(actor_id, workload_token=workload_token)
+    return {"lark": kind == "token"}
+
+
 def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
     """Start a fresh 3LO flow for `idp` even when a token is already vaulted →
     {auth_url}. Authorization is per-IdP; only "lark" is wired up so far (add a module
