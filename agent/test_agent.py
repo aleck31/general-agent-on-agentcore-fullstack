@@ -177,19 +177,6 @@ def test_repair_ignores_a_dangling_call_that_is_not_trailing():
     assert (n, appended) == (0, [])
 
 
-def test_long_term_store_is_absent_until_memory_exists():
-    """The Store is long-term memory only now. It must be optional: the checkpointer is
-    what carries the conversation, so no Memory resource may not break a turn."""
-    with mock.patch.object(agent_core, "_MEMORY_ID", ""):
-        assert agent_core._store() is None
-
-
-# ------------------------------- busy tracking ------------------------------
-# /ping must report HealthyBusy while a background turn runs, or AgentCore
-# reclaims the container and kills it. The counter is shared mutable state
-# touched from two scopes, which is exactly where a missing `global` hides — an
-# earlier version raised UnboundLocalError only at runtime, in production.
-
 def _load_busy_helpers():
     """The real functions, with the counter reset so tests don't inherit each other."""
     agent_core._in_flight = 0
@@ -803,3 +790,68 @@ def test_an_explicit_per_call_cache_control_is_not_overridden():
     m.invoke([SystemMessage("sys"), HumanMessage("a")], cache_control={"ttl": "5m"})
     assert [b["cachePoint"].get("ttl") for b in client.params["system"]
             if "cachePoint" in b] == [None]      # 5m → field omitted
+
+
+# --------------------------- long-term memory --------------------------------
+# Two tools, not automatic extraction. The isolation that matters is the namespace: it is
+# built from the bound actor, never from a model-supplied argument, so no prompt can make
+# recall read another user's records.
+
+def test_no_memory_resource_means_no_tools_rather_than_an_error():
+    import memory_tools
+    with mock.patch.object(memory_tools, "_MEMORY_ID", ""):
+        assert memory_tools.tools_for("lark:ou_x") == []
+
+
+def test_the_namespace_comes_from_the_bound_actor_not_from_arguments():
+    import memory_tools
+    calls = {}
+
+    class _C:
+        def batch_create_memory_records(self, **kw):
+            calls["write"] = kw
+            return {"successfulRecords": [{"memoryRecordId": "r1"}]}
+
+        def retrieve_memory_records(self, **kw):
+            calls["read"] = kw
+            return {"memoryRecordSummaries": [{"content": {"text": "code name is X"}}]}
+
+    with mock.patch.object(memory_tools, "_MEMORY_ID", "mem-1"), \
+         mock.patch.object(memory_tools.boto3, "client", return_value=_C()):
+        remember, recall = memory_tools.tools_for("lark:ou_alice")
+        assert remember.invoke({"fact": "likes tea"}) == "Saved."
+        assert "code name is X" in recall.invoke({"query": "code name?"})
+
+    assert calls["write"]["records"][0]["namespaces"] == ["/facts/lark:ou_alice"]
+    assert calls["read"]["namespace"] == ["/facts/lark:ou_alice"][0]
+    # No strategy id: measured that the service embeds and scores directly-written records
+    # without one, so declaring a strategy would only add cost and constraints.
+    assert "memoryStrategyId" not in calls["write"]["records"][0]
+    assert set(remember.args) == {"fact"} and set(recall.args) == {"query"}
+
+
+def test_a_rejected_record_is_reported_not_swallowed():
+    import memory_tools
+
+    class _C:
+        def batch_create_memory_records(self, **kw):
+            return {"successfulRecords": [], "failedRecords": [{"errorCode": "Throttled"}]}
+
+    with mock.patch.object(memory_tools, "_MEMORY_ID", "mem-1"), \
+         mock.patch.object(memory_tools.boto3, "client", return_value=_C()):
+        remember, _ = memory_tools.tools_for("lark:ou_x")
+        assert "could not save" in remember.invoke({"fact": "x"})
+
+
+def test_recall_says_so_when_there_is_nothing_stored():
+    """An empty result must not read as a tool failure, or the model retries it."""
+    import memory_tools
+
+    class _C:
+        def retrieve_memory_records(self, **kw):
+            return {"memoryRecordSummaries": []}
+
+    with mock.patch.object(memory_tools, "_MEMORY_ID", "mem-1"), \
+         mock.patch.object(memory_tools.boto3, "client", return_value=_C()):
+        _, recall = memory_tools.tools_for("lark:ou_x")
+        assert recall.invoke({"query": "anything?"}) == "Nothing on record about that."

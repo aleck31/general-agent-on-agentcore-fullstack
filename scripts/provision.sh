@@ -3,13 +3,14 @@
 #
 # Steps (idempotent — re-runnable independently):
 #   --base      CDK base stacks (security, agentcore, router, gateway, observability)
+#   --memory    AgentCore Memory for long-term records (implied by --runtime)
 #   --runtime   create/update the AgentCore Runtime from the built image (CLI)
 #   --gateway   Web Search gateway in us-east-1 (only when WEB_SEARCH=true)
 #   (no arg)    run all steps in order
 #
 # Step implementation — normally invoked through ./deploy.sh in the repo root,
 # which owns the ordering. Callable directly when iterating on one phase:
-# Usage: [PROFILE=p REGION=r] scripts/provision.sh [--base|--runtime|--gateway]
+# Usage: [PROFILE=p REGION=r] scripts/provision.sh [--base|--memory|--runtime|--gateway]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -96,6 +97,55 @@ base_cdk_stacks() {
   $CDK deploy "${stacks[@]}" -c "files_storage=$FILES_STORAGE" \
              --require-approval never --outputs-file cdk.out/outputs.json
 }
+
+phase_memory() {
+  log "Memory — long-term store"
+
+  # Long-term records only. The conversation itself is LangGraph state in DynamoDB (see
+  # .dev/adr/0008), so nothing here holds the transcript: this resource exists for records
+  # the agent decides are worth keeping across threads.
+  #
+  # No memoryStrategies on purpose. Measured against the service: BatchCreateMemoryRecords
+  # accepts records with `memoryStrategyId` omitted, and RetrieveMemoryRecords then returns
+  # them by semantic score — identical score to the same record written under a semantic or
+  # summary strategy, so the embedding happens regardless. Declaring a strategy would only
+  # add cost and constraints: a *custom* strategy is rejected outright without a
+  # memoryExecutionRoleArn ("memory contains one or more Custom strategies"), and a built-in
+  # one runs AWS-managed extraction we do not want, billed per record stored per month.
+  # Extraction is the thing we are deliberately not using — what to remember is our
+  # decision, not a by-product of every turn.
+  #
+  # eventExpiryDuration is REQUIRED (3-365 days). 365 because short-term events are billed
+  # per write, not per day retained, so a longer window costs nothing.
+  local mname="${PREFIX//-/_}_ltm" mid
+  # list-memories returns no `name` — only `id`, which is "<name>-<suffix>". Matching on
+  # name would never hit, and this step would create a new memory on every run.
+  mid="$(aws bedrock-agentcore-control list-memories --max-results 100 \
+        --query "memories[?starts_with(id, '${mname}-')].id" --output text 2>/dev/null | head -1)"
+
+  if [ -n "$mid" ] && [ "$mid" != "None" ]; then
+    echo "  reusing $mid"
+  else
+    mid="$(acp create_memory "$(MNAME="$mname" uv run python -c '
+import json, os
+print(json.dumps({
+    "name": os.environ["MNAME"],
+    "description": "Long-term records for the agent; the conversation lives in DynamoDB",
+    "eventExpiryDuration": 365,
+}))')" | uv run python -c 'import json,sys;print(json.load(sys.stdin)["memory"]["id"])')"
+    echo "  created $mid"
+  fi
+
+  # Wait for ACTIVE: creation is asynchronous and a write to a CREATING memory fails
+  # rather than queueing.
+  for _ in $(seq 1 40); do
+    [ "$(aws bedrock-agentcore-control get-memory --memory-id "$mid" \
+         --query 'memory.status' --output text 2>/dev/null)" = "ACTIVE" ] && break
+    sleep 5
+  done
+  ctx_set memory_id "$mid"
+}
+
 
 phase2_runtime() {
   # The agent Runtime is created straight from the control plane, using the ARM64 image
@@ -352,9 +402,12 @@ print(json.dumps({
 
 case "${1:-all}" in
   --base|--phase1) base_cdk_stacks ;;  # --phase1 kept as a back-compat alias
-  --runtime)  phase2_runtime ;;
+  --memory)   phase_memory ;;
+  # Memory first: the runtime is created with BEDROCK_AGENTCORE_MEMORY_ID baked into its
+  # environment, and UpdateAgentRuntime replaces rather than patches.
+  --runtime)  phase_memory; phase2_runtime ;;
   --gateway)  phase3_gateway ;;
-  all|"")     base_cdk_stacks; phase2_runtime; phase3_gateway
+  all|"")     base_cdk_stacks; phase_memory; phase2_runtime; phase3_gateway
               log "Webhook URL (register in Lark): $(cfn_out "$PREFIX-router" WebhookLarkUrl)" ;;
-  *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--runtime|--gateway]"; exit 1 ;;
+  *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--memory|--runtime|--gateway]"; exit 1 ;;
 esac

@@ -14,13 +14,10 @@ Memory is two independent backends, because the two jobs have different requirem
     key, so a turn cut off at the 15-minute invoke cap resumes in a brand-new microVM.
     Written per superstep, so the durable record advances *during* a turn: there is no
     shutdown hook on a microVM, and a design that flushes at the end loses the turn.
-  - AgentCoreMemoryStore — long-term memory only, written once per completed turn as
-    *conversational* events. Extraction and semantic retrieval are the things AgentCore
-    Memory does that a plain table does not. The router also counts and clears these
-    (/status, /clear read `conversational` payloads), so dropping them zeroes that count
-    silently.
-Once per completed turn rather than from a model hook: a hook fires on every model call,
-so a turn with tool calls would record itself several times over.
+  - AgentCore Memory — long-term records only, reached through the `remember`/`recall`
+    tools in memory_tools. Nothing is written per turn: retrieval is the priced operation,
+    so storing every exchange and querying blindly is the pattern that makes cost scale
+    with chat volume instead of with need. What to keep is the model's explicit decision.
 
 Per-user Lark access (agent-side 3LO): for each end-user the agent fetches that user's
 vaulted Lark token from AgentCore Identity (GetResourceOauth2Token, USER_FEDERATION)
@@ -43,7 +40,6 @@ import os
 import queue
 import threading
 import time
-import uuid
 from contextlib import AsyncExitStack
 
 from langchain.agents import create_agent
@@ -54,6 +50,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 
 import lark_3lo
 import lark_notify
+import memory_tools
 import websearch
 
 log = logging.getLogger("agent.core")
@@ -187,7 +184,7 @@ def _checkpointer():
     per write, and needs the Memory resource to exist at all. Fidelity is identical —
     both go through JsonPlusSerializer and produce the same CheckpointTuple — so the
     choice is only about the dependency surface. AgentCore Memory is still used, for
-    long-term records; see _store().
+    long-term records; see _long_term_tools().
 
     Built per session rather than once, because it holds a boto3 client and a stale one
     outliving its credentials is the failure that avoids."""
@@ -214,13 +211,14 @@ def _checkpointer():
     )
 
 
-def _store():
-    """Long-term memory, or None until the Memory resource exists. Keyword-only args,
-    despite what the devguide example shows."""
-    if not _MEMORY_ID:
-        return None
-    from langgraph_checkpoint_aws import AgentCoreMemoryStore
-    return AgentCoreMemoryStore(memory_id=_MEMORY_ID, region_name=_REGION)
+def _long_term_tools(actor_id: str) -> list:
+    """Long-term memory reaches the model as two tools (remember/recall), not as a Store.
+
+    A LangGraph Store would write every exchange as conversational events — the
+    by-product pattern ADR 0008 rejected, and the one that makes retrieval cost scale with
+    chat volume rather than with need. Nothing reads a Store here now that /status counts
+    checkpoints instead of events."""
+    return memory_tools.tools_for(actor_id)
 
 
 _INTERRUPTED_TOOL = "The previous attempt was interrupted before this tool returned."
@@ -322,14 +320,15 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         except Exception:  # noqa: BLE001 — search is optional, Lark tools are not
             log.exception("web search unavailable for %s", actor_id)
 
-    saver, store = _checkpointer(), _store()
+    tools += _long_term_tools(actor_id)
+    saver = _checkpointer()
     # langchain.agents.create_agent, not langgraph.prebuilt.create_react_agent: the
     # latter is deprecated as of LangGraph 1.0 and slated for removal in 2.0 (AWS's
     # devguide example still imports it). Note there are no pre/post model hooks on
     # this API — middleware replaces them — which is another reason the conversational
     # record is written at turn end instead.
     graph = create_agent(model=_model, tools=tools, system_prompt=_SYSTEM,
-                         checkpointer=saver, store=store)
+                         checkpointer=saver)
     # thread_id is the whole checkpoint address (chosen by the router, so /reset can
     # rotate it) — DynamoDBSaver derives its partition key from it alone, and since it is
     # the sha256 of the actor, per-user isolation follows from the key. The agent never
@@ -345,7 +344,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     except Exception:  # noqa: BLE001 — a failed repair must not cost the user a session
         log.warning("could not check for an interrupted turn", exc_info=True)
     return {
-        "graph": graph, "stack": stack, "store": store,
+        "graph": graph, "stack": stack,
         "config": config,
         "actor_id": actor_id, "mem_sid": mem_sid,
         "created": time.time(),
@@ -441,25 +440,6 @@ def _get_session(actor_id: str, email: str, mem_sid: str, fresh: bool = False,
         return s
 
 
-def _record_turn(session: dict, user_text: str, answer: str) -> None:
-    """Write this exchange as conversational events, which is the only shape the router
-    can count (/status) and AgentCore's long-term extraction can read. The checkpointer
-    already stored the same turn as blobs for the agent's own use — these two records
-    have different readers, not redundant ones.
-
-    Best-effort: the answer has already reached the user by now, so failing here must
-    not turn a delivered turn into an error."""
-    store = session.get("store")
-    if store is None or not answer:
-        return
-    namespace = (session["actor_id"], session["mem_sid"])
-    try:
-        for msg in (HumanMessage(user_text), AIMessage(answer)):
-            _run(store.aput(namespace, str(uuid.uuid4()), {"message": msg}), timeout=30)
-    except Exception:  # noqa: BLE001
-        log.warning("could not record the turn to Memory", exc_info=True)
-
-
 def chat_result(actor_id: str, message: str, email: str = "",
                 mem_sid: str = "", workload_token: str = "") -> dict:
     """Non-streaming chat → {reply, needs_auth, auth_url}. History via Memory.
@@ -483,7 +463,6 @@ def chat_result(actor_id: str, message: str, email: str = "",
     if _hit_auth_wall(s):
         return {"reply": _AUTH_PROMPT.format(url=s["auth_url"]),
                 "needs_auth": True, "auth_url": s["auth_url"]}
-    _record_turn(s, message, reply)
     return {"reply": reply, "needs_auth": False}
 
 
@@ -523,8 +502,6 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
                 lark_notify.send_link(
                     chat_id, "需要访问你的 Lark 账号，授权后我会自动继续：",
                     "点击授权", s["auth_url"])
-            else:
-                _record_turn(s, message, answer)
         except Exception as e:  # noqa: BLE001 — the caller is already gone
             log.exception("async turn failed for %s", actor_id)
             # This session stays cached, so a turn that died mid tool call would make every

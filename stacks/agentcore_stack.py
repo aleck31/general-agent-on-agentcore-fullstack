@@ -145,16 +145,14 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # AgentCore Memory (STM) — conversation history read/write. Scoped to the
-        # project's memory resources (the toolkit creates <prefix>_..._mem-*).
+        # AgentCore Memory — long-term records only, written and read directly by the
+        # remember/recall tools. No event actions: the conversation lives in the checkpoint
+        # table, so nothing writes events any more, and dropping CreateEvent/ListEvents
+        # keeps the agent unable to store transcripts here even by accident.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
-                    "bedrock-agentcore:CreateEvent",
-                    "bedrock-agentcore:ListEvents",
-                    "bedrock-agentcore:GetEvent",
-                    "bedrock-agentcore:ListActors",
-                    "bedrock-agentcore:ListSessions",
+                    "bedrock-agentcore:BatchCreateMemoryRecords",
                     "bedrock-agentcore:RetrieveMemoryRecords",
                 ],
                 resources=[
