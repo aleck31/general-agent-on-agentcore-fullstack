@@ -129,7 +129,10 @@ if _flag("webui"):
     webui = WebUiStack(
         app,
         f"{prefix}-webui",
-        router_api_url=router.api_url,
+        # From .cdk-state.json, not router.api_url: a CDK reference makes the router
+        # unable to change an export this stack imports (UPDATE_ROLLBACK, measured), the
+        # same deadlock the storage stack hit.
+        router_api_url=ctx("router_api_url") or "",
         # From .env, which deploy.sh sources — the page needs it for requestAuthCode.
         lark_app_id=os.environ.get("LARK_APP_ID", ""),
         env=env,

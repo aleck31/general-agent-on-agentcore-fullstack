@@ -99,9 +99,9 @@ async function ask(text) {
   const url = `https://bedrock-agentcore.${session.region}.amazonaws.com/runtimes/`
             + `${encodeURIComponent(session.runtimeArn)}/invocations`
             + `?qualifier=${encodeURIComponent(session.qualifier)}`;
-  // threadId is sent because the protocol requires the field; the agent overwrites it with
-  // the caller's own thread, so its value here carries no authority.
-  const body = {threadId: 'web', runId: uuid(), messages: [{id: uuid(), role: 'user', content: text}],
+  // Neither actorId nor threadId carries authority: the agent verifies the actor against
+  // the vaulted token's real owner, and derives the thread from it.
+  const body = {actorId: session.actorId, threadId: 'web', runId: uuid(), messages: [{id: uuid(), role: 'user', content: text}],
                 tools: [], context: [], state: {}, forwardedProps: {}};
   const res = await fetch(url, {method: 'POST', body: JSON.stringify(body), headers: {
     'Content-Type': 'application/json', 'Accept': 'text/event-stream',

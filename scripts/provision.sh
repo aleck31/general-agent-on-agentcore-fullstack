@@ -11,7 +11,7 @@
 #
 # Step implementation — normally invoked through ./deploy.sh in the repo root,
 # which owns the ordering. Callable directly when iterating on one phase:
-# Usage: [PROFILE=p REGION=r] scripts/provision.sh [--base|--memory|--runtime|--gateway|--webui]
+# Usage: [PROFILE=p REGION=r] scripts/provision.sh [--base|--memory|--runtime|--gateway|--a2a|--webui]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -97,6 +97,9 @@ base_cdk_stacks() {
   fi
   $CDK deploy "${stacks[@]}" -c "files_storage=$FILES_STORAGE" \
              --require-approval never --outputs-file cdk.out/outputs.json
+  # The web page needs this and CDK assigns it, so it travels through state rather than a
+  # cross-stack export — importing it would freeze the router's own exports.
+  ctx_set router_api_url "$(cfn_out "$PREFIX-router" ApiUrl)"
 }
 
 phase_memory() {
@@ -308,6 +311,77 @@ print(json.dumps(p))')" >/dev/null
   echo "  dropped $n session(s)"
 }
 
+phase_a2a() {
+  log "A2A — expose the agent to peer agents"
+  if [ "${A2A:-false}" != "true" ]; then
+    echo "  a2a: off (set A2A=true in .env)"; return 0
+  fi
+  local role image rname rid params
+  role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
+  image="$(cfn_out "$PREFIX-agentcore" AgentImageUri)"
+  [ -n "$image" ] || { echo "missing agent image — run --base first"; exit 1; }
+  rname="${PREFIX//-/_}_a2a"
+
+  # Same image as the agent, SERVER_MODE=a2a picks the other entrypoint. Only the identity
+  # and model variables are needed: an A2A task runs a normal turn.
+  params="$(RNAME="$rname" IMAGE="$image" ROLE="$role" PREFIX="$PREFIX" \
+    ISSUER="$(cfn_out "$PREFIX-security" CognitoIssuerUrl)" \
+    CLIENT="$(cfn_out "$PREFIX-security" UserPoolClientId)" \
+    AGENT_ARN="$(aws bedrock-agentcore-control list-agent-runtimes \
+      --query "agentRuntimes[?agentRuntimeName=='${PREFIX//-/_}_agent'].agentRuntimeArn" \
+      --output text | head -1)" \
+    SRC="$(aws bedrock-agentcore-control get-agent-runtime \
+      --agent-runtime-id "$(aws bedrock-agentcore-control list-agent-runtimes \
+        --query "agentRuntimes[?agentRuntimeName=='${PREFIX//-/_}_agent'].agentRuntimeId" \
+        --output text | head -1)" --query 'environmentVariables' --output json 2>/dev/null)" \
+    uv run python - <<'PYEOF'
+import json, os
+e = os.environ
+env = json.loads(e["SRC"] or "{}")
+env["SERVER_MODE"] = "a2a"
+# It forwards to the agent Runtime rather than running a turn: a vaulted consent belongs to
+# the Runtime that obtained it, so only that one can act for a user.
+env["AGENT_RUNTIME_ARN"] = e["AGENT_ARN"]
+print(json.dumps({
+    "agentRuntimeName": e["RNAME"],
+    "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": e["IMAGE"]}},
+    "roleArn": e["ROLE"],
+    "networkConfiguration": {"networkMode": "PUBLIC"},
+    "protocolConfiguration": {"serverProtocol": "A2A"},
+    # Authorization is stripped at the edge unless listed, and forwarding the caller's own
+    # bearer is the whole design — this server adds no identity.
+    "requestHeaderConfiguration": {"requestHeaderAllowlist": ["Authorization"]},
+    "environmentVariables": {k: v for k, v in env.items() if v},
+    "authorizerConfiguration": {"customJWTAuthorizer": {
+        "discoveryUrl": e["ISSUER"] + "/.well-known/openid-configuration",
+        "allowedClients": [e["CLIENT"]]}},
+}))
+PYEOF
+)"
+
+  rid="$(aws bedrock-agentcore-control list-agent-runtimes \
+    --query "agentRuntimes[?agentRuntimeName=='$rname'].agentRuntimeId" --output text 2>/dev/null | head -1)"
+  if [ -n "$rid" ] && [ "$rid" != "None" ]; then
+    acp update_agent_runtime "$(RID="$rid" P="$params" uv run python -c '
+import json, os
+p = json.loads(os.environ["P"]); p.pop("agentRuntimeName", None)
+p["agentRuntimeId"] = os.environ["RID"]
+print(json.dumps(p))')" >/dev/null
+    echo "  updated $rname ($rid)"
+  else
+    rid="$(acp create_agent_runtime "$params" | uv run python -c 'import json,sys;print(json.load(sys.stdin)["agentRuntimeId"])')"
+    echo "  created $rname ($rid)"
+  fi
+  for _ in $(seq 1 40); do
+    [ "$(aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$rid" \
+         --query status --output text 2>/dev/null)" = "READY" ] && break
+    sleep 5
+  done
+  ctx_set a2a_runtime_id "$rid"
+  log "Agent card: .../runtimes/<arn>/invocations/.well-known/agent-card.json"
+}
+
+
 phase_webui() {
   log "WebUI — static web chat on S3 + CloudFront"
   if [ "${WEBUI:-false}" != "true" ]; then
@@ -417,9 +491,10 @@ case "${1:-all}" in
   # Memory first: the runtime is created with BEDROCK_AGENTCORE_MEMORY_ID baked into its
   # environment, and UpdateAgentRuntime replaces rather than patches.
   --runtime)  phase_memory; phase2_runtime ;;
+  --a2a)      phase_a2a ;;
   --webui)    phase_webui ;;
   --gateway)  phase3_gateway ;;
-  all|"")     base_cdk_stacks; phase_memory; phase2_runtime; phase3_gateway; phase_webui
+  all|"")     base_cdk_stacks; phase_memory; phase2_runtime; phase3_gateway; phase_a2a; phase_webui
               log "Webhook URL (register in Lark): $(cfn_out "$PREFIX-router" WebhookLarkUrl)" ;;
-  *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--memory|--runtime|--gateway|--webui]"; exit 1 ;;
+  *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--memory|--runtime|--gateway|--a2a|--webui]"; exit 1 ;;
 esac

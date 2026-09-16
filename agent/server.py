@@ -27,6 +27,7 @@ from aiohttp import web
 
 import agent_core   # pulls in langchain/langgraph, boto3 and mcp — the bulk of start-up
 import agui
+import lark_3lo
 
 _T_IMPORT_DONE = time.monotonic()
 
@@ -198,7 +199,18 @@ async def handle_invocations(request: web.Request) -> web.Response:
             return web.json_response({"error": str(e)})
 
     if action == "chat":
-        actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
+        # A caller that cannot name the user — the A2A adapter forwards a bearer and nothing
+        # else — gets the actor derived from the token instead of defaulting to "anonymous",
+        # which would fail the ownership check and ask for consent forever.
+        actor_id = payload.get("actorId") or payload.get("userId") or ""
+        if not actor_id:
+            kind, derived = await asyncio.get_event_loop().run_in_executor(
+                None, lark_3lo.actor_from_workload_token, workload_token)
+            if kind != "actor":
+                return web.json_response(
+                    {"reply": "无法确认这次请求代表谁。请先在 Lark 里完成一次授权。",
+                     "needs_auth": True}, status=200)
+            actor_id = derived
         message = payload.get("message", "")
         email = payload.get("email", "")
         # Memory thread id is chosen by the caller (router) — that's what makes

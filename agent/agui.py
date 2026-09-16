@@ -6,8 +6,8 @@ served from the existing agent Runtime rather than a second one with `serverProt
 One runtime, one image, one deployment. See docs/agentcore-behavior.md.
 
 The browser calls `/invocations` directly with its Cognito JWT as Bearer; the platform's
-CUSTOM_JWT authorizer verifies it. Nothing in the request body may name a user — see
-`lark_3lo.actor_from_workload_token` for how the caller is derived instead.
+CUSTOM_JWT authorizer verifies it. It also names the actor, and is not believed on it —
+building that actor's session runs the ownership check that refuses a mismatch.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ import logging
 from aiohttp import web
 
 import agent_core
-import lark_3lo
 
 log = logging.getLogger("agent.agui")
 
@@ -54,13 +53,18 @@ async def _error_stream(request: web.Request, message: str) -> web.StreamRespons
 async def handle(request: web.Request, payload: dict,
                  workload_token: str) -> web.StreamResponse:
     """Run one AG-UI turn, streaming events as they are produced."""
-    kind, actor_id = await agent_core.arun_in_thread(
-        lark_3lo.actor_from_workload_token, workload_token)
-    if kind == "needs_consent":
-        return await _error_stream(
-            request, "请先在 Lark 聊天里发一条消息完成授权，然后回到网页继续。")
-    if kind != "actor":
-        return await _error_stream(request, "无法确认你的身份，请稍后再试。")
+    # The caller names the actor and is not believed on it: building the session fetches
+    # that actor's vaulted token, and lark_3lo's ownership check asks Lark whose token it is
+    # and refuses a mismatch. So a page claiming somebody else gets a consent prompt, never
+    # their data. Deriving the actor instead is not possible — customState participates in
+    # the vault lookup and is built from the actor (see docs/agentcore-behavior.md).
+    #
+    # Session building is the one path that has been proven end to end, so it is reused
+    # rather than re-implemented: a parallel check drifted and reported "not authorised" for
+    # a user the proven path could serve.
+    actor_id = payload.get("actorId") or ""
+    if not actor_id:
+        return await _error_stream(request, "请求缺少身份信息，请重新打开页面。")
 
     try:
         from ag_ui.core.types import RunAgentInput
@@ -72,6 +76,11 @@ async def handle(request: web.Request, payload: dict,
     # The session carries the tools, the checkpointer and the summarisation middleware, so a
     # web turn lands in the same conversation as a Lark turn for the same person.
     session = await agent_core.aget_session(actor_id, workload_token=workload_token)
+    if session.get("auth_url"):
+        return await _error_stream(
+            request, "请先在 Lark 聊天里完成一次授权，然后回到网页继续。")
+    if session.get("identity_error"):
+        return await _error_stream(request, "暂时无法访问你的 Lark 账号，请稍后再试。")
 
     # thread_id comes from the session, never from the request: it decides whose
     # conversation this is.

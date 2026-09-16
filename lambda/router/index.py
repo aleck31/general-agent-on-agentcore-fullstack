@@ -680,6 +680,9 @@ def _web_session(body: str) -> dict:
     logger.info("web session issued for %s", actor_id)
     return _resp(200, {
         "token": cognito.user_jwt(actor_id),
+        # Echoed so the page can name itself. Not a credential: the agent verifies the
+        # claim against the vaulted token's real owner before using it.
+        "actorId": actor_id,
         "runtimeArn": RUNTIME_ARN,
         "region": os.environ.get("AWS_REGION", ""),
         "qualifier": QUALIFIER,

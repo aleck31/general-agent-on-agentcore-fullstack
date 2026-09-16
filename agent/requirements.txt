@@ -14,6 +14,10 @@ langchain-mcp-adapters>=0.3.0
 # serve the events from aiohttp, not FastAPI.
 ag-ui-langgraph>=0.0.45
 fastapi>=0.115.0
+# A2A, served on its own Runtime from this same image (SERVER_MODE=a2a). The http-server
+# extra brings the Starlette/FastAPI route helpers; uvicorn runs them.
+a2a-sdk[http-server]>=1.1.2
+uvicorn>=0.30.0
 bedrock-agentcore>=0.1.0
 mcp>=1.23.0
 httpx>=0.27.0

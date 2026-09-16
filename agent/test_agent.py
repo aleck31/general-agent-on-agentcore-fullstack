@@ -915,15 +915,18 @@ def test_agui_requests_are_told_apart_from_the_router_protocol():
     assert agui.is_agui_request({}) is False
 
 
-def test_agui_ignores_a_client_supplied_thread_id():
-    """A browser naming someone else's thread would read their conversation. The value is
-    overwritten from the session, which comes from the actor the platform vouched for."""
+def test_agui_verifies_a_claimed_actor_rather_than_trusting_or_deriving_it():
+    """A claimed actor is safe only because fetching that actor's vaulted token runs the
+    ownership check, which asks Lark whose token it is and refuses a mismatch. Deriving the
+    actor instead is not possible: customState participates in the vault lookup and is built
+    from the actor. threadId still comes from the session, never from the request."""
     import agui, inspect
     src = inspect.getsource(agui.handle)
+    # Session building is what fetches the token and runs the ownership check; an unverified
+    # claim surfaces as auth_url rather than as somebody else's conversation.
+    assert "aget_session" in src and 'session.get("auth_url")' in src
     assert '"threadId": session["mem_sid"]' in src
-    # And the actor itself is derived, never read from the payload.
-    assert "actor_from_workload_token" in src
-    assert 'payload.get("actorId")' not in src
+    assert 'payload.get("threadId")' not in src
 
 
 def test_the_actor_is_derived_from_the_vaulted_token_owner():
