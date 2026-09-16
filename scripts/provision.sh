@@ -226,6 +226,10 @@ env = {
     # Conversation state. Without the table the agent still answers, but history dies
     # with the container — so a missing output here is a real regression, not an option.
     "CHECKPOINT_TABLE": e["CKPT_TABLE"],
+    # Tunable without a code change: the right threshold depends on the model's context
+    # window and on how much a cache-prefix invalidation costs at your traffic.
+    "SUMMARIZE_AT_TOKENS": os.environ.get("SUMMARIZE_AT_TOKENS", ""),
+    "PROMPT_CACHE_TTL": os.environ.get("PROMPT_CACHE_TTL", ""),
     "CHECKPOINT_BUCKET": e["CKPT_BUCKET"],
     # Long-term memory only; empty until the Memory resource exists.
     "BEDROCK_AGENTCORE_MEMORY_ID": e["MEMORY"],

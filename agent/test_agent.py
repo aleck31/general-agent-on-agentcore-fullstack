@@ -866,3 +866,37 @@ def test_recall_says_so_when_there_is_nothing_stored():
          mock.patch.object(memory_tools.boto3, "client", return_value=_C()):
         _, recall = memory_tools.tools_for("lark:ou_x")
         assert recall.invoke({"query": "anything?"}) == "Nothing on record about that."
+
+
+# --------------------------- bounding the thread -----------------------------
+# The thread is permanent per user and DynamoDBSaver has no prune, so summarisation is the
+# only bound. It must trigger on a threshold, never per turn: it rewrites the prefix, and
+# rewriting the prefix every turn would make the prompt cache miss every turn.
+
+def test_summarisation_triggers_on_a_token_threshold_not_every_turn():
+    mw = agent_core._middleware()
+    assert len(mw) == 1
+    clauses = mw[0]._trigger_clauses
+    assert clauses == [{"tokens": agent_core._SUMMARIZE_AT_TOKENS}]
+    assert agent_core._SUMMARIZE_AT_TOKENS > 0
+
+
+def test_the_summariser_does_not_pay_for_prompt_caching():
+    """The summary call happens once per crossing and is never re-read, so a cachePoint
+    would only buy a 1.25-2x write premium."""
+    assert agent_core._middleware()[0].model.cache_ttl == ""
+
+
+def test_summarisation_can_be_disabled_outright():
+    with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
+        assert agent_core._middleware() == []
+
+
+def test_summarisation_rewrites_state_so_the_checkpoint_shrinks():
+    """If it only trimmed what is sent to the model, the stored thread would keep growing
+    towards DynamoDB's item cap. Asserted against the real middleware's contract."""
+    from langchain_core.messages import RemoveMessage
+    from langchain.agents.middleware.summarization import SummarizationMiddleware
+    import inspect
+    src = inspect.getsource(SummarizationMiddleware.before_model)
+    assert "RemoveMessage" in src and "REMOVE_ALL_MESSAGES" in src

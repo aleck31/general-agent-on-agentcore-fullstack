@@ -127,6 +127,40 @@ class _CachingChatBedrockConverse(ChatBedrockConverse):
 _model = _CachingChatBedrockConverse(model=_MODEL_ID, region_name=_REGION,
                                      cache_ttl=_CACHE_TTL)
 
+# --------------------------- bounding an endless thread ----------------------
+# A thread is per-user and permanent (only /reset rotates it), so `messages` only grows,
+# and DynamoDBSaver has no prune. Summarisation is the only place to bound it: it rewrites
+# the state (RemoveMessage(REMOVE_ALL_MESSAGES) + summary + kept tail), so the checkpoint
+# itself shrinks rather than just the payload sent to the model.
+#
+# Trigger late, on purpose. With prompt caching on, re-reading a long history costs 0.1x,
+# so cost is not what binds — the context window is. Summarising is not free either: it
+# pays a full-price pass over the history being condensed AND invalidates the cached prefix
+# once, because the prefix is what it rewrites. Trimming a little every turn would pay that
+# invalidation on every turn, which is exactly the way to make caching worthless.
+#
+# `tokens` rather than `fraction`: the token clause compares against either an approximate
+# count or the model's own reported usage, with no dependency on a registry knowing this
+# model's context window.
+_SUMMARIZE_AT_TOKENS = int(os.environ.get("SUMMARIZE_AT_TOKENS", "120000"))  # 0 disables
+_SUMMARIZE_KEEP = int(os.environ.get("SUMMARIZE_KEEP_MESSAGES", "20"))
+
+
+def _middleware() -> list:
+    if not _SUMMARIZE_AT_TOKENS:
+        return []
+    from langchain.agents.middleware import SummarizationMiddleware
+    return [SummarizationMiddleware(
+        # Caching deliberately off for this one: the summary call happens once per
+        # threshold crossing and is never re-read, so a cachePoint would only buy a
+        # 1.25-2x write premium.
+        model=_CachingChatBedrockConverse(model=_MODEL_ID, region_name=_REGION,
+                                         cache_ttl=""),
+        trigger=("tokens", _SUMMARIZE_AT_TOKENS),
+        keep=("messages", _SUMMARIZE_KEEP),
+    )]
+
+
 # session_id -> {graph, config, stack, created, ...}. One microVM ≈ one session.
 _sessions: dict[str, dict] = {}
 _lock = threading.Lock()
@@ -334,7 +368,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     # this API — middleware replaces them — which is another reason the conversational
     # record is written at turn end instead.
     graph = create_agent(model=_model, tools=tools, system_prompt=_SYSTEM,
-                         checkpointer=saver)
+                         checkpointer=saver, middleware=_middleware())
     # thread_id is the whole checkpoint address (chosen by the router, so /reset can
     # rotate it) — DynamoDBSaver derives its partition key from it alone, and since it is
     # the sha256 of the actor, per-user isolation follows from the key. The agent never
