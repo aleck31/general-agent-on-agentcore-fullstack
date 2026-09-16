@@ -246,10 +246,16 @@ async def _arepair_interrupted_turn(graph, config: dict) -> int:
         if isinstance(last, AIMessage) else []
     if not pending:
         return 0
+    # as_node is not optional here: once a graph has more than one node LangGraph cannot
+    # infer which one a write came from and raises InvalidUpdateError("Ambiguous update").
+    # "tools" is the honest attribution — a ToolMessage is what that node produces. Learned
+    # the hard way: the unit test's fake graph accepted the call without it, so this shipped
+    # broken and only a poisoned checkpoint on the real table surfaced it.
+    nodes = graph.get_graph().nodes
     await graph.aupdate_state(config, {"messages": [
         ToolMessage(content=_INTERRUPTED_TOOL, tool_call_id=tc["id"],
                     name=tc.get("name") or "tool")
-        for tc in pending]})
+        for tc in pending]}, as_node="tools" if "tools" in nodes else "model")
     return len(pending)
 
 

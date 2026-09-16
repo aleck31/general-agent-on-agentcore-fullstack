@@ -141,10 +141,19 @@ def _repair(messages):
     appended = []
 
     class _Graph:
+        """Mimics the real graph's contract, including the part a looser fake hid: a
+        multi-node graph rejects aupdate_state without as_node."""
+
+        def get_graph(self):
+            return type("G", (), {"nodes": ["__start__", "model", "tools", "__end__"]})()
+
         async def aget_state(self, config):
             return type("S", (), {"values": {"messages": messages}})()
 
-        async def aupdate_state(self, config, values):
+        async def aupdate_state(self, config, values, as_node=None):
+            if as_node is None:
+                raise RuntimeError("Ambiguous update, specify as_node")
+            appended.append(as_node)
             appended.extend(values["messages"])
 
     n = asyncio.run(agent_core._arepair_interrupted_turn(_Graph(), {}))
@@ -159,7 +168,9 @@ def test_interrupted_tool_call_is_answered_so_the_thread_stays_usable():
         {"name": "lark_list_my_docs", "args": {}, "id": "call-1"}])
     n, appended = _repair([HumanMessage("hi"), dangling])
     assert n == 1
-    assert appended[0].tool_call_id == "call-1"
+    # The write must be attributed to the tools node or LangGraph refuses it outright.
+    assert appended[0] == "tools"
+    assert appended[1].tool_call_id == "call-1"
 
 
 def test_repair_is_a_no_op_on_a_completed_turn():
