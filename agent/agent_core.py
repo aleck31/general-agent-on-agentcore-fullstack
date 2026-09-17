@@ -436,6 +436,8 @@ def _get_session(actor_id: str, email: str, mem_sid: str, fresh: bool = False,
     expiry. A pending-authorization session (no token yet) is NOT cached — so the next
     turn re-checks the vault and picks up a freshly consented token."""
     cache_key = f"{actor_id}|{mem_sid}"
+    log.info("session lookup: key=%s cached=%s fresh=%s",
+             cache_key[-28:], cache_key in _sessions, fresh)
     with _lock:
         s = _sessions.get(cache_key)
         # `fresh` is for the consent-resume path: the user has just authorized, so a

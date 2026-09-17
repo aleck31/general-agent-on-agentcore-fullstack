@@ -105,6 +105,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
     # after workload_token so both paths use the one value — reading the headers separately
     # here is how the two drifted.
     if agui.is_agui_request(payload):
+        log.info("dispatch: agui  instance=%s session=%s", _INSTANCE, sid[:24])
         return await agui.handle(request, payload, workload_token)
 
     now = time.monotonic()
@@ -197,6 +198,7 @@ async def handle_invocations(request: web.Request) -> web.Response:
             return web.json_response({"error": str(e)})
 
     if action == "chat":
+        log.info("dispatch: chat  instance=%s session=%s", _INSTANCE, sid[:24])
         # A caller that cannot name the user — the A2A adapter forwards a bearer and nothing
         # else — gets the actor derived from the token instead of defaulting to "anonymous",
         # which would fail the ownership check and ask for consent forever.

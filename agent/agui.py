@@ -76,10 +76,10 @@ async def handle(request: web.Request, payload: dict,
     # The session carries the tools, the checkpointer and the summarisation middleware, so a
     # web turn lands in the same conversation as a Lark turn for the same person.
     session = await agent_core.aget_session(actor_id, workload_token=workload_token)
-    log.info("agui session: actor=%s wat=%s auth_url=%s identity_error=%s mem_sid=%s",
-             actor_id, "present" if workload_token else "MISSING",
+    log.info("agui gate: auth_url=%s identity_error=%s tools=%s keys=%s",
              bool(session.get("auth_url")), bool(session.get("identity_error")),
-             session.get("mem_sid"))
+             len((session.get("graph") and getattr(session["graph"], "nodes", None)) or []) or "?",
+             sorted(session.keys()))
     if session.get("auth_url"):
         return await _error_stream(
             request, "请先在 Lark 聊天里完成一次授权，然后回到网页继续。")
