@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import os
+import urllib.parse
 from datetime import timedelta
 
 import boto3
@@ -131,9 +132,25 @@ def _fetch_vaulted(workload_token: str, state_actor: str, force: bool = False) -
     # Whether a grant came back, which is the difference between "acts as the user" and
     # "asks for consent again" — and the two callers disagree on it, see the open item in
     # docs/agentcore-behavior.md.
-    log.info("vault fetch: state=%r -> %s", state_actor,
-             "token" if resp.get("accessToken") else "authorizationUrl")
+    log.info("vault fetch: state=%r force=%s -> %s", state_actor, force,
+             "token" if resp.get("accessToken") else
+             f"authorizationUrl session={pending_session_id(resp.get('authorizationUrl'))}")
     return resp
+
+
+def pending_session_id(authorization_url: str | None) -> str:
+    """The consent session a link points at, so a log can be matched against the shim's
+    `/return` and the completion call. Without it there is no way to tell whether the link
+    a user clicked is the one the code handed back."""
+    if not authorization_url:
+        return "-"
+    try:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(authorization_url).query)
+        raw = (q.get("request_uri") or [""])[0].rsplit(":", 1)[-1]
+        pad = raw + "=" * (-len(raw) % 4)
+        return base64.urlsafe_b64decode(pad).decode()
+    except Exception:  # noqa: BLE001 — a diagnostic must not raise
+        return "?"
 
 
 def actor_from_workload_token(workload_token: str) -> tuple[str, str]:
@@ -198,13 +215,20 @@ def get_user_lark_token(actor_id: str, force: bool = False,
     if token and _belongs_to(token, actor_id):
         return "token", token
     if token:
-        # Someone else's grant is sitting under this actor. Re-consent is the only way
-        # out: the wrong token stays in the vault, so without forcing a fresh flow the
-        # next call would fetch it right back. Guarded against recursion by `force`.
-        if not force:
-            return get_user_lark_token(actor_id, force=True,
-                                       workload_token=workload_token)
-        log.error("fresh authorization still produced a token for another account")
+        # The vault is keyed by the *caller's* workload identity, not by the actor named
+        # here, so a mismatch means the claim is wrong — not that the vault holds a stale
+        # grant. Forcing a fresh flow here destroyed the caller's own working grant
+        # (measured: a token at 13:16:40, gone one second later). See docs/agentcore-behavior.
+        log.warning("claimed actor %s does not own this vaulted token — refusing", actor_id)
+        return "wrong_owner", ""
+    # No grant at all, so nothing can be destroyed and the consent must be interactive: an
+    # authorizationUrl minted with forceAuthentication=False is not completable —
+    # CompleteResourceTokenAuth answers "Invalid or expired session" for it, while the same
+    # flow forced succeeds. Measured; see docs/agentcore-behavior.md.
+    if not force:
+        resp = _fetch_vaulted(wat, actor_id, force=True)
+        if resp.get("accessToken"):
+            return "token", resp["accessToken"]
     return "auth_url", resp["authorizationUrl"]
 
 

@@ -319,6 +319,10 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
 
     if kind == "auth_url":
         auth_url = value  # remembered for the tool-call path, not returned upfront
+    elif kind == "wrong_owner":
+        # A claimed actor that does not own the vaulted token. Refused rather than offered a
+        # consent link: minting one would burn the real owner's grant.
+        identity_error = "这个身份与授权的账号不一致，无法代表其操作。"
     elif kind != "token":
         # Surface identity failures instead of running tool-less: an agent that merely
         # says "I have no tools" reads as model behaviour and hides the real cause (a
@@ -476,11 +480,12 @@ def _get_session(actor_id: str, email: str, mem_sid: str, fresh: bool = False,
         # Without this a consented user is told to authorise again at random.
         if s.get("auth_url") and workload_token:
             retry = _build_session(actor_id, email, mem_sid, workload_token)
-            if not retry.get("auth_url"):
-                _close_session(s)
-                s = retry
-            else:
-                _close_session(retry)
+            # Keep the retry either way. Each attempt mints a pending consent session and
+            # invalidates the one before it, so handing back the first attempt's URL gave the
+            # user a link that this retry had already killed — every completion then failed
+            # with "Invalid or expired session". Only the newest URL is live.
+            _close_session(s)
+            s = retry
         if not s.get("identity_error"):
             _sessions[cache_key] = s
         return s

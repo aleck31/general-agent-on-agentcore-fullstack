@@ -436,6 +436,48 @@ def test_vaulted_token_must_belong_to_the_actor():
     assert ns["_belongs_to"]("tok2", "lark:ou_bob") is False     # Bob's grant, Alice's slot
 
 
+def test_a_wrong_owner_is_refused_without_burning_the_real_grant():
+    """The vault is keyed by the caller's workload identity, not by the actor named in the
+    request, so a fetch for a bogus actor returns the caller's own token. Forcing a fresh
+    flow on that mismatch destroyed the caller's working grant — measured: a token at
+    13:16:40, gone one second later, and every later fetch answered authorizationUrl."""
+    import inspect
+    src = inspect.getsource(agent_core.lark_3lo.get_user_lark_token)
+    branch = src[src.index("if token:"):src.index('return "wrong_owner"')]
+    assert "force=True" not in branch      # forcing here is what burned the grant
+    # Forcing when the vault is *empty* is a different case and is required — see the
+    # completability test below.
+    assert "force=True" in src[src.index('return "wrong_owner"'):]
+
+
+def test_an_empty_vault_mints_a_completable_consent_link():
+    """An authorizationUrl from forceAuthentication=False cannot be completed —
+    CompleteResourceTokenAuth answers "Invalid or expired session" for it, repeatably, while
+    the same flow forced completes. So the empty case must re-ask with force."""
+    import inspect
+    src = inspect.getsource(agent_core.lark_3lo.get_user_lark_token)
+    tail = src[src.index('return "wrong_owner"'):]
+    assert "if not force:" in tail and "force=True" in tail
+
+
+def test_the_session_retry_hands_back_the_live_consent_link():
+    """Each build mints a pending consent session and invalidates the previous one, so
+    keeping the first attempt's auth_url gave the user a link the retry had already killed —
+    CompleteResourceTokenAuth then answered "Invalid or expired session" every time."""
+    calls = []
+
+    def build(actor, email, mem_sid, wat=""):
+        calls.append(1)
+        return {"auth_url": f"https://consent/{len(calls)}", "mem_sid": mem_sid,
+                "created": 0, "stack": None}
+
+    with mock.patch.object(agent_core, "_build_session", side_effect=build), \
+         mock.patch.object(agent_core, "_close_session"):
+        s = agent_core._get_session("lark:ou_x", "", "mem1", workload_token="wat")
+    assert len(calls) == 2
+    assert s["auth_url"] == "https://consent/2"   # the newest, not the first
+
+
 def test_unverifiable_token_owner_fails_closed():
     """An owner we cannot establish is not "probably fine"."""
     ns = _load_3lo_guard(lambda t: "")

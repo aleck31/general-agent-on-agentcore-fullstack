@@ -22,6 +22,10 @@ echo "== cred helper =="
 # LangGraph stack the agent suite installs.
 uv run --with boto3 --with pytest python -m pytest agent/test_cred_helper.py -q
 
+echo "== a2a adapter =="
+# No a2a SDK: everything worth asserting sits outside build_app, which imports it lazily.
+uv run --with boto3 --with pytest python -m pytest agent/test_a2a.py -q
+
 echo "== router =="
 uv run --with cryptography --with boto3 --with pytest python -m pytest lambda/router/test_router.py -q
 

@@ -11,6 +11,7 @@ Identity: lark:{open_id} — the same identity the web UI resolves to.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import base64
 import json
 import logging
@@ -299,6 +300,12 @@ def complete_consent(actor_id: str, session_uri: str) -> None:
     string instead fails with `AccessDeniedException: Invalid or expired session`, which
     reads like a timing problem and is really a namespace mismatch (measured)."""
     jwt = cognito.user_jwt(actor_id)
+    # Logged before the call, because a failure raises and would otherwise say nothing about
+    # which session was refused. jwt_id identifies the token *instance*: the completion may
+    # need the same one the session was opened with, not merely one for the same user.
+    logger.info("completing consent for %s: session=%s jwt_sub=%s jwt_id=%s",
+                actor_id, session_uri[-24:], _jwt_claim(jwt, "sub"),
+                hashlib.sha256(jwt.encode()).hexdigest()[:12])
     resp = agentcore.complete_resource_token_auth(
         sessionUri=session_uri,
         userIdentifier={"userToken": jwt},
