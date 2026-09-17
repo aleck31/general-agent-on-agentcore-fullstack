@@ -693,17 +693,74 @@ def _fake_saver(messages=None, deleted=None):
     return _S()
 
 
-def test_history_stats_counts_only_user_and_assistant_messages():
+def test_history_stats_counts_a_turn_only_when_an_answer_was_delivered():
+    """A tool-calling AIMessage is work in progress, not a turn — it is counted as a call."""
     from langchain_core.messages import AIMessage as AI, ToolMessage as TM
     msgs = [HumanMessage("q"), AI(content="", tool_calls=[{"name": "t", "args": {}, "id": "1"}]),
             TM(content="r", tool_call_id="1"), AI(content="a")]
     with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
-        assert agent_core.history_stats("lark:ou_x", "sess-1") == {"messages": 3}
+        assert agent_core.history_stats("lark:ou_x", "sess-1") == {
+            "turns": 1, "toolCalls": 1, "messages": 3}
 
 
 def test_history_stats_reports_zero_for_an_untouched_thread():
     with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(None)):
-        assert agent_core.history_stats("lark:ou_x", "sess-1") == {"messages": 0}
+        assert agent_core.history_stats("lark:ou_x", "sess-1") == {
+            "turns": 0, "toolCalls": 0, "messages": 0}
+
+
+def test_transcript_rebuilds_what_a_reloaded_page_should_show():
+    from langchain_core.messages import AIMessage as AI, ToolMessage as TM
+    msgs = [HumanMessage("我有几份文档"),
+            AI(content="", tool_calls=[{"name": "list_docs", "args": {"n": 5}, "id": "c1"}]),
+            TM(content="5 份", tool_call_id="c1"),
+            AI(content="你有 5 份。")]
+    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
+        out = agent_core.transcript("lark:ou_x", "sess-1")
+    assert [m["role"] for m in out["messages"]] == [
+        "user", "toolCall", "toolResult", "assistant"]
+    # The id is what pairs a call with its result when the page rebuilds the card.
+    assert out["messages"][1]["id"] == out["messages"][2]["id"] == "c1"
+    assert '"n": 5' in out["messages"][1]["args"]
+    assert out["truncated"] is False
+
+
+def test_transcript_reads_multimodal_content_without_crashing():
+    """A turn that carried an image has a list of blocks, not a string."""
+    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(
+            [HumanMessage(content=[{"type": "text", "text": "看图"},
+                                   {"type": "image", "source": {}}])])):
+        out = agent_core.transcript("lark:ou_x", "sess-1")
+    assert out["messages"] == [{"role": "user", "content": "看图"}]
+
+
+def test_transcript_caps_a_long_thread_and_says_so():
+    msgs = [HumanMessage(f"q{i}") for i in range(agent_core._TRANSCRIPT_LIMIT + 10)]
+    with mock.patch.object(agent_core, "_checkpointer", return_value=_fake_saver(msgs)):
+        out = agent_core.transcript("lark:ou_x", "sess-1")
+    assert len(out["messages"]) == agent_core._TRANSCRIPT_LIMIT
+    assert out["truncated"] is True
+    assert out["messages"][-1]["content"] == f"q{len(msgs) - 1}"   # the tail, not the head
+
+
+def test_transcript_is_blank_rather_than_broken_when_unreadable():
+    broken = mock.Mock()
+    broken.aget_tuple.side_effect = RuntimeError("no table")
+    with mock.patch.object(agent_core, "_checkpointer", return_value=broken):
+        out = agent_core.transcript("lark:ou_x", "sess-1")
+    assert out == {"messages": [], "unavailable": True}
+
+
+def test_the_transcript_action_does_not_believe_the_claimed_actor():
+    """A thread is addressed by the actor alone, so trusting the claim would hand any valid
+    token holder somebody else's conversation. The session build is the check."""
+    import inspect
+    import server
+    src = inspect.getsource(server.handle_invocations)
+    i = src.index('action == "transcript"')
+    block = src[i:i + 900]
+    assert "aget_session" in block and 'session["mem_sid"]' in block
+    assert "identity_error" in block and "auth_url" in block
 
 
 def test_history_stats_degrades_instead_of_failing_status():

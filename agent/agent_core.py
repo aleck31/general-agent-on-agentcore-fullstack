@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import queue
@@ -155,6 +156,17 @@ _in_flight_lock = threading.Lock()
 def busy() -> bool:
     with _in_flight_lock:
         return _in_flight > 0
+
+
+def model_id() -> str:
+    """What this container actually calls Bedrock with — /status reads it from here so a
+    stale router config cannot report a model nobody is using."""
+    return _MODEL_ID
+
+
+def cache_ttl() -> str:
+    """The prompt-cache TTL in force, "" when caching is off."""
+    return _CACHE_TTL
 
 
 def _track(delta: int) -> None:
@@ -731,26 +743,80 @@ def _thread_config(actor_id: str, mem_sid: str) -> dict:
 
 
 def history_stats(actor_id: str, mem_sid: str = "") -> dict:
-    """How many messages this thread holds → {"messages": n}.
+    """What this thread holds → {"turns": n, "toolCalls": n, "messages": n}.
 
-    The router used to count `conversational` events itself, which it can no longer do:
-    the conversation is graph state in DynamoDB now, and decoding it means the whole
-    LangGraph stack. Answering here instead keeps agent_core the only framework-coupled
-    module (the router stays a thin channel adapter) and costs one checkpoint read rather
-    than the paged ListEvents walk it replaces.
+    Turns, not messages, because a message count is an implementation detail: LangGraph
+    splits state in a way the user cannot see, and unevenly — a turn that calls a tool
+    produces more messages than one that does not. A turn here is an *answer delivered*
+    (an AIMessage with no pending tool_calls), which is the unit a person can check against
+    their own chat window, and which a summary cannot inflate (the injected summary is a
+    HumanMessage).
 
-    Tool messages are excluded: the old count was of user/assistant exchanges, and that
-    is what /status reports."""
+    toolCalls is reported alongside because a good-looking answer is not evidence that a
+    tool ran — that mistake cost a long debugging session. It says a call was made, not
+    whose identity made it; only the MCP server's own log answers that.
+
+    Answered here rather than in the router because reading the conversation means decoding
+    a checkpoint, and agent_core is the only module that knows the framework."""
     try:
         tup = _run(_checkpointer().aget_tuple(_thread_config(actor_id, mem_sid)),
                    timeout=30)
     except Exception:  # noqa: BLE001 — /status must answer even if this part cannot
         log.warning("could not read thread stats", exc_info=True)
-        return {"messages": 0, "unavailable": True}
+        return {"turns": 0, "toolCalls": 0, "messages": 0, "unavailable": True}
     values = (tup.checkpoint.get("channel_values") if tup else None) or {}
-    return {"messages": sum(
-        1 for m in (values.get("messages") or [])
-        if isinstance(m, (HumanMessage, AIMessage)))}
+    messages = values.get("messages") or []
+    ai = [m for m in messages if isinstance(m, AIMessage)]
+    return {
+        "turns": sum(1 for m in ai if not (getattr(m, "tool_calls", None) or [])),
+        "toolCalls": sum(len(getattr(m, "tool_calls", None) or []) for m in ai),
+        "messages": sum(1 for m in messages
+                        if isinstance(m, (HumanMessage, AIMessage))),
+    }
+
+
+_TRANSCRIPT_LIMIT = int(os.environ.get("TRANSCRIPT_LIMIT", "60"))
+_TRANSCRIPT_TOOL_CHARS = 800
+
+
+def transcript(actor_id: str, mem_sid: str = "") -> dict:
+    """This thread's messages, render-ready → {"messages": [...], "truncated": bool}.
+
+    Lets a reloaded page show the conversation the agent actually remembers rather than a
+    copy the tab was keeping: after summarisation or /clear the two would disagree, and the
+    checkpoint is the one that decides the next turn."""
+    try:
+        tup = _run(_checkpointer().aget_tuple(_thread_config(actor_id, mem_sid)), timeout=30)
+    except Exception:  # noqa: BLE001 — a blank page beats a broken one
+        log.warning("could not read transcript", exc_info=True)
+        return {"messages": [], "unavailable": True}
+    values = (tup.checkpoint.get("channel_values") if tup else None) or {}
+    history = values.get("messages") or []
+    tail = history[-_TRANSCRIPT_LIMIT:]
+    out = []
+    for m in tail:
+        if isinstance(m, HumanMessage):
+            out.append({"role": "user", "content": _text_of(m)})
+        elif isinstance(m, AIMessage):
+            for call in getattr(m, "tool_calls", None) or []:
+                out.append({"role": "toolCall", "id": call.get("id") or "",
+                            "name": call.get("name") or "tool",
+                            "args": json.dumps(call.get("args") or {}, ensure_ascii=False)})
+            if _text_of(m):
+                out.append({"role": "assistant", "content": _text_of(m)})
+        elif isinstance(m, ToolMessage):
+            out.append({"role": "toolResult", "id": getattr(m, "tool_call_id", "") or "",
+                        "content": _text_of(m)[:_TRANSCRIPT_TOOL_CHARS]})
+    return {"messages": out, "truncated": len(history) > len(tail)}
+
+
+def _text_of(message) -> str:
+    """Content is a string for simple turns and a list of blocks for multimodal ones."""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    parts = [b.get("text", "") for b in content or [] if isinstance(b, dict)]
+    return "".join(p for p in parts if p)
 
 
 def clear_history(actor_id: str, mem_sid: str = "") -> dict:

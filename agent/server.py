@@ -1,16 +1,14 @@
 """AgentCore container server: the HTTP contract on 8080.
 
   GET  /ping          -> {"status":"Healthy"}   (must respond within seconds)
-  POST /invocations   -> action in {warmup, status, chat}
-      chat       : {action,actorId,message,email?} -> {reply}  (history via Memory)
+  POST /invocations   -> the router's JSON protocol, or an AG-UI RunAgentInput
+      chat       : {action,actorId,message,email?} -> {reply}
       chat_async : same + chatId -> {accepted:true}; result is pushed to the chat
                    (messageId/reactionId: the router's progress marker, cleared at the end)
-      warmup : {action} -> {ready:true}
-      status : {action} -> {ready, instance, uptime, sessionAge, + clock diagnostics}
-
-Chat-only scope: the sibling interceptor variant also served a WebSocket path
-for the Lark-embedded web UI; this variant's sole entrypoint is the Lark bot
-webhook, so no WS.
+      warmup     : {action} -> {ready:true}
+      status     : {action} -> {ready, instance, uptime, sessionAge, model, + clock diags}
+      history_stats / clear_history / transcript / auth_status / reauth
+      no `action` -> AG-UI, answered as an SSE event stream (see agui.py)
 """
 
 from __future__ import annotations
@@ -127,6 +125,10 @@ async def handle_invocations(request: web.Request) -> web.Response:
             # How long THIS session has been served by THIS process, counted from its
             # first request. Independent of when the microVM booted.
             "sessionAge": round(now - _session_first_seen[sid], 1) if sid else None,
+            # Reported by the container that actually calls Bedrock: the router's own
+            # config can disagree with what was baked into this Runtime.
+            "model": agent_core.model_id(),
+            "cacheTtl": agent_core.cache_ttl(),
         })
 
     if action == "warmup":
@@ -148,6 +150,26 @@ async def handle_invocations(request: web.Request) -> web.Response:
         except Exception as e:
             log.exception("%s failed", action)
             return web.json_response({"error": str(e)})
+
+    # The transcript for a reloaded browser tab. The claimed actorId cannot be trusted here
+    # the way it can on the chat path: a thread is addressed by the actor alone, so believing
+    # the claim would hand any valid token holder somebody else's conversation. Building the
+    # session first is what checks it — lark_3lo asks Lark whose vaulted token this is and
+    # refuses a mismatch — and it is the one identity path proven end to end.
+    if action == "transcript":
+        actor_id = payload.get("actorId") or ""
+        if not actor_id:
+            return web.json_response({"messages": [], "error": "actorId required"})
+        session = await agent_core.aget_session(actor_id, workload_token=workload_token)
+        if session.get("identity_error") or session.get("auth_url"):
+            return web.json_response({"messages": [], "unverified": True})
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, agent_core.transcript, actor_id, session["mem_sid"])
+            return web.json_response(result)
+        except Exception as e:
+            log.exception("transcript failed")
+            return web.json_response({"messages": [], "error": str(e)})
 
     if action == "auth_status":
         actor_id = payload.get("actorId") or payload.get("userId") or "anonymous"
