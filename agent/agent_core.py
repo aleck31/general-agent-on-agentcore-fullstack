@@ -456,6 +456,17 @@ def _get_session(actor_id: str, email: str, mem_sid: str, fresh: bool = False,
                 return s
             _close_session(s)
         s = _build_session(actor_id, email, mem_sid, workload_token)
+        # One retry when the vault says "not consented". GetResourceOauth2Token is
+        # nondeterministic for a grant that exists: measured in one container, seconds apart,
+        # identical arguments — one build got the token, the next only an authorizationUrl.
+        # Without this a consented user is told to authorise again at random.
+        if s.get("auth_url") and workload_token:
+            retry = _build_session(actor_id, email, mem_sid, workload_token)
+            if not retry.get("auth_url"):
+                _close_session(s)
+                s = retry
+            else:
+                _close_session(retry)
         if not s.get("identity_error"):
             _sessions[cache_key] = s
         return s

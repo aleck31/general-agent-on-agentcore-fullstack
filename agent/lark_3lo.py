@@ -127,7 +127,13 @@ def _fetch_vaulted(workload_token: str, state_actor: str, force: bool = False) -
     )
     if _SHIM_RETURN_URL:
         kwargs["resourceOauth2ReturnUrl"] = _SHIM_RETURN_URL
-    return _agentcore.get_resource_oauth2_token(**kwargs)
+    resp = _agentcore.get_resource_oauth2_token(**kwargs)
+    # Whether a grant came back, which is the difference between "acts as the user" and
+    # "asks for consent again" — and the two callers disagree on it, see the open item in
+    # docs/agentcore-behavior.md.
+    log.info("vault fetch: state=%r -> %s", state_actor,
+             "token" if resp.get("accessToken") else "authorizationUrl")
+    return resp
 
 
 def actor_from_workload_token(workload_token: str) -> tuple[str, str]:
@@ -180,7 +186,7 @@ def get_user_lark_token(actor_id: str, force: bool = False,
         # identity has been observed to complete successfully and then be unreadable by
         # every namespace we query, so the open question is whether this differs from the
         # identity GetWorkloadAccessTokenForJWT derives from the same JWT. Claims only.
-        log.info("workload token claims: %s", _claims(wat))
+        pass  # the platform's token; opaque, so nothing useful to log about it
     else:
         log.warning("no platform workload token for %s — falling back to ForUserId",
                     actor_id)
