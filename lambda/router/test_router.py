@@ -624,3 +624,29 @@ def test_web_session_returns_a_token_and_where_to_send_it():
     body = json.loads(r["body"])
     assert r["statusCode"] == 200 and body["token"] == "JWT"
     assert body["runtimeArn"] and body["qualifier"]
+
+
+def test_status_survives_a_missing_runtime_session():
+    """rt_sid is empty until a turn has run. Passing it through produced a 400 that killed
+    the whole handler, so /status silently answered nothing at all."""
+    import index
+    assert index.thread_stats("", "u1", "lark:ou_a", "mem-1") == (0, False)
+    assert index.user_authorized("", "u1", "lark:ou_a", "lark") is False
+
+
+def test_a_failed_count_does_not_take_down_the_command():
+    import index
+    with mock.patch.object(index, "invoke_agent", side_effect=RuntimeError("boom")):
+        assert index.thread_stats("ses_x", "u1", "lark:ou_a", "mem-1") == (0, False)
+        assert index.user_authorized("ses_x", "u1", "lark:ou_a", "lark") is False
+
+
+def test_status_does_not_manufacture_the_session_it_reports_as_absent():
+    """Counting needs a runtime session, so counting eagerly created one — while the line
+    above still said "not established". A diagnostic must not cause what it reports."""
+    import index, inspect
+    src = inspect.getsource(index.process_lark_event)
+    i = src.index('cmd == "/status"')
+    block = src[i:i + 1400]
+    assert "get_or_create_session" not in block
+    assert "（发一条普通消息后可见）" in block

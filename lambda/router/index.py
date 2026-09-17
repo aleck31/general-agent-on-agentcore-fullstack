@@ -73,8 +73,14 @@ def thread_stats(session_id: str, user_id: str, actor_id: str, mem_sid: str) -> 
     checkpoint — the agent owns that. `capped` is kept in the signature the callers already
     use, but is always False: a checkpoint read is exact, unlike the paged ListEvents walk
     this replaces, which gave up after a few pages."""
-    r = invoke_agent(session_id, user_id, actor_id, "", action="history_stats",
-                     mem_sid=mem_sid)
+    if not session_id:
+        return 0, False        # nothing has run yet, so there is nothing to count
+    try:
+        r = invoke_agent(session_id, user_id, actor_id, "", action="history_stats",
+                         mem_sid=mem_sid)
+    except Exception:  # noqa: BLE001 — /status must still render without the count
+        logger.warning("thread_stats failed for %s", actor_id, exc_info=True)
+        return 0, False
     return int(r.get("messages") or 0), False
 
 
@@ -243,7 +249,13 @@ def user_authorized(session_id: str, user_id: str, actor_id: str,
     The router cannot answer it: a consent is vaulted against the workload identity the
     Runtime derives from the inbound JWT, and re-deriving one here reads a different
     namespace and always reports "no" (see docs/agentcore-behavior.md)."""
-    r = invoke_agent(session_id, user_id, actor_id, "", action="auth_status")
+    if not session_id:
+        return False
+    try:
+        r = invoke_agent(session_id, user_id, actor_id, "", action="auth_status")
+    except Exception:  # noqa: BLE001 — an unknown state reads as "not authorised"
+        logger.warning("auth_status failed for %s", actor_id, exc_info=True)
+        return False
     return bool(r.get(idp_key))
 
 
@@ -559,7 +571,11 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
         info = identity.session_info(user_id)
         rt_sid = info.get("sessionId", "")
         mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
-        events, capped = thread_stats(rt_sid, user_id, actor_id, mem_sid)
+        # Counting means asking the agent, which needs a runtime session — so with no
+        # routing key yet, report the count as unavailable rather than create one. /status
+        # must not manufacture the very state it says is absent.
+        events, capped = thread_stats(rt_sid, user_id, actor_id, mem_sid) if rt_sid \
+            else (None, False)
         last = info.get("lastActivity", 0)
         last_str = (datetime.datetime.fromtimestamp(last, datetime.timezone.utc)
                     .strftime("%Y-%m-%d %H:%M UTC") if last else "—")
@@ -569,12 +585,13 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
             f"会话路由键：{rt_sid or '尚未建立（发一条普通消息后创建）'}",
             f"当前 microVM：{_microvm_line(rt_sid, user_id, actor_id)}",
             f"记忆线程：{mem_sid}",
-            f"该线程对话记录：{events}{'+' if capped else ''} 条",
+            (f"该线程对话记录：{events}{'+' if capped else ''} 条" if events is not None
+             else "该线程对话记录：—（发一条普通消息后可见）"),
             f"最近活跃：{last_str}",
             "授权状态：发送 /auth 查看",
         ]
         lark.send_message(chat_id, "\n".join(lines))
-        logger.info("status for %s: events=%d", actor_id, events)
+        logger.info("status for %s: events=%s", actor_id, events)
         return
 
     # If the user isn't authorized yet, a Lark tool this turn may hit an auth wall
