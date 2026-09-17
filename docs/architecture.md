@@ -237,12 +237,48 @@ Keeping them apart is what makes the chat commands possible — rotating an id i
 
 Earlier the agent derived the thread id from `actor_id` itself and ignored what the router sent, which welded the two dimensions together: switching instances could never start a new thread, and the router's own reads of the thread always missed.
 
-`/status`'s message count and `/clear` are answered by the **agent**, not the router (`history_stats` / `clear_history` actions). Reading or deleting the conversation now means decoding a checkpoint, and `agent/agent_core.py` is the only module allowed to know about the framework — so the router stayed a channel adapter instead of gaining the whole LangGraph stack, and dropped its Memory permissions with it.
+`/status`'s counts and `/clear` are answered by the **agent**, not the router (`history_stats` / `clear_history` actions). Reading or deleting the conversation now means decoding a checkpoint, and `agent/agent_core.py` is the only module allowed to know about the framework — so the router stayed a channel adapter instead of gaining the whole LangGraph stack, and dropped its Memory permissions with it.
+
+`/status` reports **turns**, not messages: a turn is an `AIMessage` with no pending `tool_calls` — an answer actually delivered. A raw message count is not a conversation length (one exchange can be 5+ messages, and summarization rewrites the list), and the tool-calling `AIMessage` is work in progress rather than a turn. Tool calls are counted alongside rather than folded in, because a plausible-looking answer is not evidence a tool ran. The model it reports comes from the container serving the request, not from the router's config: `UpdateAgentRuntime` replaces the environment wholesale, so the two can disagree and only the container's answer is true.
 
 Authorization is a third, orthogonal dimension: the vaulted Lark token is keyed to `lark:{open_id}`, not to either session, so rotating sessions never forces a re-consent.
 
+## The web entrypoint, over AG-UI
+
+The page is one static file on CloudFront and reaches the agent in two hops, split deliberately:
+
+```
+  browser (inside Lark)            router Lambda                 AgentCore Runtime
+        │  tt.requestAuthCode           │                              │
+        │──── POST /web/session ───────▶│  code → open_id (authen v2)  │
+        │◀──── {token, actorId} ────────│  mints the user's JWT        │
+        │                                                              │
+        │──── POST /invocations  (Bearer JWT, AG-UI RunAgentInput) ────▶│
+        │◀──── text/event-stream: canonical AG-UI events ──────────────│
+```
+
+The first hop exists so identity is **established, not claimed**: the h5 code is single-use and issued by Lark to this app inside the Lark client, so a browser can prove who it is without being allowed to say who it is. The router remains the only component that mints user JWTs. The second hop has no backend at all — the Runtime's endpoint answers CORS itself and streams SSE straight to the tab.
+
+`serverProtocol` accepts `AGUI`, but a plain `HTTP` runtime already streams SSE (measured), so AG-UI needs no second Runtime — `agent/agui.py` is a route on the existing one, dispatched before the chat path and sharing the same session build, thread and vaulted token. The page's `actorId` and `threadId` are therefore claims: `threadId` is overwritten from the session's `mem_sid`, and the actor is checked against the vaulted token's real owner.
+
+What AG-UI buys over an ad-hoc frame format is the event vocabulary. The page renders the tool lifecycle (`TOOL_CALL_START` → `ARGS` → `RESULT` → `END`) as one card per `toolCallId`, and the **result** line is the point: it is the only thing distinguishing a tool that ran from a model narrating one. `THINKING_*`/`REASONING_*` are handled but never fire — this deployment does not enable extended thinking.
+
+Model output is markdown, re-rendered from the accumulated source on each delta (parsing a partial stream incrementally yields broken trees mid-token) and sanitised on the way in — a tool result is untrusted input that reaches the page through the model. Images go the other way as `ImageInputContent` with an inline base64 source, which `ag-ui-langgraph` converts to LangChain content blocks; inlining avoids a storage bucket and a second credential, at the cost of a 4 MB cap matching the Lark path.
+
+A `/command` does **not** go to the Runtime. `run_command` in the router returns text instead of sending it, so one implementation answers both surfaces; the page posts to `/web/command` with a fresh h5 code. They belong to the router because they rotate session ids it owns and read the identity table, which the agent cannot reach by design. An auth link travels as data (`{"link": {"text", "url"}}`) so Lark can render a rich-text post and the page can render markdown.
+
+Lark-side setup has three separate fields with three different matching rules (see README step 5); the one that costs an afternoon is Redirect URLs, which is an exact page URL and needs the trailing slash.
+
+## A2A: delegation that has to be attributable
+
+What this agent has that a peer does not is the identity chain — it can act in Lark as the calling human, with that person's own vaulted token, and Lark adjudicates. So the capability worth exposing over A2A is not reasoning; it is "do this as that user".
+
+It runs no turn of its own. A vaulted consent is scoped to the Runtime that obtained it — measured: the same user, same workload, same provider and scopes, seen from a second Runtime, reads as "never consented". So `agent/a2a_server.py` is a protocol adapter: it captures the caller's bearer, forwards it to the agent Runtime's `chat` action along with the claimed `actorId`, and returns the reply. A second Runtime is unavoidable here (unlike AG-UI) because the A2A contract binds port 9000 at the root while the HTTP contract is 8080 under `/invocations` — same image, `entrypoint.sh` branches on `SERVER_MODE`.
+
+This keeps the trust boundary honest rather than widening it: A2A carries no end-user identity of its own, so a caller wanting us to act as someone must already hold that person's token — and a caller able to do that is already trusted to speak for them. A request with no bearer is refused with an explanation, not served anonymously.
+
 ## Deploy shape
 
-CDK stacks: security, agentcore, router, shim, gateway, observability, and storage when `FILES_STORAGE=true` (that one carries the VPC, so it is off by default). The tool path is agent-side 3LO, so the gateway stack is reduced to its service role (no mcpServer target); the shim stack is what the 3LO flow actually uses. Everything AgentCore-side is created outside CloudFormation: the **Runtimes** (agent, lark-cli MCP server, and the approval MCP server when deployed), Memory, the OAuth2 credential provider, the workload identity, and the Web Search gateway. `deploy.sh` builds them — ARM64 images via CodeBuild, resources via the AgentCore CLI / control-plane — and feeds ids back through `.cdk-state.json`.
+CDK stacks: security, agentcore, router, shim, gateway, observability, plus storage when `FILES_STORAGE=true` (that one carries the VPC, so it is off by default) and webui when `WEBUI=true`. The webui stack owns no compute — a bucket, a distribution, and the two values injected into `config.js`. Its domain only exists after deploy and the router needs it for CORS, so `phase_webui` writes it to `.cdk-state.json` and re-deploys the router; routing it through state rather than a CloudFormation export is deliberate, since importing the router's URL would freeze that export. The tool path is agent-side 3LO, so the gateway stack is reduced to its service role (no mcpServer target); the shim stack is what the 3LO flow actually uses. Everything AgentCore-side is created outside CloudFormation: the **Runtimes** (agent, lark-cli MCP server, and the approval MCP server when deployed), Memory, the OAuth2 credential provider, the workload identity, and the Web Search gateway. `deploy.sh` builds them — ARM64 images via CodeBuild, resources via the AgentCore CLI / control-plane — and feeds ids back through `.cdk-state.json`.
 
 `AWS::BedrockAgentCore::*` types do now exist, so this is a choice rather than a limitation: the agent Runtime and Memory are created implicitly by `agentcore deploy`, which also builds the image, and replacing that official tool to move them into a stack costs more than it returns. Two consequences worth knowing: `destroy.sh` needs an explicit delete for each of these (nothing errors if one is missed — only a real teardown catches it), and the ordering `3lo`/`gateway` → `runtime` has to be maintained by hand, since the Runtime bakes in the provider name and gateway URL. See `README.md` for the deploy commands and Lark console setup.
