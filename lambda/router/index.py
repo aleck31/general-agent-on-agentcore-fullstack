@@ -28,7 +28,6 @@ from botocore.config import Config
 from botocore.exceptions import ReadTimeoutError
 
 import cognito
-import files
 import lark
 import identity
 
@@ -647,12 +646,6 @@ def _dispatch_turn(user_id: str, actor_id: str, agent_message: str, chat_id: str
     mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
     logger.info("invoking agent: session=%s mem=%s msg=%r",
                 session_id, mem_sid, agent_message[:80])
-    # Mount this user's files once per session. It costs a control-plane round trip and a
-    # cold start, so it is claimed per session rather than attempted per turn — and it
-    # doubles as the warm-up, since InvokeAgentRuntimeCommand starts the microVM. A
-    # failure here is not fatal: the turn then runs without file tools.
-    if files.enabled() and identity.mount_needs_bootstrap(user_id, session_id):
-        files.bootstrap(session_id, actor_id)
     # Acknowledge before doing anything slow: the first token is seconds away
     # (session assembly, MCP handshake, model latency), and until then the user has
     # no way to tell "working on it" from "my message never arrived". The agent

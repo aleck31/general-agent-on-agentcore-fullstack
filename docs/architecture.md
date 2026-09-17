@@ -13,7 +13,7 @@ A general-purpose agent on Amazon Bedrock AgentCore, integrated with **Lark (Fei
 | **Reasoning** | the model, the system prompt, the turn loop | `agent/agent_core.py` — LangGraph (`langchain.agents.create_agent`) on `ChatBedrockConverse` |
 | **Memory** | what the agent remembers, and for how long | DynamoDB checkpoints (conversation) + AgentCore Memory (long-term); thread id owned by the router |
 | **Tools** | what the agent can actually do, and as whom | `mcp-servers/*` (one Runtime each), plus the Web Search Gateway |
-| **Files** | what survives the microVM, and whose it is | `stacks/storage_stack.py`, `lambda/broker/`, `lambda/router/files.py` (optional) |
+| **Files** | what survives the microVM, and whose it is | `stacks/storage_stack.py` (optional) |
 
 Each layer is separable, and the seams are deliberate: adding a tool server touches only the last row, adding a channel only the first. `README.md → Extending the agent` lists what each addition actually costs.
 
@@ -62,7 +62,6 @@ Each layer is separable, and the seams are deliberate: adding a tool server touc
 | Checkpoint table | Per-user conversation state, partition key derived from `thread_id` | `agentcore-fullstack-checkpoints` (+ an S3 bucket for state over ~350 KB) |
 | Cognito user pool | Token factory: mints a standard OIDC JWT for a Lark-authenticated user (Lark is not standard OIDC) | `stacks/security_stack.py` |
 | AgentCore Gateway | Fronts the built-in **Web Search** connector (us-east-1 only, so it's cross-region) | `stacks/gateway_stack.py`, `deploy.sh gateway` |
-| Mount broker | Turns a KMS-signed ticket into credentials scoped to one user's Access Point. Optional, with the VPC and file system it needs | `lambda/broker/`, `stacks/storage_stack.py` |
 
 ## How an answer gets back
 
@@ -169,32 +168,27 @@ Two things that are easy to get wrong. **The router does not deliver the answer*
 
 Delivery is scoped by subscription: Lark sends approval events only for definitions subscribed through `approvals/{code}/subscribe`, a **separate step from ticking the event in the console** (`./deploy.sh approvals`). Two naming inconsistencies cost an afternoon each: the event calls it `approval_code` while `tasks/query` returns `definition_code`, and `tasks/query` is a **GET** (POST answers `404 page not found`, which reads like a permissions problem).
 
-## Persistent files, per user
+## Code execution, and the workspace it writes to
 
-Optional (`FILES_STORAGE=true`) and off by default, because it is the only part of this project with a fixed monthly cost. The Runtime is stateless in the way that matters: a session's filesystem dies with its microVM, and `maxLifetime` ends that microVM within 8 h regardless of activity. Conversation state is covered by Memory; **bytes** are what this adds.
+Optional (`FILES_STORAGE=true`) and off by default. The Runtime is stateless in the way that matters: a session's filesystem dies with its microVM, and `maxLifetime` ends that microVM within 8 h regardless of activity. Conversation state is covered by checkpoints; **bytes** are what this adds — and the thing that consumes them is generated code.
 
 ```
-router (the only component that knows who a turn is)
-  │  KMS-signed ticket: {sub: lark:ou_..., exp}          ← subject is the verified actor,
-  │                                                        never an argument
-  ▼  InvokeAgentRuntimeCommand → bootstrap inside the session (also starts the microVM)
-agent microVM (root)
-  │  ticket → /dev/shm, mount profile → credential_process = cred_helper.py
-  │  cred_helper → broker Lambda ─────────────────────────┐
-  ▼  mount -t s3files -o accesspoint=<ap> …  /mnt/user    │
-S3 Files ← Access Point rooted at /users/lark_<open_id>   │
-                                                          ▼
-                                        broker: verify ticket → this user's Access Point
-                                        → STS credentials pinned to that one AP ARN
+agent Runtime (PUBLIC, no VPC)
+  │  StartCodeInterpreterSession(filesystemConfigurations=[ this user's Access Point ])
+  ▼
+Code Interpreter session — own microVM, in the storage VPC
+  │  /mnt/workspace  ← S3 Files, Access Point rooted at /users/lark_<open_id>
+  ▼  executeCode / executeCommand
+S3 (write-through, asynchronous)
 ```
 
-**Why the mount happens inside the session.** `filesystemConfigurations` would let the platform mount an Access Point for us, with no root and no broker — but it is **Runtime-scoped**, and one Runtime serves every user. A single shared Access Point would put one user's files on a filesystem every other session can read; a Runtime per user would mean deploying N identical Runtimes. Since the isolation unit has to be the user and the config knob is per Runtime, the mount can only be performed at invoke time. That is also the only reason root is needed: `mount(2)` requires `CAP_SYS_ADMIN`, whereas a platform-performed mount needs no privilege in the container at all.
+**Only the sandbox is in the VPC, and there is no NAT.** A mount is NFS, so it needs a mount target, so something must be inside a VPC — but that something is the sandbox, not the Runtime. The sandbox only has to reach S3, which a **free gateway endpoint** does. The Runtime stays PUBLIC and keeps reaching Bedrock, Lark and a cross-region Gateway directly; putting *it* in the VPC is what used to make a NAT unavoidable.
 
-**Two layers of isolation, neither of them agent code.** The Access Point's `rootDirectory` is fixed server-side to `/users/lark_<open_id>`, so a mount through it cannot see another prefix whatever the client asks. And the credentials the broker returns carry an STS session policy conditioned on that one Access Point ARN, so code running as root still cannot mount anything else. The agent's own execution role has no S3 permission on the bucket.
+**Isolation is the platform's boundary, not our code's.** `filesystemConfigurations` is accepted per **session**, so one shared Code Interpreter serves every user while each session mounts only that user's Access Point — measured: a session mounting user B's Access Point sees an empty directory while user A's files exist, and the Access Point's root is the top of the visible tree. The Access Point's `rootDirectory` is fixed server-side to `/users/lark_<open_id>`, and the file system's own resource policy refuses any mount that names no Access Point. The agent's execution role has no S3 permission on the bucket at all.
 
-**What the ticket is and is not.** It is a bearer capability: whoever holds it can get credentials for that user's files until it expires, and expiry is the only revocation. It says nothing about who asked for it — which is exactly why the signer must never take a subject as input. The router signs the actor it has already verified from the inbound JWT, and it holds `kms:Sign` while the broker holds only `kms:Verify`: neither can do the other's job.
+What that leaves as the one thing to get right is **which Access Point a session mounts** — a bug there is a cross-user leak, and no amount of platform isolation helps. It is the same trust shape as the broker this replaced, with far fewer moving parts: no signed ticket, no vended credentials, no `credential_process`, no watchdog.
 
-**Known edges.** Bootstrap runs once per session (claimed via a DynamoDB `MOUNT` marker) and doubles as the microVM warm-up; a microVM replaced mid-session loses the mount until the session rotates, though the bootstrap script is idempotent and safe to re-run. Access Points are a limited resource, so the user count is bounded (EFS allows 1000 per file system; s3files is assumed similar but unconfirmed). `/clear` deletes Memory events, never files. Details and the measured findings behind the container are in `.dev/adr/0007`.
+**Known edges.** `mountPath` must match `/mnt/[a-zA-Z0-9._-]+/?`, so the path is `/mnt/workspace` rather than a friendlier `/workspace`. Write-through to S3 is asynchronous (~40 s measured for a small file), so reading an artifact out of the bucket needs a retry while reading it back through the sandbox does not. `readFiles`/`writeFiles` are scoped to the sandbox's own workspace and cannot touch the mount — use `executeCommand`/`executeCode`. Access Points are limited (EFS allows 1000 per file system; s3files assumed similar, unconfirmed), which bounds the user count. `/clear` deletes conversation state, never files. Measured details in `docs/agentcore-behavior.md`, decisions in `.dev/adr/0007`.
 
 ## Conversation memory
 

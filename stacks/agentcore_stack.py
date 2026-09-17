@@ -215,18 +215,42 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # The mount broker, when files storage is deployed. cred_helper.py runs in the
-        # agent container as this role and calls the broker on every credential refresh.
-        # Named rather than referenced: importing the function from the storage stack would
-        # make this stack depend on one that already depends on it (the bucket), and the
-        # name is deterministic anyway. This is the agent's only permission anywhere near
-        # the file system — it cannot read the bucket, mount, or sign a ticket, only ask.
+        # Code execution: one shared Code Interpreter, one Access Point per user, and the
+        # session mounts that user's Access Point. The agent needs to create the Access
+        # Point on first use and to drive sessions — it never gets mount credentials of its
+        # own, and never S3 access to the bucket. See .dev/adr/0007.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
-                actions=["lambda:InvokeFunction"],
-                resources=[
-                    f"arn:aws:lambda:{region}:{account}:function:{prefix}-mount-broker",
-                ],
+                actions=["bedrock-agentcore:StartCodeInterpreterSession",
+                         "bedrock-agentcore:InvokeCodeInterpreter",
+                         "bedrock-agentcore:GetCodeInterpreterSession",
+                         "bedrock-agentcore:StopCodeInterpreterSession"],
+                resources=[f"arn:aws:bedrock-agentcore:{region}:{account}:*code-interpreter*/{prefix}_*"],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                # TagResource because creating an Access Point tags it with its actor, and
+                # a missing tag permission fails the create on the tag rather than the create.
+                actions=["s3files:CreateAccessPoint", "s3files:GetAccessPoint",
+                         "s3files:TagResource", "s3files:ListAccessPoints"],
+                # Access Point ids are unknown until created; the file system is not, so the
+                # blast radius is this project's file system rather than the account's.
+                resources=["*"],
+            )
+        )
+        # Mounting itself. Without these the session fails to start with "S3 Files mount
+        # failed: access denied" (measured). Both name sets are needed: S3 Files runs on the
+        # EFS control plane, so the elasticfilesystem aliases are what some paths check.
+        # The file system's own resource policy refuses any mount that names no Access Point,
+        # so these permissions cannot reach the file system root.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3files:ClientMount", "s3files:ClientWrite",
+                         "elasticfilesystem:ClientMount", "elasticfilesystem:ClientWrite",
+                         "elasticfilesystem:DescribeMountTargets"],
+                resources=[f"arn:aws:s3files:{region}:{account}:file-system/*",
+                           f"arn:aws:elasticfilesystem:{region}:{account}:file-system/*"],
             )
         )
 
@@ -253,10 +277,10 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # --- Per-user files. Reached through the mount, never with this role: the agent
-        # deliberately holds no S3 permission on this bucket. Access is granted only to
-        # the S3 Files file system role (scoped to users/*) and, per call, to credentials
-        # the broker scopes to one Access Point — see .dev/adr/0007. An earlier version
+        # --- Per-user files. Reached through the sandbox's mount, never with this role:
+        # the agent deliberately holds no S3 permission on this bucket. Access is granted
+        # only to the S3 Files file system role (scoped to users/*) and, per session, to the
+        # one Access Point that session mounts — see .dev/adr/0007. An earlier version
         # granted this role read/write on the whole bucket, which handed every session's
         # code every user's files.
         self.user_files_bucket = s3.Bucket(

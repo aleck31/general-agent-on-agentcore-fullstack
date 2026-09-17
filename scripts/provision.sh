@@ -6,12 +6,13 @@
 #   --memory    AgentCore Memory for long-term records (implied by --runtime)
 #   --runtime   create/update the AgentCore Runtime from the built image (CLI)
 #   --gateway   Web Search gateway in us-east-1 (only when WEB_SEARCH=true)
+#   --code      Code Interpreter for code generation/execution (FILES_STORAGE=true)
 #   --webui     static web chat on S3 + CloudFront (only when WEBUI=true)
 #   (no arg)    run all steps in order
 #
 # Step implementation — normally invoked through ./deploy.sh in the repo root,
 # which owns the ordering. Callable directly when iterating on one phase:
-# Usage: [PROFILE=p REGION=r] scripts/provision.sh [--base|--memory|--runtime|--gateway|--a2a|--webui]
+# Usage: [PROFILE=p REGION=r] scripts/provision.sh [--base|--memory|--code|--runtime|--gateway|--a2a|--webui]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,9 +25,9 @@ _CLI_FILES="${FILES_STORAGE:-}"
 PROFILE="${_CLI_PROFILE:-${PROFILE:-}}"   # empty -> ambient creds (instance role / env)
 REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
 WEB_SEARCH="${_CLI_WEB_SEARCH:-${WEB_SEARCH:-false}}"
-# Persistent per-user files. Off by default because it is the only part of this project
-# with a fixed monthly cost: the mount is NFS, so the Runtime has to sit in a VPC and
-# needs a NAT to keep reaching Bedrock and Lark. See .dev/adr/0007.
+# Code execution and its per-user workspace. Off by default: it adds a VPC (no NAT — the
+# sandbox only needs S3, via a free gateway endpoint) and an S3 Files file system.
+# See .dev/adr/0007.
 FILES_STORAGE="${_CLI_FILES:-${FILES_STORAGE:-false}}"
 PREFIX="agentcore-fullstack"
 export AWS_REGION="$REGION" UV_LINK_MODE=copy
@@ -64,6 +65,14 @@ cfn_out() { # stack, output-key
     --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue" --output text 2>/dev/null
 }
 
+ctx_get() { # key — read a deployment id back out of .cdk-state.json ("" when absent)
+  uv run python - "$1" <<'PYGET'
+import json, os, sys
+f = ".cdk-state.json"
+print((json.load(open(f)) if os.path.isfile(f) else {}).get(sys.argv[1], ""))
+PYGET
+}
+
 ctx_set() { # key value  — persist a deployment id into .cdk-state.json (gitignored)
   uv run python - "$1" "$2" <<'PY'
 import json, os, sys
@@ -91,9 +100,9 @@ base_cdk_stacks() {
   # naming it unconditionally would fail the deploy rather than skip it.
   if [ "$FILES_STORAGE" = "true" ]; then
     stacks+=("$PREFIX-storage")
-    echo "  files storage: on (VPC + NAT will be created)"
+    echo "  code execution: on (VPC without NAT + S3 Files will be created)"
   else
-    echo "  files storage: off"
+    echo "  code execution: off"
   fi
   $CDK deploy "${stacks[@]}" -c "files_storage=$FILES_STORAGE" \
              --require-approval never --outputs-file cdk.out/outputs.json
@@ -187,26 +196,21 @@ phase2_runtime() {
   [ -n "$mcp_arn" ] && [ "$mcp_arn" != "None" ] || {
     echo "${PREFIX//-/_}_mcp runtime not found — run ./deploy.sh mcp first"; exit 1; }
 
-  # Files storage: the mount is NFS, so the Runtime has to join the storage stack's VPC.
-  local subnets="" runtime_sg="" fs_id="" broker_fn=""
+  # Code execution: the Runtime stays PUBLIC. Only the Code Interpreter session joins the
+  # storage VPC, and only the ids it needs are baked in here. See .dev/adr/0007.
+  local fs_arn="" ci_id=""
   if [ "$FILES_STORAGE" = "true" ]; then
-    subnets="$(cfn_out "$PREFIX-storage" RuntimeSubnetIds)"
-    runtime_sg="$(cfn_out "$PREFIX-storage" RuntimeSecurityGroupId)"
-    fs_id="$(cfn_out "$PREFIX-storage" FileSystemId)"
-    broker_fn="$(cfn_out "$PREFIX-storage" BrokerFunctionName)"
-    [ -n "$subnets" ] && [ "$subnets" != "None" ] || {
-      echo "storage stack outputs missing — run --base with FILES_STORAGE=true first"; exit 1; }
-    echo "  files storage: VPC mode, subnets $subnets"
-    # The router needs the file system id too, and it is AWS-assigned — so it travels
-    # through .cdk-state.json and reaches the router on the re-deploy below.
-    ctx_set files_file_system_id "$fs_id"
+    fs_arn="$(cfn_out "$PREFIX-storage" FileSystemArn)"
+    ci_id="$(ctx_get code_interpreter_id)"
+    [ -n "$ci_id" ] || { echo "no code interpreter — run --code first"; exit 1; }
+    echo "  code execution: on (interpreter $ci_id)"
   fi
 
   local rname="${PREFIX//-/_}_agent" params rid
   params="$(RNAME="$rname" IMAGE="$image" ROLE="$role" ISSUER="$issuer" CLIENT="$client" \
-    SUBNETS="$subnets" SG="$runtime_sg" MODEL="$model" MEMORY="$memory" MCP_URL="$mcp_url" \
+    MODEL="$model" MEMORY="$memory" MCP_URL="$mcp_url" \
     SHIM="$shim" POOL="$pool" PWSECRET="$pwsecret" WS_URL="$ws_url" \
-    APPROVAL_URL="$approval_url" FS_ID="$fs_id" BROKER_FN="$broker_fn" PREFIX="$PREFIX" \
+    APPROVAL_URL="$approval_url" FS_ARN="$fs_arn" CI_ID="$ci_id" PREFIX="$PREFIX" \
     CKPT_TABLE="$ckpt_table" CKPT_BUCKET="$ckpt_bucket" \
     LARK_DOMAIN="$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['lark_api_domain'])")" \
     uv run python - <<'PYEOF'
@@ -236,16 +240,14 @@ env = {
     "COGNITO_PASSWORD_SECRET_ID": e["PWSECRET"],
     "WEBSEARCH_GATEWAY_URL": e["WS_URL"],
     "APPROVAL_MCP_URL": e["APPROVAL_URL"],
-    # Empty unless files storage is on; the agent and cred_helper treat that as "no mount".
-    "S3FILES_FS_ID": e["FS_ID"],
-    "MOUNT_BROKER_FN": e["BROKER_FN"],
-    "MOUNT_PATH": "/mnt/user" if e["FS_ID"] else "",
+    # Empty unless code execution is on; the agent treats that as "no code tools".
+    "CODE_INTERPRETER_ID": e["CI_ID"],
+    "FILES_FS_ARN": e["FS_ARN"],
+    "WORKSPACE_PATH": "/mnt/workspace" if e["CI_ID"] else "",
 }
+# The Runtime is never in the VPC: it must keep reaching Bedrock, Lark and a cross-region
+# Gateway, and that is what used to force a NAT. Only the sandbox goes in.
 net = {"networkMode": "PUBLIC"}
-if e["SUBNETS"]:
-    net = {"networkMode": "VPC", "networkModeConfig": {
-        "subnets": [x for x in e["SUBNETS"].split(",") if x],
-        "securityGroups": [e["SG"]]}}
 print(json.dumps({
     "agentRuntimeName": e["RNAME"],
     "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": e["IMAGE"]}},
@@ -310,6 +312,57 @@ print(json.dumps(p))')" >/dev/null
   done
   echo "  dropped $n session(s)"
 }
+
+phase_code() {
+  log "Code — the Code Interpreter the agent runs generated code in"
+  if [ "$FILES_STORAGE" != "true" ]; then
+    echo "  code execution: off (set FILES_STORAGE=true in .env)"; return 0
+  fi
+  local role subnets sg name existing
+  role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
+  subnets="$(cfn_out "$PREFIX-storage" SandboxSubnetIds)"
+  sg="$(cfn_out "$PREFIX-storage" SandboxSecurityGroupId)"
+  [ -n "$subnets" ] && [ "$subnets" != "None" ] || {
+    echo "storage stack outputs missing — run --base with FILES_STORAGE=true first"; exit 1; }
+  name="${PREFIX//-/_}_code"
+
+  # VPC mode, not SANDBOX: measured — filesystemConfigurations is refused outside VPC mode
+  # ("VPC network mode is required when filesystemConfigurations are provided"). No NAT is
+  # needed, only the S3 gateway endpoint the storage stack creates.
+  #
+  # No filesystemConfigurations here on purpose: the mount is named per session, so one
+  # shared interpreter serves every user with their own Access Point. See .dev/adr/0007.
+  existing="$(aws bedrock-agentcore-control list-code-interpreters \
+    --query "codeInterpreterSummaries[?name=='$name'].codeInterpreterId" --output text 2>/dev/null | head -1)"
+  if [ -n "$existing" ] && [ "$existing" != "None" ]; then
+    echo "  reusing $existing"
+    ctx_set code_interpreter_id "$existing"
+    return 0
+  fi
+  local cid
+  cid="$(acp create_code_interpreter "$(NAME="$name" ROLE="$role" SUBNETS="$subnets" SG="$sg" \
+    uv run python -c '
+import json, os
+e = os.environ
+print(json.dumps({
+    "name": e["NAME"],
+    "description": "Runs generated code for one user at a time, with their own workspace mounted",
+    "executionRoleArn": e["ROLE"],
+    "networkConfiguration": {"networkMode": "VPC", "vpcConfig": {
+        "subnets": [x for x in e["SUBNETS"].split(",") if x],
+        "securityGroups": [e["SG"]],
+        "requireServiceS3Endpoint": True}},
+}))')" | uv run python -c 'import json,sys;print(json.load(sys.stdin)["codeInterpreterId"])')"
+  echo "  created $cid"
+  # READY is asynchronous; starting a session against a CREATING interpreter fails.
+  for _ in $(seq 1 40); do
+    [ "$(aws bedrock-agentcore-control get-code-interpreter --code-interpreter-id "$cid" \
+         --query 'status' --output text 2>/dev/null)" = "READY" ] && break
+    sleep 6
+  done
+  ctx_set code_interpreter_id "$cid"
+}
+
 
 phase_a2a() {
   log "A2A — expose the agent to peer agents"
@@ -493,11 +546,12 @@ case "${1:-all}" in
   --memory)   phase_memory ;;
   # Memory first: the runtime is created with BEDROCK_AGENTCORE_MEMORY_ID baked into its
   # environment, and UpdateAgentRuntime replaces rather than patches.
-  --runtime)  phase_memory; phase2_runtime ;;
+  --runtime)  phase_memory; phase_code; phase2_runtime ;;
+  --code)     phase_code ;;
   --a2a)      phase_a2a ;;
   --webui)    phase_webui ;;
   --gateway)  phase3_gateway ;;
-  all|"")     base_cdk_stacks; phase_memory; phase2_runtime; phase3_gateway; phase_a2a; phase_webui
+  all|"")     base_cdk_stacks; phase_memory; phase_code; phase2_runtime; phase3_gateway; phase_a2a; phase_webui
               log "Webhook URL (register in Lark): $(cfn_out "$PREFIX-router" WebhookLarkUrl)" ;;
-  *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--memory|--runtime|--gateway|--a2a|--webui]"; exit 1 ;;
+  *) echo "usage: [PROFILE=p REGION=r] $0 [--base|--memory|--code|--runtime|--gateway|--a2a|--webui]"; exit 1 ;;
 esac

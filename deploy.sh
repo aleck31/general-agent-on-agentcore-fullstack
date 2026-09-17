@@ -42,6 +42,7 @@ run_base()    { step "base — CDK stacks";                scripts/provision.sh 
 run_mcp()     { step "mcp — MCP servers";                 scripts/build-mcp.sh "$@"; }
 run_3lo()     { step "3lo — Identity + OAuth provider";  scripts/setup-3lo.sh; }
 run_gateway() { step "gateway — Web Search (optional)";  scripts/provision.sh --gateway; }
+run_code()    { step "code — Code Interpreter for generated code"; scripts/provision.sh --code; }
 run_a2a()     { step "a2a — expose to peer agents";       scripts/provision.sh --a2a; }
 run_webui()   { step "webui — static web chat";            scripts/provision.sh --webui; }
 run_runtime() { step "runtime — agent";                  scripts/provision.sh --runtime; }
@@ -80,6 +81,7 @@ case "${1:-all}" in
   runtime) run_runtime ;;
   lark)    run_lark ;;
   approvals) run_approvals ;;
+  code)    run_code ;;
   a2a)     run_a2a ;;
   webui)   run_webui ;;
   urls)    print_urls ;;
@@ -88,7 +90,7 @@ case "${1:-all}" in
     run_preflight
     # 3lo and gateway precede runtime: the agent is deployed with the provider,
     # workload and gateway URL baked into its environment.
-    run_base; run_mcp; run_3lo; run_gateway; run_runtime; run_lark; run_approvals; run_a2a; run_webui
+    run_base; run_mcp; run_3lo; run_gateway; run_code; run_runtime; run_lark; run_approvals; run_a2a; run_webui
     print_urls
     ;;
   -h|--help) usage ;;

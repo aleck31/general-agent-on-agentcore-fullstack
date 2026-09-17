@@ -18,7 +18,7 @@ That identity integration is deliberately not re-documented here. Two samples co
 | Web chat *(optional)* | A page inside Lark, streaming over AG-UI from the same Runtime; identity comes from Lark's h5 SDK, so the browser proves who it is instead of claiming it. Renders markdown, the tool lifecycle with its results, image input, and the same chat commands |
 | Delegation from other agents *(optional)* | A2A adapter — a peer agent asks this one to act as a specific person, and Lark adjudicates |
 | Web search *(optional)* | AgentCore Gateway fronting the built-in Web Search connector — no user identity involved |
-| Persistent files per user *(optional)* | S3 Files mounted at `/mnt/user`, one Access Point per user, isolation enforced by IAM rather than by agent code |
+| Code execution per user *(optional)* | Generated code runs in a Code Interpreter session with that user's own S3 Files workspace mounted at `/mnt/workspace`; isolation is the microVM's, not the agent's |
 | Unattended decisions *(optional)* | Approval events wake a turn with nobody present; limits enforced in code, not by the model |
 | Operational visibility | Chat commands expose session routing, the serving microVM, memory thread and authorization state |
 
@@ -72,10 +72,9 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 | `webui/` | the web chat page — one static file, no build step; deploy-time values arrive as `config.js` |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands. Also the only component that mints per-user JWTs (`cognito.py`) |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
-| `lambda/broker/` | Mount-credential broker: verifies a KMS-signed ticket, gets-or-creates that user's Access Point, and mints credentials scoped to it |
 | `mcp-servers/` | One directory per MCP server, one Runtime each: `lark-cli/` acts as the user against Lark, `approval/` runs approval decisions on the app identity. Each declares its own build/runtime config in `runtime.env`, so adding a server needs no script change |
 | `deploy.sh` | the deploy entry point — orders the steps in `scripts/` |
-| `scripts/` | step implementations: preflight / provision (base/memory/runtime/gateway/a2a/webui) / build-mcp / setup-3lo / setup-lark / subscribe-approvals / manage-allowlist / destroy |
+| `scripts/` | step implementations: preflight / provision (base/memory/code/runtime/gateway/a2a/webui) / build-mcp / setup-3lo / setup-lark / subscribe-approvals / manage-allowlist / destroy |
 | `tests/` | `run.sh` (all unit suites) + e2e smoke tests that need a deployed stack |
 | `probe/` | a measurement MCP server, not part of the deployed agent — how the findings in `docs/agentcore-behavior.md` were established |
 
@@ -95,6 +94,7 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 | Step | What |
 |---|---|
 | `./deploy.sh base` | CDK stacks (security, agentcore, router, shim, gateway, observability, plus storage when `FILES_STORAGE=true`) |
+| `./deploy.sh code` | the Code Interpreter generated code runs in — skipped unless `FILES_STORAGE=true` |
 | `./deploy.sh webui` | the web chat page on S3 + CloudFront — skipped unless `WEBUI=true` |
 | `./deploy.sh a2a` | the A2A Runtime (same image, `SERVER_MODE=a2a`) — then `scripts/a2a-demo.sh` drives it as a peer would |
 | `./deploy.sh mcp` | build every MCP server under `mcp-servers/` (CodeBuild ARM64) + create/update a Runtime each. `./deploy.sh mcp approval` for just one |
@@ -271,7 +271,7 @@ This deploys billable AWS resources. All the always-on pieces are consumption- o
 - **Lambda + API Gateway** — router (webhook) + shim (OAuth RFC-6749 façade, a backend web service); effectively free at demo volume.
 - **Secrets Manager** — `$0.40/secret/month` each, and only two static secrets: the Lark credentials (`{prefix}/channels/lark`) and the Cognito password salt. No dynamic per-user secrets.
 - **Web search (optional)** — only when `WEB_SEARCH=true`: an AgentCore Gateway plus per-query connector charges. The gateway sits in us-east-1, so its traffic is cross-region.
-- **Persistent files (optional, `FILES_STORAGE=true`)** — **a NAT Gateway, ~$32/month plus data processing, which is more than everything else here put together.** It is not avoidable on this path: the mount is NFS, its endpoint is a mount target inside a VPC, so the Runtime joins that VPC and then needs a route out to Bedrock and to Lark's public API. Interface endpoints for the AWS services would cost more than the NAT. Plus S3 storage for what the agent writes, and a Lambda invocation per credential refresh (hourly per session). Off by default.
+- **Code execution (optional, `FILES_STORAGE=true`)** — **no NAT.** A mount needs a VPC, but only the Code Interpreter session goes in there, and it only has to reach S3, which a free gateway endpoint does. So the fixed cost is a VPC (free), an S3 gateway endpoint (free) and mount targets (free); what is metered is sandbox session time and the S3 storage the workspace uses. Off by default because it still adds resources you should not create by accident.
 - **Cognito, DynamoDB (on-demand)** — the identity/state plane; negligible at demo volume.
 
 `scripts/destroy.sh` removes everything `deploy.sh` created, including the OAuth credential provider and both gateways. Costs are usage-driven; an idle deployment still accrues the two microVMs' memory-time and the two static per-secret charges.

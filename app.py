@@ -80,11 +80,10 @@ shim = ShimStack(
     env=env,
 )
 
-# --- Storage: S3 Files + per-user mount broker (opt-in) ---
-# Off unless files_storage=true, because this is the one stack with a fixed monthly cost
-# (a NAT Gateway, which the NFS mount forces — see .dev/adr/0007). Everything else here
-# is consumption-priced, so creating this by accident would be the expensive mistake.
-# Declared before the router, which needs its key and file system id.
+# --- Storage: S3 Files, mounted per user into the code sandbox (opt-in) ---
+# Off unless files_storage=true. No NAT: only the Code Interpreter session sits in this
+# VPC and it reaches S3 through a free gateway endpoint — see .dev/adr/0007. Declared
+# before the router so its ids are available to the phases that need them.
 storage = None
 if _flag("files_storage"):
     storage = StorageStack(
@@ -98,13 +97,6 @@ if _flag("files_storage"):
 router = RouterStack(
     app,
     f"{prefix}-router",
-    mount_ticket_key_arn=storage.ticket_key.key_arn if storage else "",
-    # From .cdk-state.json rather than a cross-stack export: the id is assigned by AWS,
-    # so provision.sh reads it back after the storage stack exists and re-deploys the
-    # router — the same path runtime_id and the gateway URL already take. A CDK export
-    # would also deadlock on removal, since the producer cannot drop an export the router
-    # still imports.
-    s3files_file_system_id=ctx("files_file_system_id") or "",
     # The page's origin, so it may trade an h5 code for a JWT. Travels through
     # .cdk-state.json because CloudFront assigns the domain — the same route the file
     # system id takes, and it breaks the cycle between this stack and the WebUI one.

@@ -1,29 +1,15 @@
 # Agent container for Bedrock AgentCore Runtime (ARM64).
 #
-# Amazon Linux 2023 rather than a slim Debian image, and root rather than a dedicated
-# user, for one reason: the per-user file mount. `mount.s3files` ships in
-# amazon-efs-utils, which is packaged for AL2023, and mount(2) needs CAP_SYS_ADMIN, which
-# means the process performing it must be root. The mount cannot be declared on the
-# Runtime instead — filesystemConfigurations is Runtime-scoped and we need one Access
-# Point per user. See .dev/adr/0007.
-#
-# The cost is real and worth stating: this image gives up the non-root execution the
-# previous Debian-based one had. Nothing else here needs root. If it turns out that
-# InvokeAgentRuntimeCommand executes as root independently of USER, and the watchdog can
-# refresh a mount unprivileged, this should go back to a dedicated user.
+# Amazon Linux 2023 because the agent's dependencies install cleanly on its python3.11.
+# It used to be here for a stronger reason — `mount.s3files` from amazon-efs-utils, which
+# needed root — and that reason is gone: the per-user mount now happens inside the Code
+# Interpreter session, not in this container. See .dev/adr/0007. Nothing left here needs
+# root, so switching to a dedicated user is a worthwhile follow-up, deliberately not done
+# blind in the same change.
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023
 
-# amazon-efs-utils: provides /sbin/mount.s3files and amazon-efs-mount-watchdog (verified
-# on amazon-efs-utils-3.3.1, aarch64).
-#
-# python3-botocore is for the SYSTEM python3, not for the agent: the mount helper's
-# shebang is #!/usr/bin/python3 and it resolves the mount profile's credential_process
-# through botocore, which AL2023 does not install with efs-utils (checked — importing it
-# there fails otherwise, and the mount then reports no credentials).
-#
-# python3.11 is what AL2023 packages, and the agent's dependencies install cleanly on it.
-RUN dnf install -y --setopt=install_weak_deps=False \
-        amazon-efs-utils python3-botocore python3.11 python3.11-pip \
+# python3.11 is what AL2023 packages.
+RUN dnf install -y --setopt=install_weak_deps=False python3.11 python3.11-pip \
     && dnf clean all && rm -rf /var/cache/dnf
 
 WORKDIR /app
@@ -32,14 +18,13 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python3.11 -m pip install --no-cache-dir -r /app/requirements.txt
 
-# `python3` must reach the interpreter that has the agent's dependencies: entrypoint.sh
-# and cred_helper.py both use it, while efs-utils keeps using /usr/bin/python3 through its
-# own absolute path.
+# `python3` must reach the interpreter that has the agent's dependencies, which is what
+# entrypoint.sh invokes.
 RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python3
 
 COPY *.py /app/
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh /app/cred_helper.py
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8080
 
