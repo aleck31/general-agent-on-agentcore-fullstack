@@ -334,13 +334,31 @@ class AgentCoreStack(Stack):
             ],
         )
 
-        # Objects only. DynamoDBSaver also tries to set a lifecycle policy on this bucket
-        # at startup and logs "Failed to configure S3 lifecycle: AccessDenied" when it
-        # cannot — leave it that way. The rule above is deliberately longer than the
-        # table's TTL, and granting PutBucketLifecycleConfiguration would let a container
-        # running model output rewrite it. The warning is expected, not a misconfiguration.
-        self.checkpoint_table.grant_read_write_data(self.execution_role)
-        self.checkpoint_bucket.grant_read_write(self.execution_role)
+        # No enumeration. Isolation here is the partition key, not IAM — the role can reach
+        # every thread — so removing Scan and List is what stops "read everyone" from being
+        # one call. thread_id is sha256 of the actor and Lark open_ids live in the router's
+        # table, which this role cannot read, so without enumeration an attacker must
+        # already know whose conversation to ask for. See .dev/adr/0008.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query",
+                    "dynamodb:PutItem", "dynamodb:BatchWriteItem", "dynamodb:UpdateItem",
+                    "dynamodb:DeleteItem", "dynamodb:DescribeTable",
+                ],
+                resources=[self.checkpoint_table.table_arn],
+            )
+        )
+        # Exact keys only, under the one prefix the saver writes. DynamoDBSaver also tries to
+        # set a lifecycle policy at startup and logs "Failed to configure S3 lifecycle:
+        # AccessDenied" — leave it: the stack's own rule outlives the table TTL on purpose,
+        # and a container running model output should not be able to rewrite it.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                resources=[f"{self.checkpoint_bucket.bucket_arn}/state/*"],
+            )
+        )
 
         # --- Container image (ARM64) ------------------------------------------
         # Built from ./agent. deploy.sh reads this URI to create/update the runtime.
