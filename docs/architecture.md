@@ -275,7 +275,9 @@ What this agent has that a peer does not is the identity chain — it can act in
 
 It runs no turn of its own. A vaulted consent is scoped to the Runtime that obtained it — measured: the same user, same workload, same provider and scopes, seen from a second Runtime, reads as "never consented". So `agent/a2a_server.py` is a protocol adapter: it captures the caller's bearer, forwards it to the agent Runtime's `chat` action along with the claimed `actorId`, and returns the reply. A second Runtime is unavoidable here (unlike AG-UI) because the A2A contract binds port 9000 at the root while the HTTP contract is 8080 under `/invocations` — same image, `entrypoint.sh` branches on `SERVER_MODE`.
 
-This keeps the trust boundary honest rather than widening it: A2A carries no end-user identity of its own, so a caller wanting us to act as someone must already hold that person's token — and a caller able to do that is already trusted to speak for them. A request with no bearer is refused with an explanation, not served anonymously.
+This keeps the trust boundary honest rather than widening it: A2A carries no end-user identity of its own, so a caller wanting us to act as someone must already hold that person's token — and a caller able to do that is already trusted to speak for them. A request with no bearer is refused with an explanation, not served anonymously (though through AgentCore the authorizer rejects it first, so that branch only guards a direct-to-container call).
+
+`scripts/a2a-demo.sh` drives all of it as a peer would, and its third step is the one that matters: the same bearer naming a *different* actor does not return that person's data — it returns a consent prompt, because the agent checks the claim against the vaulted token's owner. Step two ends by reading the MCP server's own log for `tools/call token=yes`, since a plausible answer is not evidence that a tool ran as anyone. The Agent Card sits behind the Runtime's authorizer, which means a peer must already be a known identity in this tenant before it can even discover the agent — see docs/agentcore-behavior.md.
 
 ## Deploy shape
 

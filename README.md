@@ -96,7 +96,7 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 |---|---|
 | `./deploy.sh base` | CDK stacks (security, agentcore, router, shim, gateway, observability, plus storage when `FILES_STORAGE=true`) |
 | `./deploy.sh webui` | the web chat page on S3 + CloudFront — skipped unless `WEBUI=true` |
-| `./deploy.sh a2a` | the A2A Runtime (same image, `SERVER_MODE=a2a`) |
+| `./deploy.sh a2a` | the A2A Runtime (same image, `SERVER_MODE=a2a`) — then `scripts/a2a-demo.sh` drives it as a peer would |
 | `./deploy.sh mcp` | build every MCP server under `mcp-servers/` (CodeBuild ARM64) + create/update a Runtime each. `./deploy.sh mcp approval` for just one |
 | `./deploy.sh 3lo` | workload identity + the `agentcore-fullstack-3lo` OAuth credential provider |
 | `./deploy.sh gateway` | Web Search gateway in us-east-1 — skipped unless `WEB_SEARCH=true` |

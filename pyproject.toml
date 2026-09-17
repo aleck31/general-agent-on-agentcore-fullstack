@@ -1,6 +1,6 @@
 [project]
 name = "agent-on-agentcore-fullstack"
-version = "0.3.0"
+version = "0.3.1"
 description = "CDK app and deploy tooling for a general-purpose agent on Bedrock AgentCore"
 requires-python = ">=3.13"
 dependencies = [

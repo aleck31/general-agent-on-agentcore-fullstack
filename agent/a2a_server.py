@@ -41,6 +41,9 @@ _bearer: contextvars.ContextVar[str] = contextvars.ContextVar("bearer", default=
 
 _AGENT_RUNTIME_ARN = os.environ.get("AGENT_RUNTIME_ARN", "")
 _REGION = os.environ.get("AWS_REGION", "us-west-2")
+# What a peer sees when it discovers this agent. Overridable from .env, because a tenant
+# running two of these needs to tell them apart.
+_AGENT_NAME = os.environ.get("A2A_AGENT_NAME", "agentcore-general-agent")
 
 
 async def _invoke_agent(bearer: str, text: str, actor_id: str = "") -> str:
@@ -101,7 +104,7 @@ def build_app():
             raise NotImplementedError("A delegated turn runs to completion or fails.")
 
     card = AgentCard(
-        name="lark-identity-agent",
+        name=_AGENT_NAME,
         description=(
             "Acts inside Lark (Feishu) as the end user the request is for, using that "
             "person's own consented token. Delegate work here when it must be attributable "
@@ -122,7 +125,7 @@ def build_app():
         )],
     )
 
-    app = FastAPI(title="lark-identity-agent (A2A)")
+    app = FastAPI(title=f"{_AGENT_NAME} (A2A)")
 
     @app.get("/ping")
     async def ping():

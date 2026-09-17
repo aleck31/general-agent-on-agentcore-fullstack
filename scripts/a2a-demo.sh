@@ -103,7 +103,32 @@ dim "   actorId: $ACTOR"
 dim "   task:    $QUESTION"
 SINCE=$(( $(date +%s) * 1000 ))
 echo
-rpc "$BEARER" "$ACTOR" "$QUESTION" | sed 's/^/  /'
+REPLY_TEXT="$(rpc "$BEARER" "$ACTOR" "$QUESTION")"
+printf '%s\n' "$REPLY_TEXT" | sed 's/^/  /'
+
+# A first run — or one after the vaulted grant lapses — answers with a consent link instead
+# of doing the work. Exactly one link is minted and then we wait: each request mints a new
+# pending session and invalidates the one before it, so a second link on screen makes the
+# first fail with "Invalid or expired session" the moment the human clicks the older one.
+NEEDS_CONSENT=0
+case "$REPLY_TEXT" in *"/identities/oauth2/authorize"*) NEEDS_CONSENT=1 ;; esac
+if [ "$NEEDS_CONSENT" = 1 ]; then
+  log "   Consent needed before this task can run as that person"
+  if [ -t 0 ]; then
+    dim "   Open the link above — the newest one only — approve, then press Enter (5 min)."
+    read -r -t 300 _ || true
+    echo
+    REPLY_TEXT="$(rpc "$BEARER" "$ACTOR" "$QUESTION")"
+    printf '%s\n' "$REPLY_TEXT" | sed 's/^/  /'
+    case "$REPLY_TEXT" in *"/identities/oauth2/authorize"*)
+      dim "   Still not consented. Clicking an older link fails with \"Invalid or expired"
+      dim "   session\" — only the last one printed is live." ;;
+    esac
+  else
+    dim "   No terminal to wait on, so no retry: re-run interactively to finish consent."
+    dim "   Not minting a second link — it would invalidate the one above."
+  fi
+fi
 
 log "   Evidence — did a tool actually run, and as whom?"
 dim "   A reply proves nothing; the MCP server's own log line does."
@@ -122,8 +147,26 @@ done
 log "3. Impersonate — the same bearer, naming somebody else"
 dim "   A2A carries no end-user identity of its own, so the actorId is only a claim."
 dim "   The agent checks it against the vaulted token's real owner and refuses a mismatch."
+# Skipped when consent is still outstanding: this call mints its own pending session and
+# would invalidate the link the human is in the middle of using.
+if [ "$NEEDS_CONSENT" = 1 ] && [ ! -t 0 ]; then
+  dim "   Skipped — a link for step 2 is still live and this would invalidate it."
+  exit 0
+fi
+dim "   The link this prints is for a user that does not exist — do not click it."
 echo
-rpc "$BEARER" "lark:ou_0000000000000000000000000000dead" "$QUESTION" | sed 's/^/  /'
+OTHER="$(rpc "$BEARER" "lark:ou_0000000000000000000000000000dead" "$QUESTION")"
+printf '%s\n' "$OTHER" | sed 's/^/  /'
+echo
+# The pass is a refusal, and the refusal must not be a consent link: minting one for a
+# claimed actor destroys the real owner's grant, which is how this used to fail.
+case "$OTHER" in
+  *"/identities/oauth2/authorize"*)
+    printf '  \033[31m✗ offered a consent link — that would burn the real owner'"'"'s grant\033[0m\n' ;;
+  *不一致*|*[Aa]uthoriz*|*无法*)
+    printf '  \033[32m✓ refused — returned nobody'"'"'s data, and minted no consent link\033[0m\n' ;;
+  *) printf '  \033[31m✗ look closely: this should not have produced an answer\033[0m\n' ;;
+esac
 
 log "Note"
 dim "  A call with no bearer at all cannot be shown from here: the Runtime's CUSTOM_JWT"

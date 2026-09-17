@@ -342,6 +342,9 @@ env["SERVER_MODE"] = "a2a"
 # It forwards to the agent Runtime rather than running a turn: a vaulted consent belongs to
 # the Runtime that obtained it, so only that one can act for a user.
 env["AGENT_RUNTIME_ARN"] = e["AGENT_ARN"]
+# Only when .env sets it; otherwise the container's own default names the card.
+if e.get("A2A_AGENT_NAME"):
+    env["A2A_AGENT_NAME"] = e["A2A_AGENT_NAME"]
 print(json.dumps({
     "agentRuntimeName": e["RNAME"],
     "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": e["IMAGE"]}},
