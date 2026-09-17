@@ -2,62 +2,53 @@
 
 A general-purpose agent on **Amazon Bedrock AgentCore**, with **Lark (Feishu) as its interaction channel**. The agent runs on AgentCore Runtime (LangGraph + Bedrock), checkpoints conversation state to DynamoDB, reaches its tools over MCP, and answers in Lark chat — typed into a streaming card as it is produced, because a real task outlasts any request/response window.
 
-Its identity foundation is the part most agent samples skip: every message resolves to `lark:{open_id}`, and any tool that touches a user's data acts **as that user**, with the user's own token from the AgentCore Identity Token Vault (OAuth 3LO). So the agent inherits both *who you are* and *what you're allowed to do*, adding nothing of its own — Lark itself adjudicates access, and there is no parallel permission layer to keep in sync.
+Every message resolves to `lark:{open_id}`, and any tool touching a user's data acts **as that user**, with their own vaulted Lark token (3LO through AgentCore Identity). So Lark adjudicates access and there is no parallel permission layer to keep in sync. That identity chain is documented in depth by two sibling samples rather than here: [native](https://github.com/aws-samples/sample-lark-identity-on-agentcore-native) (the Token Vault path this repo uses) and [interceptor](https://github.com/aws-samples/sample-lark-identity-on-agentcore-interceptor) (same guarantees, self-managed vaulting).
 
-That identity integration is deliberately not re-documented here. Two samples cover it in full: [sample-lark-identity-on-agentcore-native](https://github.com/aws-samples/sample-lark-identity-on-agentcore-native) (the native Token Vault path this repo uses) and [sample-lark-identity-on-agentcore-interceptor](https://github.com/aws-samples/sample-lark-identity-on-agentcore-interceptor) (same guarantees via a Gateway Request Interceptor and self-managed vaulting). Read either for the per-hop reasoning; this repo documents only what you need to run and extend the agent.
+## What we build
 
-## What it does today
+Ten layers, each with a real implementation rather than a stub — that is the "full-stack" in the name. The interesting part is not any single layer but the seams between them, which is where this repo's design decisions and the measured findings in [docs/agentcore-behavior.md](docs/agentcore-behavior.md) came from.
 
-| Capability | How |
-|---|---|
-| Conversational agent in Lark chat | LangGraph agent on AgentCore Runtime; webhook in, streaming card out |
-| Memory across containers | DynamoDB checkpoints, addressed by a thread id derived from the user — a fresh microVM still remembers, and a turn cut off at the 15-minute cap resumes |
-| Tools as the calling user | MCP server running the official `lark-cli` with that user's vaulted `user_access_token` |
-| Long-running turns | The turn is accepted, runs in the background, and posts its own answer — no synchronous wait to time out |
-| Per-user consent, self-healing | First use posts a 点击授权 link and replays the original message once consent lands; the user never re-sends |
-| Web chat *(optional)* | A page inside Lark, streaming over AG-UI from the same Runtime; identity comes from Lark's h5 SDK, so the browser proves who it is instead of claiming it. Renders markdown, the tool lifecycle with its results, image input, and the same chat commands |
-| Delegation from other agents *(optional)* | A2A adapter — a peer agent asks this one to act as a specific person, and Lark adjudicates |
-| Web search *(optional)* | AgentCore Gateway fronting the built-in Web Search connector — no user identity involved |
-| Code execution per user *(optional)* | Generated code runs in a Code Interpreter session with that user's own S3 Files workspace mounted at `/mnt/workspace`; isolation is the microVM's, not the agent's |
-| Unattended decisions *(optional)* | Approval events wake a turn with nobody present; limits enforced in code, not by the model |
-| Operational visibility | Chat commands expose session routing, the serving microVM, memory thread and authorization state |
+| Layer | What it decides | How it's built |
+|---|---|---|
+| **Channel** | how a turn is started, and how the answer gets back | Lark webhook → router Lambda → an answer typed into a streaming CardKit card. Two more surfaces reach the same agent — a page inside Lark (AG-UI over SSE) and A2A for peer agents — and an approval event can start a turn with nobody present at all |
+| **Model** | which model answers, and what it costs per turn | **Amazon Bedrock** — Claude Sonnet over the Converse API, with prompt caching on every request (a `cachePoint` is explicit) |
+| **Agent loop** | the prompt, and how tool calls iterate | LangGraph `create_agent`, plus threshold-triggered summarisation to bound a thread that is permanent per user |
+| **Identity** | who this turn is, and whose credentials its tools may use | every message resolves to `lark:{open_id}`; Cognito mints the signed identity, **AgentCore Identity** vaults that person's Lark grant (3LO), and tools act as them — Lark adjudicates, we add nothing |
+| **Session state** | what the agent remembers *within* a conversation | DynamoDB checkpoints — full graph state keyed by the user, written per superstep, so it outlives the microVM and a turn cut off at the 15-minute cap resumes |
+| **Long-term memory** | what it remembers *across* conversations | **AgentCore Memory**, reached through `remember`/`recall` — written only when the model decides a fact should outlast the chat, because retrieval is the priced operation |
+| **Persistent storage** | what survives the container, and whose it is | **S3 Files** in your own bucket, one Access Point per user, mounted into the sandbox at `/mnt/workspace` — outlives sessions, deploys and image updates, and is isolated at the microVM boundary rather than by agent code |
+| **Tools** | what it can do, and as whom | **MCP servers** on their own Runtimes — `lark-cli` as the user, approvals on the app identity; **AgentCore Gateway** for Web Search; **AgentCore Code Interpreter** for generated code |
+| **Observability** | what it did, and on which compute | **AgentCore Observability** — OTel traces and container logs in CloudWatch; chat commands report the serving microVM and the model it is really running |
+| **Operations** | how it gets deployed and torn down | CDK for what CloudFormation covers, control-plane calls for the rest, both ordered by one `./deploy.sh` |
+
+Each layer is separable and the seams are deliberate: adding a tool server touches one row, adding a channel another. Two AgentCore primitives are **not** used: Browser (nothing here needs a headless one) and Evaluations (`CreateEvaluator` / online evaluation configs) — this repo verifies behaviour by measuring a real deployment, and has no automated quality harness. Nor is it production: single-tenant, no CI, removal policies that destroy data. Those trade-offs are stated where they are made, see [Notes & limitations](#notes--limitations).
 
 ## Architecture
 
 ```
-                                            ┌──────────── AgentCore Identity ────────────┐
-                                            │  Token Vault: stores / refreshes / returns │
-                                            │  THIS user's Lark token (3LO)              │
-                                            └───────────────────┬────────────────────────┘
-                                                                │ the user's own token
-  Lark    ──webhook──▶  Router Lambda  ──▶  Agent (AgentCore Runtime)  ──▶  Lark MCP server
-  bot chat              verify/decrypt      LangGraph + DynamoDB            acts AS the user
-     ▲                  resolve identity    fetches that user's token                │
-     │                                                                               ▼
-     └──────────────── the answer, posted when the turn finishes ───────────  Lark REST API
-                                                                        returns only what
-                                                                        THIS user can see
-
-  Every message resolves to lark:{open_id}. That identity picks the token, and Lark — not
-  our code — decides what the tools may reach.
-
-  Delivery is asynchronous: the agent accepts the turn, returns at once, and posts the answer
-  when it's ready. Real tasks outlast any request/response window, and cutting one off is
-  worse than waiting — the work has usually already succeeded.
-
-  First use needs consent: with no vaulted token the router posts a 点击授权 link, waits for
-  approval, and continues on its own, so the user never re-sends.
-
-  Two more entrypoints reach the same agent, the same thread and the same vaulted token:
-
-    Lark h5 page ──▶ Router /web/session ──▶ (JWT) ──▶ Runtime, AG-UI over SSE
-                     h5 code → open_id                 streams text and tool events
-
-    Peer agent   ──▶ A2A Runtime (:9000) ──▶ forwards the caller's bearer ──▶ agent Runtime
-
-  Neither carries authority of its own. The page's `actorId` and A2A's `actorId` are claims;
-  the agent checks them against the vaulted token's real owner before acting.
+                                        ┌──────────── AgentCore Identity ────────────┐
+                                        │  Token Vault: stores / refreshes / returns │
+                                        │  THIS user's Lark token (3LO)              │
+                                        └──────────────────┬─────────────────────────┘
+  Lark bot chat ──webhook──▶ Router Lambda                 │ the user's own token
+  Lark h5 page  ──h5 code──▶ (mints the JWT)               │
+  Peer agent    ──bearer───▶ A2A Runtime                   ▼
+                                  └──────▶  Agent (AgentCore Runtime)  ──▶  Lark MCP server
+                                            LangGraph + Bedrock             acts AS the user
+                                            DynamoDB checkpoints                    │
+                                              │          │                          ▼
+   the answer, when the turn finishes  ◀──────┘          │                   Lark REST API
+   (chat card · SSE · A2A reply)                         │            returns only what THIS
+                                                         ▼            user can see
+                                          Code Interpreter session
+                                          /mnt/workspace ← this user's S3 Files
 ```
+
+Three surfaces, one agent, one thread, one vaulted token per person. The `actorId` a page or a peer sends is a **claim**: the agent checks it against the vaulted token's real owner before acting, so naming somebody else yields a consent prompt rather than their data.
+
+Two behaviours worth knowing before reading the code. **Delivery is asynchronous** — the agent accepts the turn, returns at once, and posts the answer when it is ready, because a real task outlasts any request/response window and cutting one off is worse than waiting. **Consent is self-healing** — with no vaulted token the router posts a 点击授权 link, waits, and replays the original message once the grant lands, so the user never re-sends.
+
+Four layers ship switched off, because each adds cost or console work: web search (`WEB_SEARCH`), the web page (`WEBUI`), A2A (`A2A`), and code execution with its storage (`FILES_STORAGE`). The agent runs without any of them.
 
 See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop auth, and the consent-wait sequence; **[docs/agentcore-behavior.md](docs/agentcore-behavior.md)** for measured AgentCore Runtime/Gateway behavior (read this before debugging anything platform-level); **[docs/native-3lo-builtin-vendor.md](docs/native-3lo-builtin-vendor.md)** for the reusable recipe to give the agent access to *another* downstream system.
 
@@ -68,7 +59,7 @@ See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop 
 | `app.py`, `cdk.json` | CDK app (uv-managed deps). Deployment state goes to `.cdk-state.json`, not here |
 | `.env` | Deployment target (`PROFILE`/`REGION`/`MODEL_ID`) + Lark credentials — gitignored, read by every script |
 | `stacks/` | security, agentcore, router, shim, gateway, observability, plus storage and webui when their flags are on |
-| `agent/` | the agent container: HTTP contract + DynamoDB checkpoints + per-user 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers into a card (`lark_notify`). `agui.py` serves the browser off the same Runtime; `a2a_server.py` is a second entrypoint on the same image (`SERVER_MODE=a2a`) |
+| `agent/` | the agent container: HTTP contract + DynamoDB checkpoints + per-user 3LO (`lark_3lo`) + MCP clients for the lark-cli server and, optionally, web search (`websearch`); runs turns in the background and streams answers into a card (`lark_notify`). `code_tools.py` runs generated code in a per-user sandbox; `agui.py` serves the browser off the same Runtime; `a2a_server.py` is a second entrypoint on the same image (`SERVER_MODE=a2a`) |
 | `webui/` | the web chat page — one static file, no build step; deploy-time values arrive as `config.js` |
 | `lambda/router/` | Lark webhook: verify/decrypt/tenant-token/send + 3LO consent-wait + the chat commands. Also the only component that mints per-user JWTs (`cognito.py`) |
 | `lambda/shim/` | Lark OAuth RFC-6749 façade + 3LO return endpoint (`CompleteResourceTokenAuth`, then DMs the user) |
@@ -212,20 +203,16 @@ Send these to the bot instead of a question — in Lark chat or on the web page,
 | Command | What it does |
 |---|---|
 | `/auth` | Authorization status per IdP — one OAuth provider per downstream system |
-| `/auth <idp>` | Authorize (or re-authorize) that IdP; always starts a fresh 3LO flow, so it is idempotent |
-| `/status` | Identity, session routing key, the microVM serving it (id + age + how long it has served this session), the model that microVM actually calls, checkpoint thread id, turns + tool calls, last activity |
+| `/auth <idp>` | Authorize or re-authorize that IdP; always starts a fresh 3LO flow, so it is idempotent |
+| `/status` | Identity, both session ids, the microVM serving you (id + age + how long it has served this session), the model that microVM actually calls, turns and tool calls, last activity |
 | `/new` | New thread **and** new runtime instance — a fully fresh start |
 | `/reset` | New thread, same runtime instance — history starts over, old state kept |
 | `/clear` | Actually delete this thread's checkpoints (unlike `/reset`, which just stops reading them) |
 | `/reconnect` | New runtime instance, same thread — shows that the conversation outlives the container |
 
-The three session commands exist because **the runtime session and the checkpoint thread are independent ids**: the first decides which microVM serves you, the second decides which conversation history the agent reads. The router owns both (DynamoDB `SESSION` / `MEMSESSION` items) and rotates them in the three meaningful combinations — rotating is just "switch to a new id", so all of them are instant. `/clear` is the only one that deletes data.
+The three session commands exist because **the runtime session and the checkpoint thread are independent ids**: one decides which microVM serves you, the other which history the agent reads. Rotating either is instant; `/clear` is the only command that deletes anything. Authorization is a third, orthogonal dimension — the vaulted token is keyed to `lark:{open_id}`, not to a session, so `/new` never costs a re-consent.
 
-`/status` is written for developers evaluating AgentCore rather than for end users, so it deliberately exposes the compute layer: the session id is a routing key that outlives any one microVM, and AgentCore replaces the microVM underneath it on idle or lifetime limits without the id changing. Showing the microVM's own id alongside two durations — its age, and how long it has served this session — makes that turnover visible. Both are in seconds so they can be compared directly: equal values mean this microVM started for you, a much larger age means an existing one took over. The model line comes from that same probe — the container reports what it calls Bedrock with, because `UpdateAgentRuntime` replaces the environment wholesale and the router's own config can name a model nobody is using. See `docs/agentcore-behavior.md` for how these are obtained and, more importantly, which seemingly obvious signals are *not* trustworthy.
-
-The commands are answered by `run_command`, which returns text rather than sending it, so both surfaces get the same diagnostics from one implementation. They stay on the **router** even for the web page (`POST /web/command`): they rotate session ids the router owns and read the identity table, which the agent has no access to by design. The page establishes identity with a fresh h5 code per command rather than reusing its Runtime token.
-
-Authorization is a third, orthogonal dimension: the vaulted Lark token is keyed to `lark:{open_id}`, not to any session — so `/new` does **not** require re-authorizing. Token Vault refreshes the access token automatically; users only re-authorize if the refresh chain lapses, they revoke access in Lark, or the provider is recreated.
+`/status` is for developers evaluating AgentCore, so it deliberately exposes the compute layer: the microVM's own id and two durations, both in seconds so they can be subtracted (equal means it started for you; a much larger age means an existing one took over). The model line comes from that same probe — the container reports what it actually calls Bedrock with, because the router's config can name a model nobody is using. Which signals here are *not* trustworthy, and why, is in [docs/agentcore-behavior.md](docs/agentcore-behavior.md).
 
 ## Extending the agent
 
@@ -239,16 +226,6 @@ The four extension points that need no new plumbing:
 | A different system prompt | `AGENT_SYSTEM_PROMPT` on the agent Runtime. Note the deploy script does not set it today, so the default in `agent/agent_core.py` applies until you pass it through `scripts/provision.sh` |
 
 Two structural constraints shape anything larger. **One Runtime per MCP server** — `protocolConfiguration.serverProtocol` is a single value and a container exposes one MCP endpoint, so tools are grouped by trust boundary rather than packed together, which is why `lark-cli` (acts as the user) and `approval` (acts as the app) are separate servers. And **a Runtime-hosted MCP server cannot receive a per-user token from the Gateway**, so the agent fetches tokens itself and passes them in a custom header; a tool server on an addressable HTTPS endpoint could use the managed Gateway path instead. Both are explained in `docs/agentcore-behavior.md`.
-
-## Roadmap
-
-Not implemented yet — listed so the current shape isn't mistaken for the intended one. Directions, not commitments:
-
-- **A user-facing document tool.** "Save this as a doc" should create a docx in the user's own Lark Drive, where they can open and share it — the scopes and the raw API passthrough already allow it, but no named tool exposes it, so the model has to assemble the call itself. The S3 layer below is for artifacts the user never sees; it is not where a deliverable belongs.
-- **More interaction surfaces.** Three exist (Lark chat, the web page, A2A) and the router's identity resolution is deliberately channel-shaped (`resolve_user(channel, channel_user_id)`), so a fourth needs no rework. What no surface does yet is let a user act on the answer — the web page renders tool calls but offers no way to approve, edit or re-run one, which is what AG-UI's `tools`/`state` fields are for.
-- **A broader tool set.** `mcp-servers/lark-cli/` exposes three tools — whoami, list-my-docs, and a raw Lark API passthrough — chosen to prove per-user access end to end, not to be complete.
-- **More downstream systems.** One OAuth provider per system is already the model; nothing but a provider and an `IDP_REGISTRY` entry is missing for the second one.
-- **Richer Lark interaction.** Interactive cards are used for output streaming only; card callbacks, files and images are unhandled beyond image download scope.
 
 ## Test
 
@@ -295,11 +272,11 @@ This is a **reference implementation, not production-ready as-is**. Before any r
 
 ### Notes & limitations
 
-- **Answers arrive asynchronously.** A turn that researches a topic and writes a document takes longer than any request/response window allows — `InvokeAgentRuntime` and the router's Lambda both cap out, and a turn cut off mid-way is the worst outcome, because the work often completed while the user was told it failed. So the agent accepts the work, returns immediately, and types the answer into a CardKit streaming card as it is produced — a placeholder appears at once (the first token takes several seconds: session assembly, MCP handshake, model latency), then fills in. If CardKit is unavailable the answer is posted as plain text instead, so it is never lost. Its `/ping` reports `HealthyBusy` while a turn is running, which defers *idle* reclamation (`idleRuntimeSessionTimeout`, a session-inactivity timer). It does **not** defer `maxLifetime` — the microVM's wall-clock age cap (default 8 h, configurable) that never resets — so that is the hard ceiling on a single background turn. Consent is the exception and stays synchronous, since the router drives the wait-and-retry loop around it.
+- **A background turn has a hard ceiling of `maxLifetime`.** `/ping` reports `HealthyBusy` while a turn runs, which defers *idle* reclamation (`idleRuntimeSessionTimeout`) but **not** `maxLifetime` — the microVM's wall-clock age cap (default 8 h) that never resets. The first token takes several seconds (session assembly, MCP handshake, model latency), which is what the CardKit placeholder covers; if CardKit is unavailable the answer is posted as plain text rather than lost. Consent is the one synchronous exception, since the router drives the wait-and-retry loop around it.
 - **Consent-wait is time-bounded.** On first use the router posts the consent link, then holds and polls the vault up to `AUTH_WAIT_SECONDS` (45s) before falling back to "re-send after approving". A user who takes longer than that to approve just re-sends once; the token is already vaulted by then.
-- **The web page and A2A add no authority.** The page proves identity with a single-use h5 code, and A2A forwards the caller's own bearer — neither can name a user it cannot already speak for, because the agent checks the claimed actor against the vaulted token's owner. A2A in particular runs no turn of its own: a vaulted consent is scoped to the Runtime that obtained it (measured), so it can only forward to the agent Runtime.
+- **A2A runs no turn of its own.** A vaulted consent is scoped to the Runtime that obtained it (measured — the same user, provider and scopes read as "never consented" from a second Runtime), so the A2A adapter can only forward to the agent Runtime.
 - **3LO is agent-side, not Gateway-mediated — because the topology requires it.** A tool server hosted on AgentCore Runtime cannot be handed a per-user token by the Gateway: `/invocations` owns the `Authorization` header for its own transport auth. So the agent fetches each user's token and passes it in a custom header. Measured evidence in `docs/agentcore-behavior.md`.
-- **One Runtime per MCP server.** `protocolConfiguration.serverProtocol` is a single value and a container exposes one MCP endpoint, so each server under `mcp-servers/` gets its own Runtime — the agent's is a third. All are built via CodeBuild (ARM64) and created out-of-band by the CLI. Each server declares its own build/runtime config in `runtime.env`, including an optional gate so it is skipped when unconfigured.
+- **One Runtime per MCP server, because `serverProtocol` is a single value.** Each server under `mcp-servers/` declares its own build and runtime config in `runtime.env` — including a gate that skips it when unconfigured — and is built via CodeBuild (ARM64) out-of-band from CDK.
 - **A new image doesn't reach existing users by itself.** AgentCore keeps serving stored sessions from the old container, so `./deploy.sh runtime` drops the saved session ids — the next message lands on the new version.
 - **`/status` counts turns, not messages.** A turn is an answer actually delivered (an `AIMessage` with no pending `tool_calls`), and tool calls are reported beside it rather than folded in. The count is exact — it decodes the latest checkpoint, unlike the paged event walk it replaces — but it describes only what is *in* the checkpoint: after summarization the trimmed turns are gone from it, by design.
 - **Token Vault exposes no metadata.** `GetResourceOauth2Token` returns just the token (or a consent URL) — no issued-at, expiry, or granted scopes — so `/auth` reports presence only.

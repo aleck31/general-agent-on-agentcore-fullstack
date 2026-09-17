@@ -4,18 +4,7 @@ A general-purpose agent on Amazon Bedrock AgentCore, integrated with **Lark (Fei
 
 > **The Lark identity integration is documented in depth elsewhere, not here.** Two samples cover exactly that subject — [sample-lark-identity-on-agentcore-native](https://github.com/aws-samples/sample-lark-identity-on-agentcore-native) (the native Token Vault path this repo uses) and [sample-lark-identity-on-agentcore-interceptor](https://github.com/aws-samples/sample-lark-identity-on-agentcore-interceptor) (same guarantees via a Gateway Request Interceptor and self-managed vaulting). Go there for the per-hop reasoning, the measured 3LO findings, the permission matrices and the full OAuth dance. [Identity, in brief](#identity-in-brief) below carries only what you need to work on *this* codebase.
 
-## The layers
-
-| Layer | What it decides | Where |
-|---|---|---|
-| **Channel** | how a user reaches the agent and how answers get back | `lambda/router/`, `agent/lark_notify.py` |
-| **Identity** | who this turn is, and whose credentials the tools may use | `lambda/router/cognito.py`, `agent/lark_3lo.py`, `lambda/shim/` |
-| **Reasoning** | the model, the system prompt, the turn loop | `agent/agent_core.py` — LangGraph (`langchain.agents.create_agent`) on `ChatBedrockConverse` |
-| **Memory** | what the agent remembers, and for how long | DynamoDB checkpoints (conversation) + AgentCore Memory (long-term); thread id owned by the router |
-| **Tools** | what the agent can actually do, and as whom | `mcp-servers/*` (one Runtime each), plus the Web Search Gateway |
-| **Files** | what survives the microVM, and whose it is | `stacks/storage_stack.py` (optional) |
-
-Each layer is separable, and the seams are deliberate: adding a tool server touches only the last row, adding a channel only the first. `README.md → Extending the agent` lists what each addition actually costs.
+The ten layers this is built from, and what each is implemented with, are in [README.md → What we build](../README.md#what-we-build). This document is the other half: how a message becomes a turn, what each hop is authorised with, and why the awkward parts are shaped the way they are.
 
 ## The whole system
 
@@ -187,6 +176,8 @@ S3 (write-through, asynchronous)
 **Isolation is the platform's boundary, not our code's.** `filesystemConfigurations` is accepted per **session**, so one shared Code Interpreter serves every user while each session mounts only that user's Access Point — measured: a session mounting user B's Access Point sees an empty directory while user A's files exist, and the Access Point's root is the top of the visible tree. The Access Point's `rootDirectory` is fixed server-side to `/users/lark_<open_id>`, and the file system's own resource policy refuses any mount that names no Access Point. The agent's execution role has no S3 permission on the bucket at all.
 
 What that leaves as the one thing to get right is **which Access Point a session mounts** — a bug there is a cross-user leak, and no amount of platform isolation helps. It is the same trust shape as the broker this replaced, with far fewer moving parts: no signed ticket, no vended credentials, no `credential_process`, no watchdog.
+
+**What the model sees is a working directory, not a mount.** Three tools — `run_code`, `run_command`, `list_files` — and every call is prefixed with a `cd` into the workspace, because the sandbox's own working directory is elsewhere and anything written there dies with the session. The tools take no path outside the workspace and no actor id: which Access Point gets mounted is decided from the turn's verified identity, never from an argument. The session starts lazily, on the first tool call rather than while the tool list is built, and is stopped when the cached session is discarded — a code session left running is billed until it times out.
 
 **Known edges.** `mountPath` must match `/mnt/[a-zA-Z0-9._-]+/?`, so the path is `/mnt/workspace` rather than a friendlier `/workspace`. Write-through to S3 is asynchronous (~40 s measured for a small file), so reading an artifact out of the bucket needs a retry while reading it back through the sandbox does not. `readFiles`/`writeFiles` are scoped to the sandbox's own workspace and cannot touch the mount — use `executeCommand`/`executeCode`. Access Points are limited (EFS allows 1000 per file system; s3files assumed similar, unconfirmed), which bounds the user count. `/clear` deletes conversation state, never files. Measured details in `docs/agentcore-behavior.md`, decisions in `.dev/adr/0007`.
 

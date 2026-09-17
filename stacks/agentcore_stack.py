@@ -225,7 +225,9 @@ class AgentCoreStack(Stack):
                          "bedrock-agentcore:InvokeCodeInterpreter",
                          "bedrock-agentcore:GetCodeInterpreterSession",
                          "bedrock-agentcore:StopCodeInterpreterSession"],
-                resources=[f"arn:aws:bedrock-agentcore:{region}:{account}:*code-interpreter*/{prefix}_*"],
+                # rt_prefix, not prefix: AgentCore resource names use underscores, so the
+                # hyphenated form matches nothing and every call is AccessDenied.
+                resources=[f"arn:aws:bedrock-agentcore:{region}:{account}:*code-interpreter*/{rt_prefix}_*"],
             )
         )
         self.execution_role.add_to_policy(

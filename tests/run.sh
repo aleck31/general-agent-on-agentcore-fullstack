@@ -17,6 +17,13 @@ uv run --with boto3 --with aiohttp --with httpx --with pytest \
        --with langchain-mcp-adapters --with langgraph-checkpoint-aws \
        python -m pytest agent/test_agent.py -q
 
+echo "== code tools =="
+# Needs the agent's stack because it asserts against agent_core's session teardown.
+uv run --with boto3 --with aiohttp --with httpx --with pytest \
+       --with langchain --with langchain-aws --with langgraph \
+       --with langchain-mcp-adapters --with langgraph-checkpoint-aws \
+       python -m pytest agent/test_code_tools.py -q
+
 echo "== a2a adapter =="
 # No a2a SDK: everything worth asserting sits outside build_app, which imports it lazily.
 uv run --with boto3 --with pytest python -m pytest agent/test_a2a.py -q

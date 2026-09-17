@@ -49,6 +49,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.sessions import create_session
 from langchain_mcp_adapters.tools import load_mcp_tools
 
+import code_tools
 import lark_3lo
 import lark_notify
 import memory_tools
@@ -358,6 +359,15 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
             log.exception("web search unavailable for %s", actor_id)
 
     tools += _long_term_tools(actor_id)
+
+    # Code execution, when an interpreter is deployed. The sandbox is created here rather
+    # than per call so one conversation keeps one workspace session — and it is kept on the
+    # cached entry so _close_session can stop it. Nothing is started yet: the session only
+    # begins when the model first runs something.
+    sandbox = code_tools._Sandbox(actor_id) if code_tools.available() else None
+    if sandbox is not None:
+        tools += code_tools.tools_for(actor_id, sandbox)
+
     saver = _checkpointer()
     # langchain.agents.create_agent, not langgraph.prebuilt.create_react_agent: the
     # latter is deprecated as of LangGraph 1.0 and slated for removal in 2.0 (AWS's
@@ -381,7 +391,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     except Exception:  # noqa: BLE001 — a failed repair must not cost the user a session
         log.warning("could not check for an interrupted turn", exc_info=True)
     return {
-        "graph": graph, "stack": stack,
+        "graph": graph, "stack": stack, "sandbox": sandbox,
         "config": config,
         "actor_id": actor_id, "mem_sid": mem_sid,
         "created": time.time(),
@@ -397,8 +407,11 @@ def _build_session(actor_id: str, email: str, mem_sid: str,
 
 
 def _close_session(s: dict) -> None:
-    """Release every MCP session this cached entry holds. Best-effort: a connection
-    that is already gone must not stop us discarding the entry."""
+    """Release everything this cached entry holds. Best-effort: a connection that is
+    already gone must not stop us discarding the entry."""
+    sandbox = s.get("sandbox")
+    if sandbox is not None:
+        sandbox.close()   # a code session left running is billed until it times out
     stack = s.get("stack")
     if stack is None:
         return
