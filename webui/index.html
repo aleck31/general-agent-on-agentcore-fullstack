@@ -2,12 +2,13 @@
 <!--
   Web chat for the agent, served as one static file.
 
-  Two hops, and the split is the point:
+  Three destinations, and the split is the point:
     1. POST {code} to the router's /web/session — the code comes from Lark's h5 SDK, so the
        router can establish who is asking rather than be told. It answers with a user JWT.
     2. POST an AG-UI RunAgentInput straight to the AgentCore Runtime with that JWT, and read
-       the answer as an SSE stream. No backend sits in this hop: the Runtime's endpoint
-       answers CORS itself and streams through.
+       the answer as an SSE stream. No backend sits in this hop.
+    3. A /command goes to the router's /web/command instead: those rotate session ids the
+       router owns, and the agent cannot reach the identity table at all.
 
   The page never sends an open_id or a thread id — the agent derives both. See
   docs/architecture.md.
@@ -19,9 +20,16 @@
 <title>Agent</title>
 <!-- Deploy-time values (router URL, Lark app id); written by the WebUI stack. -->
 <script src="config.js"></script>
-<script src="https://lf1-cdn-tos.bytegoofy.com/goofy/locality/openplatform/h5sdk/1.5.22/h5sdk.js"></script>
+<!-- This exact path, not the /goofy/locality/openplatform/ one — that 404s, so h5sdk never
+     defines itself and every failure presents as "not in the Lark client". -->
+<script src="https://lf1-cdn-tos.bytegoofy.com/goofy/lark/op/h5-js-sdk-1.5.34.js"></script>
+<!-- Model output is markdown. Sanitised because a tool result is untrusted input that
+     reaches this page through the model. -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 <style>
-  :root { color-scheme: light dark; --edge: color-mix(in oklab, currentColor 14%, transparent); }
+  :root { color-scheme: light dark; --edge: color-mix(in oklab, currentColor 14%, transparent);
+          --accent: #2563eb; --me-bg: #d2e4ff; --me-fg: #10233d; }
   * { box-sizing: border-box; }
   body { margin: 0; font: 15px/1.6 -apple-system, "Segoe UI", "PingFang SC", sans-serif;
          display: flex; flex-direction: column; height: 100vh; }
@@ -29,40 +37,103 @@
            display: flex; gap: .6rem; align-items: baseline; }
   header small { font-weight: 400; opacity: .6; }
   #log { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: .8rem; }
-  .msg { max-width: 46rem; padding: .6rem .85rem; border-radius: .8rem; white-space: pre-wrap;
-         overflow-wrap: anywhere; }
-  .me { align-self: flex-end; background: color-mix(in oklab, currentColor 12%, transparent); }
+  .msg { max-width: 46rem; padding: .6rem .85rem; border-radius: .8rem; overflow-wrap: anywhere; }
+  /* Fixed colours, not a currentColor mix: in dark mode the mix inverts and the user's own
+     messages lose the tint that distinguishes them. */
+  .me { align-self: flex-end; background: var(--me-bg); color: var(--me-fg);
+        white-space: pre-wrap; }
   .bot { align-self: flex-start; border: 1px solid var(--edge); }
-  .tool { align-self: flex-start; font-size: 13px; opacity: .7; font-style: italic; }
-  .err { align-self: flex-start; color: #c0392b; }
-  form { display: flex; gap: .5rem; padding: .8rem 1rem; border-top: 1px solid var(--edge); }
-  input { flex: 1; padding: .6rem .8rem; border-radius: .6rem; border: 1px solid var(--edge);
-          background: transparent; color: inherit; font: inherit; }
+  /* Markdown inside a bubble: kill the block margins that would otherwise pad it out. */
+  .bot > :first-child { margin-top: 0; } .bot > :last-child { margin-bottom: 0; }
+  .bot pre { background: color-mix(in oklab, currentColor 8%, transparent); padding: .6rem;
+             border-radius: .4rem; overflow-x: auto; }
+  .bot code { font-size: 13px; }
+  .bot table { border-collapse: collapse; } .bot th, .bot td { border: 1px solid var(--edge); padding: .2rem .5rem; }
+  .msg img { max-width: 14rem; border-radius: .4rem; display: block; margin-top: .4rem; }
+  /* Command output: alignment and line breaks carry meaning, so preserve both. */
+  .cmd { align-self: flex-start; white-space: pre-wrap; font-size: 13px;
+         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+         background: color-mix(in oklab, currentColor 6%, transparent);
+         border: 1px solid var(--edge); }
+  .cmd a { color: var(--accent); }
+  .tool { align-self: flex-start; font-size: 13px; opacity: .75; border: 1px dashed var(--edge); }
+  .tool summary { cursor: pointer; font-style: italic; }
+  .tool pre { margin: .4rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere;
+              font-size: 12px; opacity: .85; }
+  .tool pre:empty { display: none; }
+  .think { align-self: flex-start; font-size: 13px; opacity: .55; font-style: italic;
+           white-space: pre-wrap; }
+  .err { align-self: flex-start; color: #c0392b; white-space: pre-wrap; }
+  form { display: flex; gap: .5rem; padding: .8rem 1rem; border-top: 1px solid var(--edge);
+         align-items: center; }
+  input[type=text] { flex: 1; padding: .6rem .8rem; border-radius: .6rem;
+                     border: 1px solid var(--edge); background: transparent; color: inherit;
+                     font: inherit; min-width: 0; }
+  /* Explicit colours, not `currentColor`/`Canvas`: the system-colour keyword is unsupported
+     in older webviews, which renders the label in the button's own colour — invisible. */
   button { padding: .6rem 1.1rem; border-radius: .6rem; border: 0; font: inherit;
-           background: currentColor; color: Canvas; cursor: pointer; }
+           background: var(--accent); color: #fff; cursor: pointer; white-space: nowrap; }
+  button.ghost { background: transparent; color: inherit; border: 1px solid var(--edge);
+                 padding: .5rem .7rem; font-size: 17px; line-height: 1; }
   button[disabled] { opacity: .45; cursor: default; }
+  #pending { padding: 0 1rem; font-size: 13px; opacity: .7; display: none; align-items: center;
+             gap: .5rem; }
+  #pending img { max-height: 2.4rem; border-radius: .3rem; }
 </style>
 </head>
 <body>
 <header>Agent <small id="who">connecting…</small></header>
 <div id="log"></div>
-<form id="f"><input id="q" placeholder="说点什么…" autocomplete="off" disabled>
-  <button id="send" disabled>发送</button></form>
+<div id="pending"></div>
+<form id="f">
+  <button type="button" id="attach" class="ghost" title="发送图片" disabled>＋</button>
+  <input type="file" id="file" accept="image/*" hidden>
+  <input type="text" id="q" placeholder="说点什么…（/help 查看命令）" autocomplete="off" disabled>
+  <button id="send" disabled>发送</button>
+</form>
 
 <script>
 const log = document.getElementById('log');
+const $ = (id) => document.getElementById(id);
+
 const say = (cls, text) => {
   const el = document.createElement('div');
   el.className = 'msg ' + cls; el.textContent = text;
   log.append(el); log.scrollTop = log.scrollHeight; return el;
 };
 
+// Markdown is re-rendered from the accumulated source on every delta: parsing a partial
+// stream incrementally would produce broken trees mid-token. `breaks` because a chat
+// message's single newline is a line break, not the paragraph continuation markdown assumes.
+const md = (raw) => (window.marked && window.DOMPurify)
+  ? DOMPurify.sanitize(marked.parse(raw, {breaks: true, gfm: true})) : null;
+
+function sayMarkdown(raw) {
+  const el = say('bot', '');
+  el.dataset.md = '';
+  paintMarkdown(el, raw || '');
+  return el;
+}
+
+function paintMarkdown(el, raw) {
+  el.dataset.md = raw;
+  const html = md(raw);
+  if (html === null) { el.style.whiteSpace = 'pre-wrap'; el.textContent = raw; }
+  else el.innerHTML = html;
+  log.scrollTop = log.scrollHeight;
+}
+
 // The router's base URL is injected at deploy time so the page needs no build step.
 const ROUTER = window.ROUTER_BASE || '';
 let session = null;
 
+const enableInput = (on) => {
+  for (const id of ['q', 'send', 'attach']) $(id).disabled = !on;
+};
+
 async function connect() {
   try {
+    $('who').textContent = '正在识别身份…';
     const code = await larkAuthCode();
     const r = await fetch(ROUTER + '/web/session', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -70,23 +141,33 @@ async function connect() {
     });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
     session = await r.json();
-    document.getElementById('who').textContent = '已连接';
-    document.getElementById('q').disabled = false;
-    document.getElementById('send').disabled = false;
+    // Input stays disabled until the transcript has landed: a message sent mid-restore
+    // would be appended first and then have the older history arrive above it.
+    await restore();
+    $('who').textContent = '已连接';
+    enableInput(true);
+    $('q').focus();
   } catch (e) {
-    document.getElementById('who').textContent = '未连接';
-    say('err', '无法建立会话：' + e.message + '\n（这个页面需要在 Lark 客户端内打开）');
+    $('who').textContent = '未连接';
+    say('err', '无法建立会话：' + e.message);
   }
 }
 
 // Lark's h5 SDK hands out a single-use code; that is the whole identity step.
+// The two globals fail for different reasons and must be reported apart: h5sdk comes from
+// the script above (a bad URL and it is simply absent), tt is injected by the client.
 function larkAuthCode() {
   return new Promise((resolve, reject) => {
-    if (!window.h5sdk || !window.tt) return reject(new Error('不在 Lark 客户端内'));
+    if (!window.h5sdk) return reject(new Error('h5sdk 未加载（CDN 脚本没取到）'));
+    if (!window.tt) return reject(new Error('不在 Lark 客户端内'));
+    window.h5sdk.error((err) => reject(new Error('h5sdk: ' + JSON.stringify(err))));
     window.h5sdk.ready(() => window.tt.requestAuthCode({
       appId: window.LARK_APP_ID,
       success: (res) => resolve(res.code),
-      fail: (err) => reject(new Error('requestAuthCode: ' + JSON.stringify(err))),
+      // Lark matches the request against the app's Redirect URLs by exact page URL, so
+      // error 10236 is unreadable without knowing which URL the client actually loaded.
+      fail: (err) => reject(new Error('requestAuthCode: ' + JSON.stringify(err)
+                                     + '\n当前页面：' + location.href)),
     }));
   });
 }
@@ -95,22 +176,95 @@ const uuid = () => crypto.randomUUID();
 // One runtime session id per page load: it decides which microVM serves this tab.
 const runtimeSession = 'web-' + uuid() + uuid().slice(0, 8);
 
-async function ask(text) {
-  const url = `https://bedrock-agentcore.${session.region}.amazonaws.com/runtimes/`
-            + `${encodeURIComponent(session.runtimeArn)}/invocations`
-            + `?qualifier=${encodeURIComponent(session.qualifier)}`;
+const runtimeUrl = () =>
+  `https://bedrock-agentcore.${session.region}.amazonaws.com/runtimes/`
+  + `${encodeURIComponent(session.runtimeArn)}/invocations`
+  + `?qualifier=${encodeURIComponent(session.qualifier)}`;
+
+const runtimeHeaders = (accept) => ({
+  'Content-Type': 'application/json', 'Accept': accept,
+  'Authorization': 'Bearer ' + session.token,
+  'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id': runtimeSession,
+});
+
+// A reload shows what the agent remembers, read back from the checkpoint — not a copy this
+// tab was keeping. After summarisation or /clear the two would disagree, and the checkpoint
+// is the one that decides the next turn.
+async function restore() {
+  // This is the slowest step on a cold load — it builds the session (which verifies the
+  // actor and hands-shakes every MCP server), so it must say so rather than look hung.
+  $('who').textContent = '正在读取对话记录…';
+  const waiting = say('think', '正在读取对话记录…');
+  let data;
+  try {
+    const r = await fetch(runtimeUrl(), {
+      method: 'POST', headers: runtimeHeaders('application/json'),
+      body: JSON.stringify({action: 'transcript', actorId: session.actorId}),
+    });
+    data = await r.json();
+  } catch {
+    waiting.className = 'msg think';
+    waiting.textContent = '（读取对话记录失败，历史未显示，但对话可以继续）';
+    return;
+  } finally {
+    if (waiting.textContent === '正在读取对话记录…') waiting.remove();
+  }
+  const msgs = (data && data.messages) || [];
+  if (!msgs.length) return;
+  if (data.truncated) say('think', '（仅显示最近的对话）');
+  for (const m of msgs) {
+    if (m.role === 'user') say('me', m.content || '');
+    else if (m.role === 'assistant') sayMarkdown(m.content || '');
+    else if (m.role === 'toolCall') {
+      const t = toolCard(m.id || uuid());
+      t.name = m.name; t.args = m.args || ''; t.done = true; paintTool(t);
+    } else if (m.role === 'toolResult') {
+      const t = toolCard(m.id || uuid());
+      t.done = true; t.result = m.content || ''; paintTool(t);
+    }
+  }
+  tools.clear();   // a restored card must not be reused by the next live turn
+  bubble = null;
+}
+
+// A command needs a fresh code: the router establishes identity per request rather than
+// trusting a token the page holds.
+async function runCommand(command) {
+  const code = await larkAuthCode();
+  const r = await fetch(ROUTER + '/web/command', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({code, command}),
+  });
+  const body = await r.json().catch(() => ({}));
+  firstEventArrived();   // drop the placeholder before the answer, not after
+  if (!r.ok) throw new Error(body.error || r.status);
+  // Not markdown: this is aligned diagnostic output, where the runs of spaces and the line
+  // breaks are the formatting. The link is a real anchor rather than markdown for the same
+  // reason — nothing here is parsed.
+  // These change which thread the next turn reads, so the transcript on screen is no longer
+  // this conversation. Leaving it would show history the agent has stopped remembering.
+  if (/^\/(clear|reset|new)\b/.test(command)) { log.innerHTML = ''; tools.clear(); }
+  const el = say('cmd', body.text || '');
+  if (body.link) {
+    const a = document.createElement('a');
+    a.href = body.link.url; a.textContent = body.link.text; a.target = '_blank';
+    el.append(document.createElement('br'), a);
+  }
+}
+
+async function ask(content) {
   // Neither actorId nor threadId carries authority: the agent verifies the actor against
   // the vaulted token's real owner, and derives the thread from it.
-  const body = {actorId: session.actorId, threadId: 'web', runId: uuid(), messages: [{id: uuid(), role: 'user', content: text}],
+  const body = {actorId: session.actorId, threadId: 'web', runId: uuid(),
+                messages: [{id: uuid(), role: 'user', content}],
                 tools: [], context: [], state: {}, forwardedProps: {}};
-  const res = await fetch(url, {method: 'POST', body: JSON.stringify(body), headers: {
-    'Content-Type': 'application/json', 'Accept': 'text/event-stream',
-    'Authorization': 'Bearer ' + session.token,
-    'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id': runtimeSession,
-  }});
+  const res = await fetch(runtimeUrl(), {
+    method: 'POST', body: JSON.stringify(body),
+    headers: runtimeHeaders('text/event-stream'),
+  });
 
   const reader = res.body.getReader(), dec = new TextDecoder();
-  let buf = '', bubble = null;
+  let buf = '';
   for (;;) {
     const {done, value} = await reader.read();
     if (done) break;
@@ -120,24 +274,156 @@ async function ask(text) {
       const line = frame.split('\n').find(l => l.startsWith('data: '));
       if (!line) continue;
       let ev; try { ev = JSON.parse(line.slice(6)); } catch { continue; }
-      if (ev.type === 'TEXT_MESSAGE_START') bubble = say('bot', '');
-      else if (ev.type === 'TEXT_MESSAGE_CONTENT' && bubble) {
-        bubble.textContent += ev.delta || '';
-        log.scrollTop = log.scrollHeight;
-      } else if (ev.type === 'TOOL_CALL_START') say('tool', '· ' + (ev.toolCallName || 'tool'));
-      else if (ev.type === 'RUN_ERROR') say('err', ev.message || '出错了');
+      render(ev);
     }
   }
 }
 
-document.getElementById('f').addEventListener('submit', async (e) => {
+// Tool calls arrive as a lifecycle keyed by toolCallId, interleaved with everything else,
+// so each one needs its own element to grow into. Args stream as JSON fragments.
+const tools = new Map();
+let bubble = null, thinking = null, waitingForFirst = null;
+
+// Between submit and the first event there is real latency (session assembly, MCP
+// handshake, model). Cleared by whichever event arrives first.
+function firstEventArrived() {
+  if (waitingForFirst) { waitingForFirst.remove(); waitingForFirst = null; }
+}
+
+function toolCard(id) {
+  let t = tools.get(id);
+  if (!t) {
+    const el = document.createElement('details');
+    el.className = 'msg tool';
+    el.innerHTML = '<summary></summary><pre></pre>';
+    log.append(el); log.scrollTop = log.scrollHeight;
+    t = {el, name: '', args: '', done: false};
+    tools.set(id, t);
+  }
+  return t;
+}
+
+function paintTool(t) {
+  t.el.querySelector('summary').textContent =
+    (t.done ? '✓ ' : '· ') + (t.name || 'tool') + (t.done ? '' : ' …');
+  const body = [t.args && '入参 ' + t.args, t.result && '结果 ' + t.result]
+    .filter(Boolean).join('\n');
+  t.el.querySelector('pre').textContent = body;
+}
+
+function render(ev) {
+  if (ev.type !== 'RUN_STARTED') firstEventArrived();
+  switch (ev.type) {
+    case 'RUN_STARTED': tools.clear(); break;
+    // The stream ends by itself, so this only matters as the signal that it ended
+    // cleanly — a dropped connection looks identical without it.
+    case 'RUN_FINISHED': bubble = thinking = null; break;
+    case 'RUN_ERROR': say('err', ev.message || '出错了'); break;
+
+    case 'TEXT_MESSAGE_START': bubble = sayMarkdown(''); break;
+    case 'TEXT_MESSAGE_CONTENT':
+    case 'TEXT_MESSAGE_CHUNK':
+      if (!bubble) bubble = sayMarkdown('');
+      paintMarkdown(bubble, bubble.dataset.md + (ev.delta || ''));
+      break;
+    case 'TEXT_MESSAGE_END': bubble = null; break;
+
+    // Only produced when the model is asked for reasoning, which this deployment does
+    // not enable — handled so turning it on needs no page change.
+    case 'THINKING_START':
+    case 'REASONING_START':
+      thinking = say('think', ''); thinking.dataset.text = ''; break;
+    case 'THINKING_TEXT_MESSAGE_CONTENT':
+    case 'REASONING_MESSAGE_CONTENT':
+      if (thinking) {
+        thinking.dataset.text += ev.delta || '';
+        thinking.textContent = thinking.dataset.text;
+      }
+      break;
+    case 'THINKING_END':
+    case 'REASONING_END': thinking = null; break;
+
+    case 'TOOL_CALL_START': {
+      const t = toolCard(ev.toolCallId);
+      t.name = ev.toolCallName || ''; paintTool(t); break;
+    }
+    case 'TOOL_CALL_ARGS': {
+      const t = toolCard(ev.toolCallId);
+      t.args += ev.delta || ''; paintTool(t); break;
+    }
+    case 'TOOL_CALL_END': {
+      const t = toolCard(ev.toolCallId);
+      t.done = true; paintTool(t); break;
+    }
+    // The result is what proves a tool ran rather than the model narrating one.
+    case 'TOOL_CALL_RESULT': {
+      const t = toolCard(ev.toolCallId);
+      t.done = true;
+      t.result = (ev.content || '').slice(0, 2000);
+      paintTool(t); break;
+    }
+  }
+}
+
+// --- image attachment -------------------------------------------------------
+// Inlined as base64 in the AG-UI message rather than uploaded anywhere: no storage, no
+// second credential, and the turn stays a single request. 4 MB matches the Lark path.
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+let attached = null;
+
+$('attach').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', async () => {
+  const f = $('file').files[0];
+  $('file').value = '';
+  if (!f) return;
+  if (f.size > MAX_IMAGE_BYTES) return say('err', '图片超过 4 MB，换一张小一点的。');
+  const dataUrl = await new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result); r.onerror = () => rej(new Error('读取失败'));
+    r.readAsDataURL(f);
+  });
+  attached = {mimeType: f.type, value: dataUrl.split(',')[1], dataUrl};
+  showPending();
+});
+
+function showPending() {
+  const p = $('pending');
+  p.innerHTML = '';
+  if (!attached) { p.style.display = 'none'; return; }
+  p.style.display = 'flex';
+  const img = document.createElement('img'); img.src = attached.dataUrl;
+  const drop = document.createElement('button');
+  drop.type = 'button'; drop.className = 'ghost'; drop.textContent = '×';
+  drop.onclick = () => { attached = null; showPending(); };
+  p.append(img, document.createTextNode('已附图片'), drop);
+}
+
+$('f').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const q = document.getElementById('q'), btn = document.getElementById('send');
-  const text = q.value.trim(); if (!text || !session) return;
-  q.value = ''; say('me', text);
-  q.disabled = btn.disabled = true;
-  try { await ask(text); } catch (err) { say('err', String(err)); }
-  q.disabled = btn.disabled = false; q.focus();
+  const q = $('q'), btn = $('send');
+  const text = q.value.trim();
+  if ((!text && !attached) || !session) return;
+  q.value = '';
+
+  const mine = say('me', text);
+  if (attached) {
+    const img = document.createElement('img'); img.src = attached.dataUrl; mine.append(img);
+  }
+  const image = attached; attached = null; showPending();
+
+  enableInput(false);
+  const isCommand = text.startsWith('/') && !image;
+  waitingForFirst = say('think', isCommand ? '执行中…' : '思考中…');
+  try {
+    if (isCommand) await runCommand(text);
+    else await ask(image
+      ? [{type: 'text', text: text || '看看这张图。'},
+         {type: 'image', source: {type: 'data', value: image.value, mimeType: image.mimeType}}]
+      : text);
+  } catch (err) { say('err', String(err && err.message || err)); }
+  firstEventArrived();   // also the fallback for a turn that produced no events at all
+  enableInput(true);
+  q.focus();
 });
 
 connect();
