@@ -66,22 +66,21 @@ _RUNTIME_URL = (f"https://bedrock-agentcore.{AWS_REGION}.amazonaws.com/runtimes/
 
 # ------------------------------- invoke agent -------------------------------
 
-def thread_stats(session_id: str, user_id: str, actor_id: str, mem_sid: str) -> tuple[int, bool]:
-    """(messages, capped) for this thread, answered by the agent.
+def thread_stats(session_id: str, user_id: str, actor_id: str, mem_sid: str) -> dict:
+    """{turns, toolCalls} for this thread, answered by the agent, or {} when unknown.
 
     The conversation is LangGraph state in DynamoDB now, so counting it means decoding a
-    checkpoint — the agent owns that. `capped` is kept in the signature the callers already
-    use, but is always False: a checkpoint read is exact, unlike the paged ListEvents walk
-    this replaces, which gave up after a few pages."""
+    checkpoint — the agent owns that. A turn is an answer actually delivered, which is why
+    tool calls are reported separately rather than folded into the same number."""
     if not session_id:
-        return 0, False        # nothing has run yet, so there is nothing to count
+        return {}              # nothing has run yet, so there is nothing to count
     try:
         r = invoke_agent(session_id, user_id, actor_id, "", action="history_stats",
                          mem_sid=mem_sid)
     except Exception:  # noqa: BLE001 — /status must still render without the count
         logger.warning("thread_stats failed for %s", actor_id, exc_info=True)
-        return 0, False
-    return int(r.get("messages") or 0), False
+        return {}
+    return {} if r.get("unavailable") else r
 
 
 def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
@@ -162,7 +161,42 @@ def _app_identity() -> str:
 _PROBE_SECONDS = int(os.environ.get("STATUS_PROBE_SECONDS", "8"))
 
 
-def _microvm_line(session_id: str, user_id: str, actor_id: str) -> str:
+def probe_agent(session_id: str, user_id: str, actor_id: str) -> dict | None:
+    """Ask the container serving this session what it is. None when it didn't answer.
+
+    Separate from the formatting below because one probe answers several /status lines —
+    which microVM, and which model that microVM actually calls Bedrock with."""
+    if not session_id:
+        return None
+    for attempt in range(2):
+        try:
+            return invoke_agent(session_id, user_id, actor_id, "",
+                                action="status", budget=_PROBE_SECONDS)
+        except Exception as e:  # noqa: BLE001 — diagnostics must not fail the command
+            # A 409 RetryableConflictException means the service is mid-provision for
+            # this session; AWS documents a short backoff. Retried only here: the chat
+            # path deliberately disables retries so a timeout can't replay a turn.
+            retryable = "RetryableConflict" in type(e).__name__ or "409" in str(e)
+            if retryable and attempt == 0:
+                logger.info("microVM probe conflicted, retrying once")
+                time.sleep(1)
+                continue
+            logger.info("microVM probe failed for %s: %s", actor_id, type(e).__name__)
+            return None
+    return None
+
+
+def _model_line(data: dict | None) -> str:
+    """The model the serving container reports, not what the router is configured with —
+    UpdateAgentRuntime replaces the environment, so the two can disagree."""
+    model = (data or {}).get("model")
+    if not model:
+        return "—（探测未返回）"
+    ttl = (data or {}).get("cacheTtl")
+    return f"{model}（prompt cache {ttl}）" if ttl else f"{model}（prompt cache 关闭）"
+
+
+def _microvm_line(session_id: str, data: dict | None) -> str:
     """One line describing the microVM currently bound to this session id.
 
     AgentCore's terms: a session (keyed by runtimeSessionId) is served by a
@@ -175,23 +209,8 @@ def _microvm_line(session_id: str, user_id: str, actor_id: str) -> str:
     own id (agent/server.py:_INSTANCE)."""
     if not session_id:
         return "无（尚未建立会话）"
-    data = None
-    for attempt in range(2):
-        try:
-            data = invoke_agent(session_id, user_id, actor_id, "",
-                                action="status", budget=_PROBE_SECONDS)
-            break
-        except Exception as e:  # noqa: BLE001 — diagnostics must not fail the command
-            # A 409 RetryableConflictException means the service is mid-provision for
-            # this session; AWS documents a short backoff. Retried only here: the chat
-            # path deliberately disables retries so a timeout can't replay a turn.
-            retryable = "RetryableConflict" in type(e).__name__ or "409" in str(e)
-            if retryable and attempt == 0:
-                logger.info("microVM probe conflicted, retrying once")
-                time.sleep(1)
-                continue
-            logger.info("microVM probe failed for %s: %s", actor_id, type(e).__name__)
-            return "未知（探测未返回；下条消息仍会正常处理）"
+    if data is None:
+        return "未知（探测未返回；下条消息仍会正常处理）"
     inst = data.get("instance")
     if not inst:
         return "运行中（旧镜像，未上报实例信息）"
@@ -408,6 +427,121 @@ def process_approval_event(ev: dict, context=None) -> None:
     _dispatch_turn(user_id, actor_id, message, open_id, context=context)
 
 
+# ------------------------------- chat commands ------------------------------
+
+_HELP = "\n".join([
+    "可用命令：",
+    "  /auth        查看各 IdP 的授权状态",
+    "  /auth <idp>  对该 IdP 授权或重新授权",
+    "  /status      当前身份、会话与对话记录",
+    "  /new         开启新的对话（切换运行实例）",
+    "  /reset       重置对话记录（运行实例不变）",
+    "  /clear       清除对话记录（运行实例不变）",
+    "  /reconnect   切换运行实例（对话记录保留）",
+])
+
+
+def run_command(message: str, user_id: str, actor_id: str) -> dict | None:
+    """Run a chat command. `None` means this wasn't one, so it's a question for the agent.
+
+    Returns `{"text": …}`, plus `{"link": {"text", "url"}}` when the answer is a URL the
+    channel should make clickable. Channel-agnostic on purpose: the web page has the same
+    diagnostics as the Lark chat, and neither surface owns the logic."""
+    cmd = message.lower()
+    if cmd in ("/help", "/?"):
+        return {"text": _HELP}
+
+    # The runtime session (which microVM serves you) and the checkpoint thread (your
+    # conversation history) are independent ids, so each command rotates one or the other.
+    if cmd == "/reset":
+        mem_sid = identity.rotate_memory_session(user_id)
+        logger.info("memory session rotated for %s -> %s", actor_id, mem_sid)
+        return {"text": "已开始新的对话记录（运行实例不变）。"}
+
+    if cmd == "/new":
+        identity.drop_session(user_id)
+        mem_sid = identity.rotate_memory_session(user_id)
+        logger.info("runtime + memory session rotated for %s -> %s", actor_id, mem_sid)
+        return {"text": "已开启新会话：新的对话记录，且由新的运行实例处理。"}
+
+    # /clear actually deletes; /reset only stops reading.
+    if cmd == "/clear":
+        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
+        rt_sid = identity.get_or_create_session(user_id)
+        n = thread_stats(rt_sid, user_id, actor_id, mem_sid).get("turns", 0)
+        r = invoke_agent(rt_sid, user_id, actor_id, "", action="clear_history",
+                         mem_sid=mem_sid)
+        ok = bool(r.get("deleted"))
+        logger.info("history cleared for %s: deleted=%s (%d turns)", actor_id, ok, n)
+        return {"text": f"已删除对话记录（{n} 轮对话）。" if ok
+                        else "删除对话记录失败，请稍后再试。"}
+
+    # Demonstrates that the conversation outlives the container: the thread is addressed by
+    # user identity, not by which microVM served it.
+    if cmd == "/reconnect":
+        identity.drop_session(user_id)
+        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
+        n = thread_stats(identity.get_or_create_session(user_id),
+                         user_id, actor_id, mem_sid).get("turns", 0)
+        logger.info("runtime session dropped (memory kept) for %s", actor_id)
+        return {"text": f"已切换运行实例，对话记录保留（{n} 轮对话）"
+                        "——对话状态存放在 DynamoDB，不随容器生命周期消失。"}
+
+    # Authorization is per-IdP (one OAuth provider per downstream system). Bare /auth lists
+    # each IdP; /auth <idp> starts a fresh 3LO flow for one (idempotent — a new link each run).
+    if cmd == "/auth" or cmd.startswith("/auth "):
+        arg = message[5:].strip().lower()
+        if not arg:
+            lines = ["各 IdP 的授权状态："]
+            session_id = identity.get_or_create_session(user_id)
+            for key, idp in IDPS.items():
+                ok = user_authorized(session_id, user_id, actor_id, key)
+                lines.append(f"  {'✅' if ok else '❌'} {key} ({idp.get('label', key)})"
+                             f"{'' if ok else ' — 发送 /auth ' + key + ' 授权'}")
+            return {"text": "\n".join(lines)}
+        if arg not in IDPS:
+            return {"text": f"未知的 IdP：{arg}。可用：{', '.join(IDPS) or '（未配置）'}"}
+        session_id = identity.get_or_create_session(user_id)
+        result = invoke_agent(session_id, user_id, actor_id, arg, action="reauth")
+        auth_url = result.get("auth_url")
+        if not auth_url:
+            return {"text": result.get("reply") or result.get("error", "无法发起授权")}
+        label = IDPS[arg].get("label", arg)
+        logger.info("forced re-auth for %s (idp=%s)", actor_id, arg)
+        return {"text": f"请授权访问你的 {label} 账号：",
+                "link": {"text": "点击授权", "url": auth_url}}
+
+    # Read-only diagnostics over three independent dimensions: the session id that routes
+    # you, the container currently serving it, and the thread holding your history.
+    if cmd == "/status":
+        info = identity.session_info(user_id)
+        rt_sid = info.get("sessionId", "")
+        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
+        # Counting needs a runtime session, so with no routing key yet report it as
+        # unavailable rather than create one: a diagnostic must not cause what it reports.
+        stats = thread_stats(rt_sid, user_id, actor_id, mem_sid) if rt_sid else {}
+        probe = probe_agent(rt_sid, user_id, actor_id)
+        last = info.get("lastActivity", 0)
+        last_str = (datetime.datetime.fromtimestamp(last, datetime.timezone.utc)
+                    .strftime("%Y-%m-%d %H:%M UTC") if last else "—")
+        logger.info("status for %s: %s", actor_id, stats or "unknown")
+        return {"text": "\n".join([
+            f"应用身份：{_app_identity()}",
+            f"用户身份：{actor_id}",
+            f"会话路由键：{rt_sid or '尚未建立（发一条普通消息后创建）'}",
+            f"当前 microVM：{_microvm_line(rt_sid, probe)}",
+            f"模型：{_model_line(probe)}",
+            f"记忆线程：{mem_sid}",
+            (f"该线程对话：{stats['turns']} 轮"
+             f"（含 {stats['toolCalls']} 次工具调用）" if stats
+             else "该线程对话：—（发一条普通消息后可见）"),
+            f"最近活跃：{last_str}",
+            "授权状态：发送 /auth 查看",
+        ])}
+
+    return None
+
+
 # ------------------------------- async processing ---------------------------
 
 def process_lark_event(body: str, headers: dict, context=None) -> None:
@@ -480,118 +614,13 @@ def process_lark_event(body: str, headers: dict, context=None) -> None:
 
     agent_message = text.strip() or "hi"
 
-    cmd = agent_message.lower()
-    if cmd in ("/help", "/?"):
-        lark.send_message(chat_id, "\n".join([
-            "可用命令：",
-            "  /auth        查看各 IdP 的授权状态",
-            "  /auth <idp>  对该 IdP 授权或重新授权",
-            "  /status      当前身份、会话与对话记录",
-            "  /new         开启新的对话（切换运行实例）",
-            "  /reset       重置对话记录（运行实例不变）",
-            "  /clear       清除对话记录（运行实例不变）",
-            "  /reconnect   切换运行实例（对话记录保留）",
-        ]))
-        return
-    # The runtime session (which microVM serves you) and the Memory thread (your
-    # conversation history) are independent ids.
-    #
-    # /reset — same runtime instance, new Memory thread (history starts over).
-    if cmd == "/reset":
-        mem_sid = identity.rotate_memory_session(user_id)
-        logger.info("memory session rotated for %s -> %s", actor_id, mem_sid)
-        lark.send_message(chat_id, "已开始新的对话记录（运行实例不变）。")
-        return
-    # /new — new runtime instance AND new Memory thread: a fully fresh start.
-    if cmd == "/new":
-        identity.drop_session(user_id)
-        mem_sid = identity.rotate_memory_session(user_id)
-        logger.info("runtime + memory session rotated for %s -> %s", actor_id, mem_sid)
-        lark.send_message(chat_id, "已开启新会话：新的对话记录，且由新的运行实例处理。")
-        return
-    # /clear — actually delete this thread's events. Different from /reset, which
-    # just starts a new thread and leaves the old data in place.
-    if cmd == "/clear":
-        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
-        rt_sid = identity.get_or_create_session(user_id)
-        n, _ = thread_stats(rt_sid, user_id, actor_id, mem_sid)
-        r = invoke_agent(rt_sid, user_id, actor_id, "", action="clear_history",
-                         mem_sid=mem_sid)
-        ok = bool(r.get("deleted"))
-        logger.info("history cleared for %s: deleted=%s (%d messages)", actor_id, ok, n)
-        lark.send_message(chat_id, f"已删除对话记录（{n} 条消息）。" if ok
-                          else "删除对话记录失败，请稍后再试。")
-        return
-    # /reconnect — new runtime instance, same checkpoint thread. Demonstrates that the
-    # conversation outlives the container: a fresh microVM still remembers, because the
-    # thread is addressed by user identity, not by which microVM served it.
-    if cmd == "/reconnect":
-        identity.drop_session(user_id)
-        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
-        n, capped = thread_stats(identity.get_or_create_session(user_id),
-                                 user_id, actor_id, mem_sid)
-        logger.info("runtime session dropped (memory kept) for %s", actor_id)
-        lark.send_message(
-            chat_id, f"已切换运行实例，对话记录保留（{n}{'+' if capped else ''} 条）"
-                     "——对话状态存放在 DynamoDB，不随容器生命周期消失。")
-        return
-    # /auth [idp] — authorization is per-IdP (one OAuth provider per downstream
-    # system). Bare /auth lists each IdP's status; /auth <idp> starts a fresh 3LO
-    # flow for that one (idempotent — each run hands out a new consent link).
-    if cmd == "/auth" or cmd.startswith("/auth "):
-        arg = agent_message[5:].strip().lower()
-        if not arg:
-            lines = ["各 IdP 的授权状态："]
-            session_id = identity.get_or_create_session(user_id)
-            for key, idp in IDPS.items():
-                ok = user_authorized(session_id, user_id, actor_id, key)
-                lines.append(f"  {'✅' if ok else '❌'} {key} ({idp.get('label', key)})"
-                             f"{'' if ok else ' — 发送 /auth ' + key + ' 授权'}")
-            lark.send_message(chat_id, "\n".join(lines))
-            return
-        if arg not in IDPS:
-            lark.send_message(
-                chat_id, f"未知的 IdP：{arg}。可用：{', '.join(IDPS) or '（未配置）'}")
-            return
-        session_id = identity.get_or_create_session(user_id)
-        result = invoke_agent(session_id, user_id, actor_id, arg, action="reauth")
-        auth_url = result.get("auth_url")
-        if auth_url:
-            label = IDPS[arg].get("label", arg)
-            lark.send_link_message(
-                chat_id, f"请授权访问你的 {label} 账号：", "点击授权", auth_url)
-            logger.info("forced re-auth for %s (idp=%s)", actor_id, arg)
+    reply = run_command(agent_message, user_id, actor_id)
+    if reply is not None:
+        link = reply.get("link")
+        if link:
+            lark.send_link_message(chat_id, reply["text"], link["text"], link["url"])
         else:
-            lark.send_message(chat_id, result.get("reply") or result.get("error", "无法发起授权"))
-        return
-    # /status — read-only diagnostics over the three independent dimensions: the
-    # session id that routes you, the container currently serving that id, and the
-    # Memory thread holding your history.
-    if cmd == "/status":
-        info = identity.session_info(user_id)
-        rt_sid = info.get("sessionId", "")
-        mem_sid = identity.get_or_create_memory_session(user_id, actor_id)
-        # Counting means asking the agent, which needs a runtime session — so with no
-        # routing key yet, report the count as unavailable rather than create one. /status
-        # must not manufacture the very state it says is absent.
-        events, capped = thread_stats(rt_sid, user_id, actor_id, mem_sid) if rt_sid \
-            else (None, False)
-        last = info.get("lastActivity", 0)
-        last_str = (datetime.datetime.fromtimestamp(last, datetime.timezone.utc)
-                    .strftime("%Y-%m-%d %H:%M UTC") if last else "—")
-        lines = [
-            f"应用身份：{_app_identity()}",
-            f"用户身份：{actor_id}",
-            f"会话路由键：{rt_sid or '尚未建立（发一条普通消息后创建）'}",
-            f"当前 microVM：{_microvm_line(rt_sid, user_id, actor_id)}",
-            f"记忆线程：{mem_sid}",
-            (f"该线程对话记录：{events}{'+' if capped else ''} 条" if events is not None
-             else "该线程对话记录：—（发一条普通消息后可见）"),
-            f"最近活跃：{last_str}",
-            "授权状态：发送 /auth 查看",
-        ]
-        lark.send_message(chat_id, "\n".join(lines))
-        logger.info("status for %s: events=%s", actor_id, events)
+            lark.send_message(chat_id, reply["text"])
         return
 
     # If the user isn't authorized yet, a Lark tool this turn may hit an auth wall
@@ -664,20 +693,41 @@ def _resp(status: int, body: dict) -> dict:
             "body": json.dumps(body)}
 
 
-# The browser holds this for the token's lifetime, so keep it short: it is authority to act
-# as that user against the Runtime. Same authority a Lark turn already carries, now in a tab.
-_WEB_ALLOWED_ORIGINS = os.environ.get("WEB_ALLOWED_ORIGINS", "")
+# CORS lives on the HTTP API, not here: with it configured there, API Gateway answers the
+# preflight itself and ignores whatever CORS headers this integration returns.
+# The allowlisted origin is set in stacks/router_stack.py from web_origin.
 
 
-def _cors(origin: str) -> dict:
-    """CORS for the page's own origin only. The Runtime's endpoint answers `*` itself, but
-    this route hands out a credential, so it is allowlisted."""
-    allowed = [o.strip() for o in _WEB_ALLOWED_ORIGINS.split(",") if o.strip()]
-    if origin and origin in allowed:
-        return {"Access-Control-Allow-Origin": origin,
-                "Access-Control-Allow-Headers": "content-type",
-                "Access-Control-Allow-Methods": "POST,OPTIONS"}
-    return {}
+def _web_identity(payload: dict) -> tuple[str, str, dict | None]:
+    """(user_id, actor_id, error_response). A fresh h5 code each time, because that is what
+    makes the identity established rather than claimed."""
+    open_id = lark.open_id_from_auth_code(payload.get("code", ""))
+    if not open_id:
+        return "", "", _resp(401, {"error": "could not establish identity from that code"})
+    actor_id = f"lark:{open_id}"
+    user_id, _ = identity.resolve_user("lark", open_id)
+    if not user_id or not identity.is_user_allowed("lark", open_id):
+        logger.info("web request refused for %s (allowlist)", actor_id)
+        return "", actor_id, _resp(403, {"error": "not allowlisted"})
+    return user_id, actor_id, None
+
+
+def _web_command(body: str) -> dict:
+    """{code, command} -> {text, link?}. The chat commands, on the web surface.
+
+    The page cannot run these against the Runtime: they rotate router-owned session ids and
+    read the identity table, which the agent has no access to by design."""
+    try:
+        payload = json.loads(body or "{}")
+    except Exception:  # noqa: BLE001
+        return _resp(400, {"error": "invalid JSON"})
+    user_id, actor_id, err = _web_identity(payload)
+    if err:
+        return err
+    reply = run_command((payload.get("command") or "").strip(), user_id, actor_id)
+    if reply is None:
+        return _resp(400, {"error": "not a command"})
+    return _resp(200, reply)
 
 
 def _web_session(body: str) -> dict:
@@ -686,14 +736,9 @@ def _web_session(body: str) -> dict:
         payload = json.loads(body or "{}")
     except Exception:  # noqa: BLE001
         return _resp(400, {"error": "invalid JSON"})
-    open_id = lark.open_id_from_auth_code(payload.get("code", ""))
-    if not open_id:
-        return _resp(401, {"error": "could not establish identity from that code"})
-    actor_id = f"lark:{open_id}"
-    user_id, _ = identity.resolve_user("lark", open_id)
-    if not user_id or not identity.is_user_allowed("lark", open_id):
-        logger.info("web session refused for %s (allowlist)", actor_id)
-        return _resp(403, {"error": "not allowlisted"})
+    user_id, actor_id, err = _web_identity(payload)
+    if err:
+        return err
     logger.info("web session issued for %s", actor_id)
     return _resp(200, {
         "token": cognito.user_jwt(actor_id),
@@ -750,6 +795,11 @@ def handler(event, context):
     # the code is what makes the identity verified rather than claimed.
     if path.endswith("/web/session") and method == "POST":
         return _web_session(body)
+
+    # The chat commands, for the web surface. Router-side because they rotate ids the
+    # router owns; the agent cannot reach the identity table at all.
+    if path.endswith("/web/command") and method == "POST":
+        return _web_command(body)
 
     if not path.endswith("/webhook/lark"):
         return _resp(404, {"error": "not found"})

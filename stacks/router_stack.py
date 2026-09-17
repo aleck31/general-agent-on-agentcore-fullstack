@@ -118,8 +118,6 @@ class RouterStack(Stack):
                 "MOUNT_TICKET_KEY_ID": mount_ticket_key_arn,
                 "S3FILES_FS_ID": s3files_file_system_id,
                 "MOUNT_PATH": mount_path,
-                # Origins allowed to trade an h5 code for a JWT. Empty = no browser may.
-                "WEB_ALLOWED_ORIGINS": web_allowed_origins,
             },
             log_group=log_group,
         )
@@ -131,9 +129,17 @@ class RouterStack(Stack):
         self.router_fn.configure_async_invoke(retry_attempts=0)
 
         integration = apigwv2_integrations.HttpLambdaIntegration("Integration", handler=self.router_fn)
+        # The web page's /web/session call is a cross-origin JSON POST, so the browser sends
+        # a preflight first. Without this it 404s and the page reports only "Failed to fetch".
+        cors = apigwv2.CorsPreflightOptions(
+            allow_origins=[o.strip() for o in web_allowed_origins.split(",") if o.strip()],
+            allow_methods=[apigwv2.CorsHttpMethod.POST, apigwv2.CorsHttpMethod.OPTIONS],
+            allow_headers=["content-type"],
+        ) if web_allowed_origins else None
         self.http_api = apigwv2.HttpApi(
             self, "RouterApi", api_name=f"{prefix}-router",
             description="Lark webhook ingestion (explicit routes only)",
+            cors_preflight=cors,
         )
         self.http_api.add_routes(
             path="/webhook/lark", methods=[apigwv2.HttpMethod.POST], integration=integration,
@@ -144,6 +150,12 @@ class RouterStack(Stack):
         # The web entrypoint's identity step: an h5 authorization code in, a user JWT out.
         self.http_api.add_routes(
             path="/web/session", methods=[apigwv2.HttpMethod.POST],
+            integration=integration,
+        )
+        # Chat commands for the web page. Here rather than on the Runtime because they
+        # rotate session ids the router owns.
+        self.http_api.add_routes(
+            path="/web/command", methods=[apigwv2.HttpMethod.POST],
             integration=integration,
         )
 

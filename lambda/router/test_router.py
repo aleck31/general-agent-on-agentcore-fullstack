@@ -160,13 +160,14 @@ def test_memory_session_is_stable_then_rotates():
         assert identity.get_or_create_memory_session("u1", "lark:ou_x") == rotated
 
 
-# --- Message counting -----------------------------------------------------
-# Strands writes session/agent state events alongside the conversation, so a raw
-# event count reads far higher than the number of messages (5 for one exchange).
+# --- The status probe ------------------------------------------------------
+# One probe, several lines: probe_agent asks the serving container what it is, and the
+# _*_line helpers only format. They must never invoke anything themselves.
 def _microvm_line_with(response, session_id="ses_x"):
     import index
     with mock.patch.object(index, "invoke_agent", return_value=response) as inv:
-        return index._microvm_line(session_id, "user_1", "lark:ou_x"), inv
+        data = index.probe_agent(session_id, "user_1", "lark:ou_x")
+        return index._microvm_line(session_id, data), inv
 
 
 def test_microvm_line_reports_kernel_age_and_session_age():
@@ -196,7 +197,7 @@ def test_microvm_line_without_a_session_does_not_probe():
     """No session id means no microVM to ask about — and probing would create one."""
     import index
     with mock.patch.object(index, "invoke_agent") as inv:
-        line = index._microvm_line("", "user_1", "lark:ou_x")
+        line = index._microvm_line("", index.probe_agent("", "user_1", "lark:ou_x"))
     assert inv.call_count == 0
     assert "尚未建立会话" in line
 
@@ -220,7 +221,7 @@ def test_microvm_line_retries_a_provisioning_conflict():
 
     with mock.patch.object(index, "invoke_agent", side_effect=flaky), \
          mock.patch.object(index.time, "sleep"):
-        line = index._microvm_line("ses_x", "user_1", "lark:ou_x")
+        line = index._microvm_line("ses_x", index.probe_agent("ses_x", "user_1", "lark:ou_x"))
     assert len(calls) == 2
     assert "abc12345" in line
 
@@ -235,7 +236,7 @@ def test_microvm_line_gives_up_after_one_retry():
     with mock.patch.object(index, "invoke_agent",
                            side_effect=RetryableConflictException("busy")) as inv, \
          mock.patch.object(index.time, "sleep"):
-        line = index._microvm_line("ses_x", "user_1", "lark:ou_x")
+        line = index._microvm_line("ses_x", index.probe_agent("ses_x", "user_1", "lark:ou_x"))
     assert inv.call_count == 2
     assert "未知" in line
 
@@ -244,7 +245,7 @@ def test_microvm_line_survives_a_probe_failure():
     """Diagnostics must never break the command that carries them."""
     import index
     with mock.patch.object(index, "invoke_agent", side_effect=RuntimeError("timeout")):
-        line = index._microvm_line("ses_x", "user_1", "lark:ou_x")
+        line = index._microvm_line("ses_x", index.probe_agent("ses_x", "user_1", "lark:ou_x"))
     assert "未知" in line
 
 
@@ -252,6 +253,19 @@ def test_microvm_line_tolerates_an_older_image():
     """A microVM running a previous image reports no instance field."""
     line, _ = _microvm_line_with({"reply": "pong"})
     assert "旧镜像" in line
+
+
+def test_model_line_reports_what_the_container_says_not_the_routers_config():
+    """UpdateAgentRuntime replaces the environment, so the router's own MODEL_ID can name
+    a model nobody is calling. Only the serving container's answer is shown."""
+    import index
+    assert index._model_line({"model": "global.anthropic.claude-sonnet-5",
+                              "cacheTtl": "1h"}) == \
+        "global.anthropic.claude-sonnet-5（prompt cache 1h）"
+    assert "关闭" in index._model_line({"model": "m", "cacheTtl": ""})
+    # An older image reports no model, and a failed probe reports nothing at all.
+    assert "探测未返回" in index._model_line({"instance": "abc"})
+    assert "探测未返回" in index._model_line(None)
 
 
 def test_add_reaction_returns_id_and_never_raises():
@@ -595,15 +609,109 @@ def test_web_session_requires_a_lark_code_and_never_trusts_an_open_id():
     """The browser proves identity with a single-use code Lark issued to this app inside the
     Lark client. Accepting an open_id instead would let anyone name anyone."""
     import index, inspect
-    src = inspect.getsource(index._web_session)
+    src = inspect.getsource(index._web_identity) + inspect.getsource(index._web_session)
     assert "open_id_from_auth_code" in src
     assert 'payload.get("openId")' not in src and 'payload.get("open_id")' not in src
+
+
+def test_the_code_exchange_uses_the_v2_endpoint_and_app_credentials():
+    """v1 oidc/access_token is deprecated and took a tenant token; v2 takes client
+    credentials in the body and returns only a token, so open_id needs user_info."""
+    import io
+    import lark as larkmod
+    seen = []
+
+    def fake_urlopen(req, timeout=None):
+        seen.append((req.full_url, req.data, dict(req.headers)))
+        body = ({"access_token": "u-tok"} if "oauth/token" in req.full_url
+                else {"code": 0, "data": {"open_id": "ou_x"}})
+        return io.BytesIO(json.dumps(body).encode())
+
+    with mock.patch.object(larkmod, "get_credentials",
+                           return_value=("app", "secret", "", "")), \
+         mock.patch.object(larkmod.urllib.request, "urlopen",
+                           side_effect=lambda req, timeout=None:
+                           _ctx(fake_urlopen(req, timeout))):
+        assert larkmod.open_id_from_auth_code("c") == "ou_x"
+    assert "authen/v2/oauth/token" in seen[0][0]
+    assert b'"client_secret": "secret"' in seen[0][1]
+    assert "Authorization" not in seen[0][2]      # no tenant token on the redeem call
+    assert "authen/v1/user_info" in seen[1][0]
+    assert seen[1][2]["Authorization"] == "Bearer u-tok"
+
+
+class _ctx:
+    """urlopen is used as a context manager; wrap a plain BytesIO so the fake matches."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __enter__(self):
+        return self.inner
+
+    def __exit__(self, *a):
+        return False
 
 
 def test_web_session_refuses_an_unexchangeable_code():
     import index
     with mock.patch.object(index.lark, "open_id_from_auth_code", return_value=""):
         assert index._web_session('{"code": "bad"}')["statusCode"] == 401
+
+
+def test_run_command_returns_text_and_never_sends_it_itself():
+    """Channel-agnostic on purpose: the same commands answer in Lark and on the web page.
+    A branch that sent to Lark directly would work in chat and silently do nothing on the web."""
+    import index, inspect
+    src = inspect.getsource(index.run_command)
+    assert "lark.send" not in src
+    with mock.patch.object(index.lark, "send_message") as send:
+        assert "/status" in index.run_command("/help", "u1", "lark:ou_a")["text"]
+        assert index.run_command("你好", "u1", "lark:ou_a") is None   # not a command
+    assert send.call_count == 0
+
+
+def test_an_auth_link_travels_as_data_so_each_channel_renders_it_its_own_way():
+    """Lark wants a rich-text post; the web page wants markdown. Returning the URL keeps
+    that choice with the channel."""
+    import index, identity
+    with mock.patch.dict(index.IDPS, {"lark": {"label": "Lark"}}, clear=True), \
+         mock.patch.object(identity, "get_or_create_session", return_value="ses_x"), \
+         mock.patch.object(index, "invoke_agent", return_value={"auth_url": "https://c/x"}):
+        r = index.run_command("/auth lark", "u1", "lark:ou_a")
+    assert r["link"] == {"text": "点击授权", "url": "https://c/x"}
+
+
+def test_web_command_refuses_anything_that_is_not_a_command():
+    """The command endpoint must not become a second way to talk to the agent — that path
+    goes straight to the Runtime and is the only one carrying the user's JWT."""
+    import index, identity
+    with mock.patch.object(index.lark, "open_id_from_auth_code", return_value="ou_x"), \
+         mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
+         mock.patch.object(identity, "is_user_allowed", return_value=True):
+        assert index._web_command('{"code":"c","command":"你好"}')["statusCode"] == 400
+        r = index._web_command('{"code":"c","command":"/help"}')
+    assert r["statusCode"] == 200 and "/status" in json.loads(r["body"])["text"]
+
+
+def test_web_command_establishes_identity_per_request():
+    """It rotates session ids, so it cannot trust a token the page is holding."""
+    import index
+    with mock.patch.object(index.lark, "open_id_from_auth_code", return_value="") as ex:
+        assert index._web_command('{"code":"bad","command":"/status"}')["statusCode"] == 401
+    assert ex.call_count == 1
+
+
+def test_cors_is_configured_on_the_api_and_not_duplicated_in_the_handler():
+    """The browser preflights a cross-origin JSON POST. With CORS on the HTTP API, API
+    Gateway answers OPTIONS itself and ignores the integration's own CORS headers — so
+    setting them here too is dead code, which is exactly how this shipped broken."""
+    import pathlib
+    stack = pathlib.Path(__file__).parents[2] / "stacks" / "router_stack.py"
+    src = stack.read_text()
+    assert "cors_preflight" in src and "web_allowed_origins.split" in src
+    handler_src = pathlib.Path(__file__).with_name("index.py").read_text()
+    assert "Access-Control-Allow-Origin" not in handler_src
 
 
 def test_web_session_honours_the_allowlist():
@@ -630,14 +738,14 @@ def test_status_survives_a_missing_runtime_session():
     """rt_sid is empty until a turn has run. Passing it through produced a 400 that killed
     the whole handler, so /status silently answered nothing at all."""
     import index
-    assert index.thread_stats("", "u1", "lark:ou_a", "mem-1") == (0, False)
+    assert index.thread_stats("", "u1", "lark:ou_a", "mem-1") == {}
     assert index.user_authorized("", "u1", "lark:ou_a", "lark") is False
 
 
 def test_a_failed_count_does_not_take_down_the_command():
     import index
     with mock.patch.object(index, "invoke_agent", side_effect=RuntimeError("boom")):
-        assert index.thread_stats("ses_x", "u1", "lark:ou_a", "mem-1") == (0, False)
+        assert index.thread_stats("ses_x", "u1", "lark:ou_a", "mem-1") == {}
         assert index.user_authorized("ses_x", "u1", "lark:ou_a", "lark") is False
 
 
@@ -645,7 +753,7 @@ def test_status_does_not_manufacture_the_session_it_reports_as_absent():
     """Counting needs a runtime session, so counting eagerly created one — while the line
     above still said "not established". A diagnostic must not cause what it reports."""
     import index, inspect
-    src = inspect.getsource(index.process_lark_event)
+    src = inspect.getsource(index.run_command)
     i = src.index('cmd == "/status"')
     block = src[i:i + 1400]
     assert "get_or_create_session" not in block
