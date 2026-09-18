@@ -129,11 +129,58 @@ _SUMMARIZE_AT_TOKENS = int(os.environ.get("SUMMARIZE_AT_TOKENS", "120000"))  # 0
 _SUMMARIZE_KEEP = int(os.environ.get("SUMMARIZE_KEEP_MESSAGES", "20"))
 
 
+# --------------------------- steering a running turn -------------------------
+# A message that arrives while a turn is running used to be refused: the turn had written
+# a toolUse whose toolResult was not there yet, and Bedrock rejects that whole history —
+# which read as "the agent is broken" for as long as the turn lasted. Refusing was honest
+# but made the user re-send. Instead the message is handed to the turn already running.
+#
+# Where it may be injected is not a free choice. A toolResult must follow its toolUse
+# immediately, so appending a HumanMessage between them would recreate exactly the failure
+# this fixes. `before_model` is the one safe boundary: any tool results from the previous
+# step are written, and the next model call has not happened yet.
+_pending_steer: dict[str, list[str]] = {}
+
+
+def steer(thread_id: str, message: str) -> None:
+    """Hand a message to the turn already running on this thread."""
+    with _in_flight_lock:
+        _pending_steer.setdefault(thread_id, []).append(message)
+
+
+def _take_steer(thread_id: str) -> list[str]:
+    with _in_flight_lock:
+        return _pending_steer.pop(thread_id, [])
+
+
+class _SteeringMiddleware:
+    """Injects messages that arrived mid-turn, at the only boundary where it is legal."""
+
+    name = "steering"
+
+    def before_model(self, state, runtime):  # noqa: ANN001 — the framework's signature
+        thread_id = ""
+        try:
+            thread_id = runtime.config["configurable"]["thread_id"]
+        except Exception:  # noqa: BLE001 — no thread means nothing to inject
+            return None
+        queued = _take_steer(thread_id)
+        if not queued:
+            return None
+        log.info("steering %d message(s) into the running turn on %s", len(queued), thread_id)
+        return {"messages": [HumanMessage(m) for m in queued]}
+
+
 def _middleware() -> list:
+    from langchain.agents.middleware import AgentMiddleware
+    # Subclassed here rather than at import time so the class exists only when the
+    # framework does, matching how summarisation is imported.
+    steering = type("SteeringMiddleware", (AgentMiddleware,),
+                    dict(_SteeringMiddleware.__dict__))()
     if not _SUMMARIZE_AT_TOKENS:
-        return []
+        return [steering]
     from langchain.agents.middleware import SummarizationMiddleware
-    return [SummarizationMiddleware(
+    return [steering, SummarizationMiddleware(
         # Caching deliberately off for this one: the summary call happens once per
         # threshold crossing and is never re-read, so a cachePoint would only buy a
         # 1.25-2x write premium.
@@ -149,8 +196,12 @@ _sessions: dict[str, dict] = {}
 _lock = threading.Lock()
 
 # Background turns in flight. AgentCore may reclaim an idle container, which would
-# kill them, so /ping reports HealthyBusy while this is non-zero.
+# kill them, so /ping reports HealthyBusy while this is non-zero. Threads are tracked
+# individually as well: a second turn on a thread that is mid tool call reads a checkpoint
+# whose toolUse has no toolResult yet, and Bedrock rejects it — the state is *in flight*,
+# not orphaned, so it must be waited out rather than repaired.
 _in_flight = 0
+_in_flight_threads: set[str] = set()
 _in_flight_lock = threading.Lock()
 
 
@@ -170,10 +221,19 @@ def cache_ttl() -> str:
     return _CACHE_TTL
 
 
-def _track(delta: int) -> None:
+def _track(delta: int, thread_id: str = "") -> None:
     global _in_flight
     with _in_flight_lock:
         _in_flight += delta
+        if thread_id:
+            _in_flight_threads.add(thread_id) if delta > 0 else \
+                _in_flight_threads.discard(thread_id)
+
+
+def thread_busy(thread_id: str) -> bool:
+    """Whether a turn is already running on this thread, in this container."""
+    with _in_flight_lock:
+        return thread_id in _in_flight_threads
 
 
 # --------------------------- the process's one event loop --------------------
@@ -263,17 +323,39 @@ async def _arepair_interrupted_turn(graph, config: dict) -> int:
     a turn was interrupted. LangGraph could resume the pending task itself, but only via
     ainvoke(None), and we always arrive carrying a new user message.
 
-    Only the trailing message is repaired. That is the only place an interrupted turn can
-    leave one, and appending is only a valid fix there — a toolResult has to follow its
-    toolUse, so a dangling call deeper in the history is a different bug that this must not
-    paper over."""
+    Two shapes, two fixes. When the dangling AIMessage is still last, appending the missing
+    results is right and keeps the turn's context. Once the user has sent anything else it
+    is no longer last — LangGraph writes the new HumanMessage before calling the model, so a
+    failed turn buries the dangling call one position deeper every time — and appending
+    cannot help, because a toolResult must come *immediately* after its toolUse. There the
+    only valid repair is to drop that AIMessage: its tools never ran, so it holds nothing but
+    a preamble, and removing it makes the history legal again."""
     state = await graph.aget_state(config)
     messages = (getattr(state, "values", None) or {}).get("messages") or []
-    last = messages[-1] if messages else None
-    pending = [tc for tc in (getattr(last, "tool_calls", None) or []) if tc.get("id")] \
-        if isinstance(last, AIMessage) else []
-    if not pending:
+    dangling, answered = None, {getattr(m, "tool_call_id", None) for m in messages
+                                if isinstance(m, ToolMessage)}
+    for m in messages:
+        if isinstance(m, AIMessage) and any(
+                tc.get("id") and tc["id"] not in answered
+                for tc in (getattr(m, "tool_calls", None) or [])):
+            dangling = m
+    if dangling is None:
         return 0
+    if dangling is not messages[-1]:
+        # A turn still running on this thread has exactly this shape — its toolUse is
+        # written, its toolResult is not yet — so removing the message would corrupt a live
+        # turn instead of repairing a dead one. Wait it out; the results are coming.
+        if thread_busy(config["configurable"]["thread_id"]):
+            log.info("dangling call belongs to a turn still in flight; leaving it alone")
+            return 0
+        # Buried and nothing is running: drop it rather than paper over it in the wrong
+        # position. Appending cannot help, a toolResult must follow its toolUse directly.
+        from langchain_core.messages import RemoveMessage
+        log.warning("dropping a buried AIMessage with %d unanswered tool call(s)",
+                    len(dangling.tool_calls))
+        await graph.aupdate_state(config, {"messages": [RemoveMessage(id=dangling.id)]})
+        return len(dangling.tool_calls)
+    pending = [tc for tc in dangling.tool_calls if tc.get("id")]
     # as_node is not optional here: once a graph has more than one node LangGraph cannot
     # infer which one a write came from and raises InvalidUpdateError("Ambiguous update").
     # "tools" is the honest attribution — a ToolMessage is what that node produces. Learned
@@ -510,16 +592,27 @@ def chat_result(actor_id: str, message: str, email: str = "",
     When the user hasn't authorized Lark yet, needs_auth is True and auth_url is the
     raw consent URL, so the caller (router) can drive the wait-for-consent loop instead
     of asking the user to re-send."""
-    s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id),
-                     workload_token=workload_token)
+    thread_id = mem_sid or _session_id_for(actor_id)
+    # A turn is already running on this thread. This surface has to answer synchronously, so
+    # it cannot wait for that turn — but the message is not lost: it is steered into the
+    # running turn, whose answer covers it.
+    if thread_busy(thread_id):
+        steer(thread_id, message)
+        return {"reply": "收到，我把它并入正在处理的那一轮，稍后一起回答。",
+                "needs_auth": False, "steered": True}
+    s = _get_session(actor_id, email, thread_id, workload_token=workload_token)
     if s.get("identity_error"):
         # Answer without tools, but say so — silently degrading is what made a missing
         # IAM permission look like the model choosing not to help.
         return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
                 "needs_auth": False, "identity_error": s["identity_error"]}
     s["tool_texts"] = []
-    state = _run(s["graph"].ainvoke({"messages": [HumanMessage(message)]},
-                                    config=s["config"]))
+    _track(+1, thread_id)
+    try:
+        state = _run(s["graph"].ainvoke({"messages": [HumanMessage(message)]},
+                                        config=s["config"]))
+    finally:
+        _track(-1, thread_id)
     for m in state.get("messages", []):
         if isinstance(m, ToolMessage):
             s["tool_texts"].append(_message_text(m))
@@ -550,7 +643,15 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     token, so the turn runs and consent is only raised if the model actually calls
     one. By then the router has returned, so the prompt is pushed to the chat like any
     other answer and the user re-sends after approving."""
-    s = _get_session(actor_id, email, mem_sid or _session_id_for(actor_id),
+    thread_id = mem_sid or _session_id_for(actor_id)
+    # A turn is already running on this thread: hand the message to it rather than starting
+    # a second one. Two turns would each read the other's half-written checkpoint, and the
+    # user would be told to re-send something the agent had in fact received.
+    if thread_busy(thread_id):
+        steer(thread_id, message)
+        lark_notify.remove_reaction(message_id, reaction_id)
+        return {"accepted": True, "needs_auth": False, "steered": True}
+    s = _get_session(actor_id, email, thread_id,
                      fresh=fresh_session, workload_token=workload_token)
     if s.get("identity_error"):
         return {"reply": _IDENTITY_ERROR.format(err=s["identity_error"]),
@@ -580,9 +681,9 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
             # would read as "still working". If the container dies outright nobody
             # clears it, which is cosmetic only.
             lark_notify.remove_reaction(message_id, reaction_id)
-            _track(-1)
+            _track(-1, thread_id)
 
-    _track(+1)
+    _track(+1, thread_id)
     threading.Thread(target=_run_turn, name=f"turn-{actor_id[:16]}", daemon=True).start()
     return {"accepted": True, "needs_auth": False}
 

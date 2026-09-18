@@ -151,12 +151,18 @@ def _repair(messages):
             return type("S", (), {"values": {"messages": messages}})()
 
         async def aupdate_state(self, config, values, as_node=None):
-            if as_node is None:
+            # A removal needs no attribution; an appended ToolMessage does, and the real
+            # graph raises without it.
+            from langchain_core.messages import RemoveMessage
+            if as_node is None and not all(isinstance(m, RemoveMessage)
+                                           for m in values["messages"]):
                 raise RuntimeError("Ambiguous update, specify as_node")
-            appended.append(as_node)
+            if as_node:
+                appended.append(as_node)
             appended.extend(values["messages"])
 
-    n = asyncio.run(agent_core._arepair_interrupted_turn(_Graph(), {}))
+    config = {"configurable": {"thread_id": "t-test"}}
+    n = asyncio.run(agent_core._arepair_interrupted_turn(_Graph(), config))
     return n, appended
 
 
@@ -173,19 +179,87 @@ def test_interrupted_tool_call_is_answered_so_the_thread_stays_usable():
     assert appended[1].tool_call_id == "call-1"
 
 
+def test_a_buried_dangling_call_is_dropped_rather_than_answered_out_of_position():
+    """The shape that actually wedged a live thread. LangGraph writes the new HumanMessage
+    before calling the model, so a failed turn buries the dangling AIMessage one deeper
+    every time — and appending cannot fix it, since a toolResult must come *immediately*
+    after its toolUse. Dropping the message is the only legal repair there."""
+    from langchain_core.messages import AIMessage as AI, HumanMessage, RemoveMessage
+    dangling = AI(content="let me test that", id="ai-1", tool_calls=[
+        {"name": "run_code", "args": {}, "id": "c1"},
+        {"name": "run_command", "args": {}, "id": "c2"}])
+    n, written = _repair([HumanMessage("hi"), dangling,
+                          HumanMessage("still there?"), HumanMessage("any news?")])
+    assert n == 2
+    assert [type(m).__name__ for m in written] == ["RemoveMessage"]
+    assert written[0].id == "ai-1"
+
+
+def test_repair_ignores_tool_calls_that_were_answered():
+    """A completed turn deeper in the history must not be mistaken for a dangling one."""
+    from langchain_core.messages import AIMessage as AI, HumanMessage, ToolMessage as TM
+    n, written = _repair([
+        HumanMessage("hi"),
+        AI(content="", id="ai-1", tool_calls=[{"name": "t", "args": {}, "id": "c1"}]),
+        TM(content="done", tool_call_id="c1"),
+        AI(content="answer"), HumanMessage("more")])
+    assert (n, written) == (0, [])
+
+
 def test_repair_is_a_no_op_on_a_completed_turn():
     from langchain_core.messages import AIMessage as AI, HumanMessage
     n, appended = _repair([HumanMessage("hi"), AI(content="done")])
     assert (n, appended) == (0, [])
 
 
-def test_repair_ignores_a_dangling_call_that_is_not_trailing():
-    """A toolResult must follow its toolUse, so appending cannot fix a call buried in the
-    history — silently 'repairing' it would corrupt the order instead."""
-    from langchain_core.messages import AIMessage as AI, HumanMessage
-    buried = AI(content="", tool_calls=[{"name": "t", "args": {}, "id": "old"}])
-    n, appended = _repair([buried, HumanMessage("hi"), AI(content="done")])
-    assert (n, appended) == (0, [])
+def test_a_buried_dangling_call_is_removed_not_answered_in_the_wrong_place():
+    """This assertion used to say the opposite — that a buried call is somebody else's bug
+    and must be left alone. A live thread then wedged permanently: LangGraph writes the new
+    HumanMessage before calling the model, so one killed turn buries its own dangling call
+    and every later question buries it deeper. Appending is still wrong (a toolResult must
+    come *immediately* after its toolUse), so the repair removes the message instead."""
+    from langchain_core.messages import AIMessage as AI, HumanMessage, RemoveMessage
+    buried = AI(content="", id="ai-old", tool_calls=[{"name": "t", "args": {}, "id": "old"}])
+    n, written = _repair([buried, HumanMessage("hi"), HumanMessage("still there?")])
+    assert n == 1
+    assert [type(m).__name__ for m in written] == ["RemoveMessage"]
+    assert written[0].id == "ai-old"
+
+
+def test_a_message_arriving_mid_turn_is_steered_not_refused():
+    """Two turns on one thread each read the other's half-written checkpoint, which Bedrock
+    rejects — the failure that made a live thread look broken. The second message joins the
+    running turn instead, so nothing has to be re-sent."""
+    agent_core._pending_steer.clear()
+    agent_core.steer("t-1", "and also check the logs")
+    agent_core.steer("t-1", "one more thing")
+    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
+    runtime = type("R", (), {"config": {"configurable": {"thread_id": "t-1"}}})()
+    out = mw.before_model({"messages": []}, runtime)
+    assert [m.content for m in out["messages"]] == ["and also check the logs", "one more thing"]
+    # Drained, so the next model call in the same turn does not see them twice.
+    assert mw.before_model({"messages": []}, runtime) is None
+
+
+def test_steering_only_injects_before_a_model_call():
+    """A toolResult must follow its toolUse immediately, so injecting anywhere else would
+    recreate the very error this fixes. before_model is the one safe boundary: tool results
+    from the previous step are written, the next model call has not happened."""
+    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
+    assert hasattr(mw, "before_model")
+    # Nothing may hook the tool boundary, where the adjacency rule would be broken.
+    assert not hasattr(agent_core._SteeringMiddleware, "after_model")
+    assert not hasattr(agent_core._SteeringMiddleware, "wrap_tool_call")
+
+
+def test_steering_is_per_thread():
+    """One user's aside must not land in another user's turn."""
+    agent_core._pending_steer.clear()
+    agent_core.steer("t-a", "for A")
+    mw = [m for m in agent_core._middleware() if getattr(m, "name", "") == "steering"][0]
+    other = type("R", (), {"config": {"configurable": {"thread_id": "t-b"}}})()
+    assert mw.before_model({"messages": []}, other) is None
+    assert agent_core._pending_steer == {"t-a": ["for A"]}
 
 
 def _load_busy_helpers():
@@ -973,7 +1047,8 @@ def test_recall_says_so_when_there_is_nothing_stored():
 # rewriting the prefix every turn would make the prompt cache miss every turn.
 
 def test_summarisation_triggers_on_a_token_threshold_not_every_turn():
-    mw = agent_core._middleware()
+    mw = [m for m in agent_core._middleware()
+          if type(m).__name__ == "SummarizationMiddleware"]
     assert len(mw) == 1
     clauses = mw[0]._trigger_clauses
     assert clauses == [{"tokens": agent_core._SUMMARIZE_AT_TOKENS}]
@@ -983,12 +1058,15 @@ def test_summarisation_triggers_on_a_token_threshold_not_every_turn():
 def test_the_summariser_does_not_pay_for_prompt_caching():
     """The summary call happens once per crossing and is never re-read, so a cachePoint
     would only buy a 1.25-2x write premium."""
-    assert agent_core._middleware()[0].model.cache_ttl == ""
+    summariser = [m for m in agent_core._middleware()
+                  if type(m).__name__ == "SummarizationMiddleware"][0]
+    assert summariser.model.cache_ttl == ""
 
 
 def test_summarisation_can_be_disabled_outright():
+    """Steering stays either way — it is what keeps a mid-turn message from being lost."""
     with mock.patch.object(agent_core, "_SUMMARIZE_AT_TOKENS", 0):
-        assert agent_core._middleware() == []
+        assert [type(m).__name__ for m in agent_core._middleware()] == ["SteeringMiddleware"]
 
 
 def test_summarisation_rewrites_state_so_the_checkpoint_shrinks():
