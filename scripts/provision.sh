@@ -225,6 +225,8 @@ env = {
     # window and on how much a cache-prefix invalidation costs at your traffic.
     "SUMMARIZE_AT_TOKENS": os.environ.get("SUMMARIZE_AT_TOKENS", ""),
     "PROMPT_CACHE_TTL": os.environ.get("PROMPT_CACHE_TTL", ""),
+    # Empty means "keep the default in agent_core"; the env filter below drops it.
+    "AGENT_SYSTEM_PROMPT": os.environ.get("AGENT_SYSTEM_PROMPT", ""),
     "CHECKPOINT_BUCKET": e["CKPT_BUCKET"],
     # Long-term memory only; empty until the Memory resource exists.
     "BEDROCK_AGENTCORE_MEMORY_ID": e["MEMORY"],

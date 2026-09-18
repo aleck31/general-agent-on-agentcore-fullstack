@@ -66,10 +66,15 @@ _CHECKPOINT_BUCKET = os.environ.get("CHECKPOINT_BUCKET", "")
 _CHECKPOINT_TTL = int(os.environ.get("CHECKPOINT_TTL_DAYS", "365")) * 86400
 # Empty unless ./deploy.sh mcp approval ran — the approval tools are opt-in.
 _APPROVAL_MCP_URL = os.environ.get("APPROVAL_MCP_URL", "")
+# Short on purpose. Operational facts a model cannot infer — the workspace persists, there
+# is no internet — live in each tool's description, next to what they constrain, instead of
+# being paid for on every turn. Debugging heuristics do not belong here at all: they encode
+# one deployment's incident history into a general-purpose agent.
 _SYSTEM = os.environ.get(
     "AGENT_SYSTEM_PROMPT",
-    "You are a helpful assistant embedded in Lark. Be concise. "
-    "Use the provided tools when they help answer the user.",
+    "You are a general-purpose agent. Be concise. Use the tools when they help. "
+    "Report what a tool actually returned, and never present work you did not "
+    "complete as done.",
 )
 # Rebuild a cached session before its Cognito access token (~1h) expires.
 _SESSION_TTL = int(os.environ.get("SESSION_TTL_SECONDS", "3000"))  # 50 min
