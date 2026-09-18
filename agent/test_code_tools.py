@@ -145,16 +145,21 @@ def test_closing_the_session_stops_the_sandbox():
     assert 'get("sandbox")' in src and ".close()" in src
 
 
-def test_output_is_capped_so_one_runaway_print_cannot_fill_the_context():
+def test_output_is_capped_from_the_middle_so_the_exception_survives():
+    """A Python traceback puts the exception last, so trimming the tail throws away the one
+    line that says what went wrong and keeps the call stack that does not."""
+    body = "HEAD-MARKER\n" + "x" * 99999 + "\nValueError: the actual problem"
     client = mock.Mock()
     client.invoke_code_interpreter.return_value = {"stream": [
-        {"result": {"structuredContent": {"stdout": "x" * 99999, "stderr": ""}}}]}
+        {"result": {"structuredContent": {"stdout": body, "stderr": ""}}}]}
     with mock.patch.object(code_tools.boto3, "client", return_value=client):
         box = code_tools._Sandbox("lark:ou_x")
         box._session_id = "s-1"
-        out = box.invoke("executeCommand", {"command": "yes"})
-    assert len(out) <= code_tools._MAX_OUTPUT + 20
-    assert out.endswith("(truncated)")
+        out = box.invoke("executeCommand", {"command": "boom"})
+    assert len(out) < len(body)
+    assert out.startswith("HEAD-MARKER")
+    assert out.endswith("ValueError: the actual problem")
+    assert "chars omitted" in out
 
 
 def test_an_expired_session_is_replaced_instead_of_failing_every_later_call():

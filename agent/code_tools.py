@@ -37,8 +37,9 @@ _WORKSPACE = os.environ.get("WORKSPACE_PATH", "/mnt/workspace")
 # Long enough to outlive a turn that thinks, short enough that an abandoned session is not
 # billed for hours. The platform caps at 28,800.
 _SESSION_TIMEOUT = int(os.environ.get("CODE_SESSION_TIMEOUT_SECONDS", "1800"))
-# One tool result goes into the model's context, so a runaway print must not fill it.
-_MAX_OUTPUT = int(os.environ.get("CODE_MAX_OUTPUT_CHARS", "4000"))
+# One tool result goes into the model's context, so a runaway print must not fill it. Big
+# enough for a real traceback or a printed DataFrame; ~3k tokens at the ceiling.
+_MAX_OUTPUT = int(os.environ.get("CODE_MAX_OUTPUT_CHARS", "12000"))
 
 
 def available() -> bool:
@@ -153,7 +154,19 @@ class _Sandbox:
             if structured.get("exitCode"):
                 chunks.append(f"[exit {structured['exitCode']}]")
         out = "\n".join(chunks).strip() or ("(failed, no output)" if failed else "(no output)")
-        return out[:_MAX_OUTPUT] + ("\n…(truncated)" if len(out) > _MAX_OUTPUT else "")
+        return _clamp(out)
+
+
+def _clamp(out: str) -> str:
+    """Trim from the middle, not the end. A Python traceback puts the exception — the one
+    line that says what went wrong — last, so keeping only the head throws away the answer
+    and leaves the call stack."""
+    if len(out) <= _MAX_OUTPUT:
+        return out
+    head = int(_MAX_OUTPUT * 0.6)
+    tail = _MAX_OUTPUT - head
+    dropped = len(out) - _MAX_OUTPUT
+    return f"{out[:head]}\n…({dropped} chars omitted)…\n{out[-tail:]}"
 
 
 class _RunCodeArgs(BaseModel):
@@ -194,10 +207,16 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
     # The model is not told about the mount — it just has a working directory that persists.
     def run_code(code: str, language: str = "python") -> str:
         if language == "python":
-            code = f"import os\nos.chdir({_WORKSPACE!r})\n" + code
-        else:
-            code = f"process.chdir({_WORKSPACE!r});\n" + code
-        return box.invoke("executeCode", {"language": language, "code": code})
+            return box.invoke("executeCode", {
+                "language": "python", "code": f"import os\nos.chdir({_WORKSPACE!r})\n" + code})
+        # JS/TS cannot go through executeCode: it runs them under Deno with no permissions
+        # and no way to pass a flag, so the workspace is unreachable (`NotCapable: Requires
+        # read access`) and `require` is undefined. Writing the file and running node gives
+        # both. Measured; see docs/agentcore-behavior.md.
+        name = "_run.ts" if language == "typescript" else "_run.js"
+        runner = f"deno run --allow-all {name}" if language == "typescript" else f"node {name}"
+        return box.invoke("executeCommand", {
+            "command": f"cd {_WORKSPACE} && cat > {name} <<'AGENT_EOF'\n{code}\nAGENT_EOF\n{runner}"})
 
     def run_command(command: str) -> str:
         return box.invoke("executeCommand", {"command": f"cd {_WORKSPACE} && {command}"})
