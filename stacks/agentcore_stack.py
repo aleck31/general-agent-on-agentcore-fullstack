@@ -137,11 +137,15 @@ class AgentCoreStack(Stack):
                 resources=["*"],
             )
         )
+        # Two namespaces: the platform's, and the agent's own. A turn's outcome is invisible
+        # to AgentCore — chat_async returns 200 at once and the turn runs on a thread — so the
+        # agent has to publish it. Still namespace-scoped: no other metrics are reachable.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["cloudwatch:PutMetricData"],
-                resources=["*"],
-                conditions={"StringEquals": {"cloudwatch:namespace": "bedrock-agentcore"}},
+                resources=["*"],   # PutMetricData takes no resource ARN
+                conditions={"StringEquals": {
+                    "cloudwatch:namespace": ["bedrock-agentcore", f"{prefix}/agent"]}},
             )
         )
 

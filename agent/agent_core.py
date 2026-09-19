@@ -53,6 +53,7 @@ import code_tools
 import lark_3lo
 import lark_notify
 import memory_tools
+import telemetry
 import websearch
 
 log = logging.getLogger("agent.core")
@@ -173,6 +174,7 @@ class _SteeringMiddleware:
         if not queued:
             return None
         log.info("steering %d message(s) into the running turn on %s", len(queued), thread_id)
+        telemetry.count("steer_injected")
         return {"messages": [HumanMessage(m) for m in queued]}
 
 
@@ -376,6 +378,7 @@ async def _arepair_interrupted_turn(graph, config: dict) -> int:
         from langchain_core.messages import RemoveMessage
         log.warning("dropping a buried AIMessage with %d unanswered tool call(s)",
                     len(dangling.tool_calls))
+        telemetry.count("interrupted_turn_repaired", shape="buried")
         await graph.aupdate_state(config, {"messages": [RemoveMessage(id=dangling.id)]})
         return len(dangling.tool_calls)
     pending = [tc for tc in dangling.tool_calls if tc.get("id")]
@@ -385,6 +388,7 @@ async def _arepair_interrupted_turn(graph, config: dict) -> int:
     # the hard way: the unit test's fake graph accepted the call without it, so this shipped
     # broken and only a poisoned checkpoint on the real table surfaced it.
     nodes = graph.get_graph().nodes
+    telemetry.count("interrupted_turn_repaired", shape="trailing")
     await graph.aupdate_state(config, {"messages": [
         ToolMessage(content=_INTERRUPTED_TOOL, tool_call_id=tc["id"],
                     name=tc.get("name") or "tool")
@@ -426,6 +430,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     if kind == "auth_url":
         auth_url = value  # remembered for the tool-call path, not returned upfront
     elif kind == "wrong_owner":
+        telemetry.count("identity_refused", reason="wrong_owner")
         # A claimed actor that does not own the vaulted token. Refused rather than offered a
         # consent link: minting one would burn the real owner's grant.
         identity_error = "这个身份与授权的账号不一致，无法代表其操作。"
@@ -622,6 +627,7 @@ def chat_result(actor_id: str, message: str, email: str = "",
     # running turn, whose answer covers it.
     if thread_busy(thread_id):
         steer(thread_id, message)
+        telemetry.count("steered", surface="sync")
         return {"reply": "收到，我把它并入正在处理的那一轮，稍后一起回答。",
                 "needs_auth": False, "steered": True}
     s = _get_session(actor_id, email, thread_id, workload_token=workload_token)
@@ -633,8 +639,9 @@ def chat_result(actor_id: str, message: str, email: str = "",
     s["tool_texts"] = []
     _track(+1, thread_id)
     try:
-        state = _run(s["graph"].ainvoke({"messages": [HumanMessage(message)]},
-                                        config=s["config"]))
+        with telemetry.timed("turn", surface="sync"):
+            state = _run(s["graph"].ainvoke({"messages": [HumanMessage(message)]},
+                                            config=s["config"]))
     finally:
         _track(-1, thread_id)
     for m in state.get("messages", []):
@@ -674,6 +681,7 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     # user would be told to re-send something the agent had in fact received.
     if thread_busy(thread_id):
         steer(thread_id, message)
+        telemetry.count("steered", surface="lark")
         lark_notify.remove_reaction(message_id, reaction_id)
         return {"accepted": True, "needs_auth": False, "steered": True}
     s = _get_session(actor_id, email, thread_id,
@@ -684,8 +692,10 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
 
     def _run_turn() -> None:
         try:
-            answer = _stream_to_chat(s, message, chat_id)
+            with telemetry.timed("turn", surface="lark"):
+                answer = _stream_to_chat(s, message, chat_id)
             if _hit_auth_wall(s):
+                telemetry.count("auth_wall", surface="lark")
                 # A clickable "点击授权" link, matching the router's synchronous path,
                 # instead of a raw URL. The message was parked before this turn, so the
                 # shim's /return replays it once consent lands — no re-send.

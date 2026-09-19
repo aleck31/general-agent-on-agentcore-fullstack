@@ -24,6 +24,8 @@ import logging
 import os
 import re
 
+import telemetry
+
 import boto3
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
@@ -137,6 +139,7 @@ class _Sandbox:
             if "is not active" not in str(e):
                 raise
             log.info("code session %s expired; starting a new one", self._session_id)
+            telemetry.count("code_session_restarted")
             self._session_id = ""
             r = self._client.invoke_code_interpreter(
                 codeInterpreterIdentifier=_INTERPRETER_ID, sessionId=self.session_id(),
@@ -194,12 +197,18 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
     box = sandbox or _Sandbox(actor_id)
 
     def _guard(fn):
+        # Counted by name and outcome: "did a tool actually run" is the one question a
+        # plausible-looking reply cannot answer, and it cost this project a long evening.
         def run(*a, **kw):
             try:
-                return fn(*a, **kw)
+                out = fn(*a, **kw)
+                telemetry.count("tool_call", tool=fn.__name__, outcome="ok")
+                return out
             except Exception as e:  # noqa: BLE001 — a broken sandbox must not kill the turn
+                telemetry.count("tool_call", tool=fn.__name__, outcome=type(e).__name__)
                 log.exception("code tool failed for %s", actor_id)
                 return f"The sandbox could not run that ({type(e).__name__})."
+        run.__name__ = fn.__name__
         return run
 
     # Every call is prefixed with a cd: the sandbox's own working directory is elsewhere

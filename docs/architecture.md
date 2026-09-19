@@ -266,6 +266,18 @@ This keeps the trust boundary honest rather than widening it: A2A carries no end
 
 `scripts/a2a-demo.sh` drives all of it as a peer would, and its third step is the one that matters: the same bearer naming a *different* actor does not return that person's data — it returns a consent prompt, because the agent checks the claim against the vaulted token's owner. Step two ends by reading the MCP server's own log for `tools/call token=yes`, since a plausible answer is not evidence that a tool ran as anyone. The Agent Card sits behind the Runtime's authorizer, which means a peer must already be a known identity in this tenant before it can even discover the agent — see docs/agentcore-behavior.md.
 
+## Knowing whether it worked
+
+Two metric sources, and the split is not cosmetic.
+
+**The platform** publishes to `AWS/Bedrock-AgentCore`: `Invocations`, `UserErrors`/`SystemErrors`, `Throttles`, `Latency`, `ActiveSessionCount`, and — the one worth wiring an alarm to — `ResourceAccessTokenFetchSuccess`/`Failures`, carrying the `ExceptionType`. That last pair watches the 3LO vault call itself, which is where this project's longest outage lived while nothing measured it.
+
+**The agent** publishes what the platform structurally cannot see. `chat_async` returns 200 immediately and runs the turn on a background thread, so a turn that fails is a *successful* invocation from outside: `agent.turn{outcome}` is the only place the difference exists. Same for `agent.tool_call{tool,outcome}` — whether a tool ran is the one thing a plausible reply cannot show — and for the recoveries the agent performs on itself: `agent.interrupted_turn_repaired`, `agent.code_session_restarted`, `agent.steer_injected`.
+
+It publishes with `PutMetricData`, not through OTel, and that was a measurement rather than a preference: the container has a real `MeterProvider` but nothing exports it, and `gen_ai.client.token.usage` has had no datapoints in this account since the agent moved off Strands, which configured its own exporter. A counter that silently goes nowhere is worse than no counter. The role's permission is scoped by namespace, and dimensions are deliberately low-cardinality — the `strands.*` series still lying around carry `tool_use_id`, one time series per call, forever.
+
+What is still missing is evaluation: nothing here measures answer quality, only whether the machinery ran.
+
 ## Deploy shape
 
 CDK stacks: security, agentcore, router, shim, gateway, observability, plus storage when `FILES_STORAGE=true` (that one carries the VPC, so it is off by default) and webui when `WEBUI=true`. The webui stack owns no compute — a bucket, a distribution, and the two values injected into `config.js`. Its domain only exists after deploy and the router needs it for CORS, so `phase_webui` writes it to `.cdk-state.json` and re-deploys the router; routing it through state rather than a CloudFormation export is deliberate, since importing the router's URL would freeze that export. The tool path is agent-side 3LO, so the gateway stack is reduced to its service role (no mcpServer target); the shim stack is what the 3LO flow actually uses. Everything AgentCore-side is created outside CloudFormation: the **Runtimes** (agent, lark-cli MCP server, and the approval MCP server when deployed), Memory, the OAuth2 credential provider, the workload identity, and the Web Search gateway. `deploy.sh` builds them — ARM64 images via CodeBuild, resources via the AgentCore CLI / control-plane — and feeds ids back through `.cdk-state.json`.
