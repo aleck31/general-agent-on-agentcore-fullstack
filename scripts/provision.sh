@@ -160,7 +160,7 @@ phase2_runtime() {
   log "Runtime — create/update the agent Runtime from the CDK-published image"
 
   local role image model memory shim mcp_arn mcp_url pool client pwsecret ws_url
-  local approval_url approval_arn issuer ckpt_table ckpt_bucket
+  local approval_url approval_arn issuer ckpt_table ckpt_bucket google_url google_arn
   role="$(cfn_out "$PREFIX-agentcore" ExecutionRoleArn)"
   image="$(cfn_out "$PREFIX-agentcore" AgentImageUri)"
   ckpt_table="$(cfn_out "$PREFIX-agentcore" CheckpointTableName)"
@@ -187,6 +187,18 @@ phase2_runtime() {
     echo "  approval tools: not deployed (./deploy.sh mcp approval to add them)"
   fi
 
+  # The second downstream system, discovered the same way: deployed or not, nothing else
+  # changes. Its provider name is fixed by setup-3lo.sh.
+  google_arn="$(aws bedrock-agentcore-control list-agent-runtimes \
+    --query "agentRuntimes[?agentRuntimeName=='${PREFIX//-/_}_google'].agentRuntimeArn" --output text 2>/dev/null | head -1)"
+  if [ -n "$google_arn" ] && [ "$google_arn" != "None" ]; then
+    google_url="https://bedrock-agentcore.$REGION.amazonaws.com/runtimes/$(uv run python -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$google_arn")/invocations?qualifier=DEFAULT"
+    echo "  google tools: enabled"
+  else
+    google_url=""
+    echo "  google tools: not deployed (./deploy.sh mcp google to add them)"
+  fi
+
   [ -n "$role" ] || { echo "missing execution role output — run --base first"; exit 1; }
   [ -n "$image" ] || { echo "missing agent image output — run --base first"; exit 1; }
   # Not fatal: the agent falls back to in-process state and keeps answering. Loud, because
@@ -211,6 +223,7 @@ phase2_runtime() {
     MODEL="$model" MEMORY="$memory" MCP_URL="$mcp_url" \
     SHIM="$shim" POOL="$pool" PWSECRET="$pwsecret" WS_URL="$ws_url" \
     APPROVAL_URL="$approval_url" FS_ARN="$fs_arn" CI_ID="$ci_id" PREFIX="$PREFIX" \
+    GOOGLE_URL="$google_url" \
     CKPT_TABLE="$ckpt_table" CKPT_BUCKET="$ckpt_bucket" \
     LARK_DOMAIN="$(uv run python -c "import json;print(json.load(open('cdk.json'))['context']['lark_api_domain'])")" \
     uv run python - <<'PYEOF'
@@ -242,6 +255,10 @@ env = {
     "COGNITO_PASSWORD_SECRET_ID": e["PWSECRET"],
     "WEBSEARCH_GATEWAY_URL": e["WS_URL"],
     "APPROVAL_MCP_URL": e["APPROVAL_URL"],
+    # Both empty unless the google server is deployed; the agent then has no Google tools.
+    "GOOGLE_MCP_URL": e["GOOGLE_URL"],
+    "GOOGLE_OAUTH_PROVIDER": (e["PREFIX"] + "-google") if e["GOOGLE_URL"] else "",
+    "GOOGLE_SCOPES": os.environ.get("GOOGLE_SCOPES", ""),
     # Empty unless code execution is on; the agent treats that as "no code tools".
     "CODE_INTERPRETER_ID": e["CI_ID"],
     "FILES_FS_ARN": e["FS_ARN"],

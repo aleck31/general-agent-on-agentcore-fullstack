@@ -34,6 +34,11 @@ uv run --with cryptography --with boto3 --with pytest python -m pytest lambda/ro
 echo "== shim =="
 uv run --with boto3 --with pytest python -m pytest lambda/shim/test_shim.py -q
 
+echo "== google mcp (node) =="
+# Node's own runner: this server has no dependencies, so a toolchain for one file would be
+# the wrong trade. Pointed at the file — the server listens on import.
+node --test mcp-servers/google/test_server.mjs
+
 echo "== approval guards (node) =="
 # Node's own runner — the guards are dependency-free by design, so no new toolchain.
 # Pointed at the file, not the directory: server.js starts listening on load.

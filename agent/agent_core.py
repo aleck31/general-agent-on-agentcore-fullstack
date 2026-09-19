@@ -67,6 +67,11 @@ _CHECKPOINT_BUCKET = os.environ.get("CHECKPOINT_BUCKET", "")
 _CHECKPOINT_TTL = int(os.environ.get("CHECKPOINT_TTL_DAYS", "365")) * 86400
 # Empty unless ./deploy.sh mcp approval ran — the approval tools are opt-in.
 _APPROVAL_MCP_URL = os.environ.get("APPROVAL_MCP_URL", "")
+# The second downstream system. Empty unless Google is configured; the agent then simply has
+# no Google tools, the same way it has no search without a gateway.
+_GOOGLE_MCP_URL = os.environ.get("GOOGLE_MCP_URL", "")
+_GOOGLE_PROVIDER = os.environ.get("GOOGLE_OAUTH_PROVIDER", "")
+_GOOGLE_SCOPES = os.environ.get("GOOGLE_SCOPES", "openid email profile").split()
 # Short on purpose. Operational facts a model cannot infer — the workspace persists, there
 # is no internet — live in each tool's description, next to what they constrain, instead of
 # being paid for on every turn. Debugging heuristics do not belong here at all: they encode
@@ -458,6 +463,23 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
                     stack, lark_3lo.mcp_connection_for(token, url=_APPROVAL_MCP_URL))
             except Exception:  # noqa: BLE001 — optional, like search
                 log.exception("approval tools unavailable for %s", actor_id)
+
+    # A second downstream system, independent of the Lark grant: a user may have consented
+    # to one and not the other, and neither absence should cost them the other's tools.
+    # No consent prompt is raised here — the tools are listed, and Google's own 401 is what
+    # tells the model to ask, exactly as with Lark.
+    if _GOOGLE_MCP_URL and _GOOGLE_PROVIDER:
+        try:
+            g_kind, g_token = await asyncio.to_thread(
+                lark_3lo.get_user_token_for, actor_id, _GOOGLE_PROVIDER, _GOOGLE_SCOPES,
+                workload_token)
+            if g_kind == "token":
+                tools += await _aopen_tools(
+                    stack, lark_3lo.mcp_connection_for(g_token, url=_GOOGLE_MCP_URL))
+            else:
+                log.info("google not consented for %s — tools omitted this turn", actor_id)
+        except Exception:  # noqa: BLE001 — optional, like search
+            log.exception("google tools unavailable for %s", actor_id)
 
     # Search doesn't depend on the user's Lark grant, so add it even when the Lark
     # tools are unavailable — an unauthorised user can still ask questions.
@@ -1009,10 +1031,15 @@ def auth_status(actor_id: str, workload_token: str = "") -> dict:
 
 
 def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
-    """Start a fresh 3LO flow for `idp` even when a token is already vaulted →
-    {auth_url}. Authorization is per-IdP; only "lark" is wired up so far (add a module
-    like lark_3lo for each new downstream system)."""
-    if idp not in ("", "lark"):
+    """Start a fresh 3LO flow for `idp` even when a token is already vaulted → {auth_url}.
+
+    Per-IdP, and the Lark path stays distinct for a reason: only it can ask the vendor whose
+    token this actually is and refuse a mismatch. A second system reuses the generic vault
+    fetch, which cannot make that check — see lark_3lo.get_user_token_for."""
+    if idp in ("google",) and not (_GOOGLE_PROVIDER and _GOOGLE_MCP_URL):
+        return {"reply": "Google 未配置（需要 GOOGLE_CLIENT_ID 与已部署的 google MCP server）",
+                "needs_auth": False}
+    if idp not in ("", "lark", "google"):
         return {"reply": f"IdP 尚未接入：{idp}", "needs_auth": False}
     # Drop every cached session for this user so the next turn re-reads the vault.
     with _lock:
@@ -1020,8 +1047,12 @@ def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
             s = _sessions.pop(key, None)
             if s:
                 _close_session(s)
-    kind, value = lark_3lo.get_user_lark_token(actor_id, force=True,
-                                               workload_token=workload_token)
+    if idp == "google":
+        kind, value = lark_3lo.get_user_token_for(
+            actor_id, _GOOGLE_PROVIDER, _GOOGLE_SCOPES, workload_token)
+    else:
+        kind, value = lark_3lo.get_user_lark_token(actor_id, force=True,
+                                                   workload_token=workload_token)
     if kind == "auth_url":
         return {"reply": _AUTH_PROMPT.format(url=value),
                 "needs_auth": True, "auth_url": value}

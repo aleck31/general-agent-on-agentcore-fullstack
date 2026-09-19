@@ -226,6 +226,34 @@ def test_a_buried_dangling_call_is_removed_not_answered_in_the_wrong_place():
     assert written[0].id == "ai-old"
 
 
+def test_a_second_downstream_system_is_absent_not_broken():
+    """Google unconfigured must cost nothing: no session build failure, no tool, and /auth
+    google says so instead of pretending. The same convention as search and long-term
+    memory — an optional system that is not deployed simply is not there."""
+    with mock.patch.object(agent_core, "_GOOGLE_MCP_URL", ""), \
+         mock.patch.object(agent_core, "_GOOGLE_PROVIDER", ""):
+        r = agent_core.reauth("lark:ou_x", "google")
+    assert r["needs_auth"] is False
+    assert "未配置" in r["reply"]
+
+
+def test_reauth_still_refuses_an_idp_nobody_wired_up():
+    """The list is explicit on purpose: a typo should not silently start a consent flow for
+    a provider that does not exist."""
+    r = agent_core.reauth("lark:ou_x", "dropbox")
+    assert r["needs_auth"] is False and "尚未接入" in r["reply"]
+
+
+def test_the_generic_vault_fetch_does_not_claim_larks_ownership_check():
+    """Only the Lark path can ask the vendor whose token this is. A generic fetch cannot, and
+    saying otherwise would be the more dangerous mistake — so the docstring states the limit
+    and the second system's tool reports the account it reached."""
+    import inspect
+    src = inspect.getsource(agent_core.lark_3lo.get_user_token_for)
+    assert "_belongs_to" not in src
+    assert "cannot make the same" in src or "cannot" in src
+
+
 def test_the_thread_comes_from_the_router_never_from_a_client():
     """A thread is addressed by user alone, so a claimed id would read somebody else's
     conversation. The router owns rotation (/reset, /new) and is the only caller trusted to

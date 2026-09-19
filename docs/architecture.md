@@ -46,6 +46,7 @@ The ten layers this is built from, and what each is implemented with, are in [RE
 | Agent container | LangGraph agent on Bedrock; HTTP contract (8080); DynamoDB checkpoints for continuity; agent-side 3LO; MCP sessions to the lark-cli server, the approval server when deployed, and optionally web search; runs turns in the background and posts answers to the chat itself | `agent/` |
 | Lark OAuth shim | RFC-6749 façade over Lark's non-standard token endpoint, plus the 3LO return endpoint | `lambda/shim/` |
 | Lark MCP server | lark-cli engine on AgentCore Runtime; calls Lark with the per-user token from a custom passthrough header | `mcp-servers/lark-cli/` |
+| Google MCP server | The second downstream system, and the test of whether one costs what the ADRs claimed. One tool (`google_whoami`), no CLI to wrap, and no credential of its own — the caller's own Google token is all it ever acts with | `mcp-servers/google/` |
 | Approval MCP server | Lark approvals on AgentCore Runtime — the case where the user's identity *cannot* be forwarded. Limits enforced in code, not by the model | `mcp-servers/approval/` |
 | AgentCore Identity | Token Vault: stores, refreshes and returns each user's Lark token (`USER_FEDERATION`), one OAuth provider per downstream system | provider `agentcore-fullstack-3lo`, workload `agentcore-fullstack-wl` |
 | Checkpoint table | Per-user conversation state, partition key derived from `thread_id` | `agentcore-fullstack-checkpoints` (+ an S3 bucket for state over ~350 KB) |
@@ -276,7 +277,7 @@ Two metric sources, and the split is not cosmetic.
 
 It publishes with `PutMetricData`, not through OTel, and that was a measurement rather than a preference: the container has a real `MeterProvider` but nothing exports it, and `gen_ai.client.token.usage` has had no datapoints in this account since the agent moved off Strands, which configured its own exporter. A counter that silently goes nowhere is worse than no counter. The role's permission is scoped by namespace, and dimensions are deliberately low-cardinality — the `strands.*` series still lying around carry `tool_use_id`, one time series per call, forever.
 
-What is still missing is evaluation: nothing here measures answer quality, only whether the machinery ran.
+What none of this measures is answer quality — deliberately. That belongs to a separate loop with its own dataset and cadence ([cs-agent-eval-loop](https://github.com/aleck31/cs-agent-eval-loop)); mixing it in here would put two different questions, "did it run" and "was it any good", behind one set of numbers.
 
 ## Deploy shape
 

@@ -35,8 +35,14 @@ Lark is the system this repo wires up, but the pattern isn't Lark-specific: **on
    aws bedrock-agentcore-control update-workload-identity --name agentcore-fullstack-wl \
      --allowed-resource-oauth2-return-urls "https://<your-return-endpoint>/return"
    ```
-5. **Append an `IDP_REGISTRY` entry** (`scripts/setup-3lo.sh`) — `{key, provider, scopes, label}`. `/auth` then reports the new system's status and `/auth <key>` consents to it, with no router or agent change.
-6. **Point a tool at it.** The agent fetches the token for `(provider, user)` and passes it to the tool server; `agent/lark_3lo.py` is the reference for both halves.
+5. **Append an `IDP_REGISTRY` entry** (`scripts/setup-3lo.sh`) — `{key, provider, scopes, label}`. `/auth` then reports the new system's status and `/auth <key>` consents to it, **with no router change**. This step used to claim "no agent change either", which was wrong and went unnoticed until Google was actually added: `reauth` refused every key but `lark`, and the provider and scopes were module-level constants in `agent/lark_3lo.py`. Both are parameters now (`get_user_token_for`), so a third system needs no further work — but that is a claim worth re-testing rather than trusting.
+6. **Point a tool at it.** The agent fetches the token for `(provider, user)` and passes it to the tool server in the custom passthrough header; `mcp-servers/google/` is the minimal reference — one tool, no CLI to wrap, and no credential of its own.
+
+## What does not carry over: the ownership check
+
+`agent/lark_3lo.py` verifies that a vaulted Lark token really belongs to the actor it is stored under, by asking Lark whose token it is and refusing a mismatch. That closes a real hole: consent completion binds the token to whatever userId the return url was told, so a forwarded consent link would otherwise vault someone else's token under your name.
+
+**That check is vendor-specific and a generic fetch cannot make it.** `get_user_token_for` says so in its own docstring rather than implying a guarantee it does not provide. What protects a second system is weaker but real: the fetch is keyed by the workload token the Runtime derived from a verified JWT, so the agent can never *name* a user. The compensation is behavioural — the second system's first tool should report the account it reached (`google_whoami` returns the email), so a wrong identity is visible to the person rather than silent.
 
 ## The flow the agent drives
 

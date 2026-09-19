@@ -127,14 +127,67 @@ echo
 echo "Lark authorize host in use: $LARK_AUTH_HOST"
 echo "  (set LARK_AUTH_HOST=https://accounts.feishu.cn in .env for the CN edition)"
 
-# Registry consumed by the router/agent so /auth can be per-IdP. Add an entry per
-# downstream system as you register more providers.
+
+# --- Google: the second downstream system -----------------------------------
+# A built-in vendor, so this is the whole configuration: client id and secret, no shim and
+# no discovery metadata. Lark needs `customOauth2ProviderConfig` and an RFC-6749 façade
+# because its token endpoint is not standard; Google is, which is the difference the two
+# cases together demonstrate. Skipped silently when unconfigured — the agent then simply
+# has no Google tools.
+GOOGLE_PROVIDER="$PREFIX-google"
+GOOGLE_CALLBACK=""
+if [ -n "${GOOGLE_CLIENT_ID:-}" ] && [ -n "${GOOGLE_CLIENT_SECRET:-}" ]; then
+  log "OAuth2 credential provider ($GOOGLE_PROVIDER)"
+  GOOGLE_PROVIDER="$GOOGLE_PROVIDER" uv run --with 'boto3>=1.43.92' python - <<'PYEOF'
+import os
+import boto3
+
+e = os.environ
+c = boto3.client("bedrock-agentcore-control")
+cfg = {"googleOauth2ProviderConfig": {
+    "clientId": e["GOOGLE_CLIENT_ID"],
+    "clientSecret": e["GOOGLE_CLIENT_SECRET"],
+}}
+name = e["GOOGLE_PROVIDER"]
+try:
+    c.get_oauth2_credential_provider(name=name)
+    c.update_oauth2_credential_provider(
+        name=name, credentialProviderVendor="GoogleOauth2",
+        oauth2ProviderConfigInput=cfg)
+    print("  updated")
+except c.exceptions.ResourceNotFoundException:
+    c.create_oauth2_credential_provider(
+        name=name, credentialProviderVendor="GoogleOauth2",
+        oauth2ProviderConfigInput=cfg)
+    print("  created")
+PYEOF
+  GOOGLE_CALLBACK="$(aws bedrock-agentcore-control get-oauth2-credential-provider \
+    --name "$GOOGLE_PROVIDER" --query callbackUrl --output text)"
+  warn "Google Cloud console → Credentials → your OAuth client → Authorized redirect URIs:"
+  echo "  $GOOGLE_CALLBACK"
+  echo "  (AgentCore's own callback, not the shim's /return — the shim is Lark-only)"
+else
+  echo "  google: off (set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env)"
+fi
+
+# Registry consumed by the router/agent so /auth can be per-IdP. One entry per downstream
+# system — this is the whole cost of adding one, which is the claim the Google provider above
+# exists to test.
 log "IdP registry (injected into the router and agent at deploy time)"
-IDP_REGISTRY="$(PROVIDER="$PROVIDER" python3 -c '
+IDP_REGISTRY="$(PROVIDER="$PROVIDER" GOOGLE_PROVIDER="$GOOGLE_PROVIDER" \
+  HAS_GOOGLE="${GOOGLE_CLIENT_ID:+1}" python3 -c '
 import json, os
-print(json.dumps([{"key": "lark", "provider": os.environ["PROVIDER"],
-                   "scopes": ["drive:drive", "docx:document", "offline_access"],
-                   "label": "Lark"}]))')"
+e = os.environ
+idps = [{"key": "lark", "provider": e["PROVIDER"],
+         "scopes": ["drive:drive", "docx:document", "offline_access"],
+         "label": "Lark"}]
+if e.get("HAS_GOOGLE"):
+    # openid/email/profile only: enough to prove whose token this is, and none of it is a
+    # sensitive scope, so the consent screen needs no verification review from Google.
+    idps.append({"key": "google", "provider": e["GOOGLE_PROVIDER"],
+                 "scopes": ["openid", "email", "profile"],
+                 "label": "Google"})
+print(json.dumps(idps))')"
 echo "  $IDP_REGISTRY"
 ctx_file=".cdk-state.json"
 python3 - "$ctx_file" "$IDP_REGISTRY" <<'PY'

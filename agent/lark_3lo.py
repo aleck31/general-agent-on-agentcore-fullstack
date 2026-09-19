@@ -113,15 +113,21 @@ def _claims(token: str) -> dict:
         return {"undecodable": True}
 
 
-def _fetch_vaulted(workload_token: str, state_actor: str, force: bool = False) -> dict:
-    """The one GetResourceOauth2Token call, so the two callers cannot drift apart.
+def _fetch_vaulted(workload_token: str, state_actor: str, force: bool = False,
+                   provider: str = "", scopes: list | None = None) -> dict:
+    """The one GetResourceOauth2Token call, so the callers cannot drift apart.
 
     They did: an earlier separate copy omitted `forceAuthentication` and reported "never
-    consented" for a user whose token the other copy fetched fine."""
+    consented" for a user whose token the other copy fetched fine.
+
+    `provider`/`scopes` default to Lark's. They are parameters because a second downstream
+    system reuses this whole path — the vault, the customState convention and the
+    return-url — and only these two values differ. An ADR claimed adding a system needed no
+    agent change; it did, and this is the change."""
     kwargs = dict(
         workloadIdentityToken=workload_token,
-        resourceCredentialProviderName=_PROVIDER,
-        scopes=_SCOPES,
+        resourceCredentialProviderName=provider or _PROVIDER,
+        scopes=scopes if scopes is not None else _SCOPES,
         oauth2Flow="USER_FEDERATION",
         customState=_b64url(state_actor),
         forceAuthentication=force,
@@ -132,7 +138,8 @@ def _fetch_vaulted(workload_token: str, state_actor: str, force: bool = False) -
     # Whether a grant came back, which is the difference between "acts as the user" and
     # "asks for consent again" — and the two callers disagree on it, see the open item in
     # docs/agentcore-behavior.md.
-    log.info("vault fetch: state=%r force=%s -> %s", state_actor, force,
+    log.info("vault fetch: provider=%s state=%r force=%s -> %s",
+             kwargs["resourceCredentialProviderName"], state_actor, force,
              "token" if resp.get("accessToken") else
              f"authorizationUrl session={pending_session_id(resp.get('authorizationUrl'))}")
     return resp
@@ -197,19 +204,7 @@ def get_user_lark_token(actor_id: str, force: bool = False,
     A vaulted token is used only after it is confirmed to be this actor's own; one
     that isn't gets discarded in favour of a fresh consent flow (see _belongs_to).
     """
-    if workload_token:
-        wat = workload_token
-        # Which identity the platform's token actually carries. A consent opened under this
-        # identity has been observed to complete successfully and then be unreadable by
-        # every namespace we query, so the open question is whether this differs from the
-        # identity GetWorkloadAccessTokenForJWT derives from the same JWT. Claims only.
-        pass  # the platform's token; opaque, so nothing useful to log about it
-    else:
-        log.warning("no platform workload token for %s — falling back to ForUserId",
-                    actor_id)
-        wat = _agentcore.get_workload_access_token_for_user_id(
-            workloadName=_WORKLOAD, userId=actor_id
-        )["workloadAccessToken"]
+    wat = _workload_token_for(actor_id, workload_token)
     resp = _fetch_vaulted(wat, actor_id, force)
     token = resp.get("accessToken")
     if token and _belongs_to(token, actor_id):
@@ -250,6 +245,49 @@ class _SigV4HTTPXAuth(httpx.Auth):
         self._signer.add_auth(aws_req)
         request.headers.update(dict(aws_req.headers))
         yield request
+
+
+def _workload_token_for(actor_id: str, workload_token: str = "") -> str:
+    """The workload identity to fetch a vaulted token under.
+
+    The platform's own token when there is one: derived from the verified inbound JWT, which
+    is what makes the identity unforgeable — this code never names a user, it uses the one
+    already authenticated. Falling back to ForUserId is a trusted-caller assumption *and* a
+    different vault namespace, so the two are not interchangeable for a deployment that has
+    consents already."""
+    if workload_token:
+        return workload_token
+    log.warning("no platform workload token for %s — falling back to ForUserId", actor_id)
+    return _agentcore.get_workload_access_token_for_user_id(
+        workloadName=_WORKLOAD, userId=actor_id)["workloadAccessToken"]
+
+
+def get_user_token_for(actor_id: str, provider: str, scopes: list,
+                       workload_token: str = "") -> tuple[str, str]:
+    """A vaulted token for any provider → ("token", …) or ("auth_url", …).
+
+    The Lark path stays separate (`get_user_lark_token`) because it does one thing this
+    cannot: it asks Lark whose token it actually is, and refuses a mismatch. That check is
+    vendor-specific — it reads a Lark endpoint — so a generic fetch cannot make the same
+    guarantee, and pretending otherwise would be the more dangerous option.
+
+    What protects a second system instead is that the fetch is keyed by the caller's own
+    workload token: this code cannot name a user, it can only use the identity the Runtime
+    derived from a verified JWT. So a token fetched here is whoever consented under that
+    identity. The remaining gap is the same one documented for Lark — consent completion
+    binds to the `state` the return url was told — which is why a tool acting on a second
+    system should still report whose account it reached, as `google_whoami` does."""
+    wat = _workload_token_for(actor_id, workload_token)
+    resp = _fetch_vaulted(wat, actor_id, provider=provider, scopes=scopes)
+    token = resp.get("accessToken")
+    if token:
+        return "token", token
+    # No grant: force once, because an authorizationUrl minted with forceAuthentication
+    # false cannot be completed (measured — see docs/agentcore-behavior.md).
+    resp = _fetch_vaulted(wat, actor_id, force=True, provider=provider, scopes=scopes)
+    if resp.get("accessToken"):
+        return "token", resp["accessToken"]
+    return "auth_url", resp["authorizationUrl"]
 
 
 def mcp_connection_for(lark_token: str, url: str = "") -> dict:
