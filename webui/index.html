@@ -10,8 +10,10 @@
     3. A /command goes to the router's /web/command instead: those rotate session ids the
        router owns, and the agent cannot reach the identity table at all.
 
-  The page never sends an open_id or a thread id — the agent derives both. See
-  docs/architecture.md.
+  The page sends no open_id and no thread id: both address a person, and a claimed one
+  would address the wrong person. It does carry the router's runtime session id, which
+  only routes — and sharing it puts this tab in the same container as the Lark chat,
+  which is what lets the agent serialise the two. See docs/architecture.md.
 -->
 <html lang="zh">
 <head>
@@ -173,8 +175,12 @@ function larkAuthCode() {
 }
 
 const uuid = () => crypto.randomUUID();
-// One runtime session id per page load: it decides which microVM serves this tab.
-const runtimeSession = 'web-' + uuid() + uuid().slice(0, 8);
+// The router's own routing key, not one of our own: a session id maps to exactly one
+// microVM, so sharing it puts this tab and the Lark chat in the same container — which is
+// what lets the agent serialise the two instead of them corrupting one conversation.
+// Falls back to a page-local id only if an older router did not send one.
+const runtimeSession = () => session.runtimeSessionId
+  || ('web-' + uuid() + uuid().slice(0, 8));
 
 const runtimeUrl = () =>
   `https://bedrock-agentcore.${session.region}.amazonaws.com/runtimes/`
@@ -184,7 +190,7 @@ const runtimeUrl = () =>
 const runtimeHeaders = (accept) => ({
   'Content-Type': 'application/json', 'Accept': accept,
   'Authorization': 'Bearer ' + session.token,
-  'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id': runtimeSession,
+  'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id': runtimeSession(),
 });
 
 // A reload shows what the agent remembers, read back from the checkpoint — not a copy this
@@ -255,7 +261,10 @@ async function runCommand(command) {
 async function ask(content) {
   // Neither actorId nor threadId carries authority: the agent verifies the actor against
   // the vaulted token's real owner, and derives the thread from it.
-  const body = {actorId: session.actorId, threadId: 'web', runId: uuid(),
+  // No thread id: it addresses a conversation by user alone, so a forged one would read
+  // somebody else's. The agent resolves it — and because this tab shares the router's
+  // runtime session id, it lands in the same container and inherits the same thread.
+  const body = {actorId: session.actorId, runId: uuid(), threadId: 'resolved-by-agent',
                 messages: [{id: uuid(), role: 'user', content}],
                 tools: [], context: [], state: {}, forwardedProps: {}};
   const res = await fetch(runtimeUrl(), {

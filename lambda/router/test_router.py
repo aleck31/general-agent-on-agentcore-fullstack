@@ -722,15 +722,22 @@ def test_web_session_honours_the_allowlist():
         assert index._web_session('{"code": "c"}')["statusCode"] == 403
 
 
-def test_web_session_returns_a_token_and_where_to_send_it():
+def test_web_session_hands_back_the_same_routing_key_lark_chat_uses():
+    """Both surfaces must land on one microVM: AgentCore maps a session id to exactly one,
+    which is what lets the agent serialise two surfaces' turns in process rather than
+    needing a distributed lock. A page-local id would put them in different containers,
+    where they corrupt one conversation."""
     import index, identity
     with mock.patch.object(index.lark, "open_id_from_auth_code", return_value="ou_x"), \
          mock.patch.object(identity, "resolve_user", return_value=("u1", False)), \
          mock.patch.object(identity, "is_user_allowed", return_value=True), \
+         mock.patch.object(identity, "get_or_create_session", return_value="ses_shared"), \
+         mock.patch.object(identity, "get_or_create_memory_session", return_value="sess_mem"), \
          mock.patch.object(index.cognito, "user_jwt", return_value="JWT"):
         r = index._web_session('{"code": "c"}')
     body = json.loads(r["body"])
     assert r["statusCode"] == 200 and body["token"] == "JWT"
+    assert body["runtimeSessionId"] == "ses_shared"
     assert body["runtimeArn"] and body["qualifier"]
 
 

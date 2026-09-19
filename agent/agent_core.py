@@ -258,6 +258,24 @@ def _run(coro, timeout: float | None = None):
     return asyncio.run_coroutine_threadsafe(coro, _LOOP).result(timeout)
 
 
+# actor -> the thread id the router last named for them. The router owns rotation (/reset,
+# /new), and only it is trusted to say which thread an actor is on; a surface that cannot
+# name one — the browser, where a claimed id would address another user's conversation —
+# reads it from here instead. Same container, because both share the router's runtime
+# session id, so this is in-process rather than shared state.
+_thread_named: dict[str, str] = {}
+
+
+def remember_thread(actor_id: str, mem_sid: str) -> None:
+    if mem_sid:
+        _thread_named[actor_id] = mem_sid
+
+
+def thread_for(actor_id: str) -> str:
+    """The thread this actor is on: what the router last named, else the derived default."""
+    return _thread_named.get(actor_id) or _session_id_for(actor_id)
+
+
 def _session_id_for(actor_id: str) -> str:
     """Deterministic per-user session id: one long conversation thread per user,
     shared across reconnects and entrypoints (STM retains it 30 days)."""
@@ -597,7 +615,8 @@ def chat_result(actor_id: str, message: str, email: str = "",
     When the user hasn't authorized Lark yet, needs_auth is True and auth_url is the
     raw consent URL, so the caller (router) can drive the wait-for-consent loop instead
     of asking the user to re-send."""
-    thread_id = mem_sid or _session_id_for(actor_id)
+    remember_thread(actor_id, mem_sid)
+    thread_id = mem_sid or thread_for(actor_id)
     # A turn is already running on this thread. This surface has to answer synchronously, so
     # it cannot wait for that turn — but the message is not lost: it is steered into the
     # running turn, whose answer covers it.
@@ -648,7 +667,8 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
     token, so the turn runs and consent is only raised if the model actually calls
     one. By then the router has returned, so the prompt is pushed to the chat like any
     other answer and the user re-sends after approving."""
-    thread_id = mem_sid or _session_id_for(actor_id)
+    remember_thread(actor_id, mem_sid)
+    thread_id = mem_sid or thread_for(actor_id)
     # A turn is already running on this thread: hand the message to it rather than starting
     # a second one. Two turns would each read the other's half-written checkpoint, and the
     # user would be told to re-send something the agent had in fact received.
@@ -775,7 +795,7 @@ async def aget_session(actor_id: str, workload_token: str = "") -> dict:
     """The cached session for this actor, fetched without blocking the caller's loop.
     Session building opens MCP connections, which is seconds of I/O."""
     return await arun_in_thread(_get_session, actor_id, "",
-                               _session_id_for(actor_id), False, workload_token)
+                               thread_for(actor_id), False, workload_token)
 
 
 def track_in_flight(delta: int) -> None:

@@ -745,6 +745,13 @@ def _web_session(body: str) -> dict:
         # Echoed so the page can name itself. Not a credential: the agent verifies the
         # claim against the vaulted token's real owner before using it.
         "actorId": actor_id,
+        # The same routing key Lark chat uses, so both surfaces land on one microVM and one
+        # conversation. AgentCore maps a session id to exactly one microVM, which is what
+        # lets the agent serialise two surfaces' turns in process instead of needing a
+        # distributed lock — see .dev/adr/0002. Neither id is a credential: one routes, the
+        # other names a thread, and without the JWT above neither does anything.
+        "runtimeSessionId": identity.get_or_create_session(user_id),
+        "memorySessionId": identity.get_or_create_memory_session(user_id, actor_id),
         "runtimeArn": RUNTIME_ARN,
         "region": os.environ.get("AWS_REGION", ""),
         "qualifier": QUALIFIER,

@@ -226,6 +226,31 @@ def test_a_buried_dangling_call_is_removed_not_answered_in_the_wrong_place():
     assert written[0].id == "ai-old"
 
 
+def test_the_thread_comes_from_the_router_never_from_a_client():
+    """A thread is addressed by user alone, so a claimed id would read somebody else's
+    conversation. The router owns rotation (/reset, /new) and is the only caller trusted to
+    name one; a surface that cannot — the browser — inherits what it last named, which works
+    because both share the router's runtime session id and land in one container."""
+    agent_core._thread_named.clear()
+    derived = agent_core._session_id_for("lark:ou_x")
+    assert agent_core.thread_for("lark:ou_x") == derived      # before anything is named
+    agent_core.remember_thread("lark:ou_x", "sess-rotated-by-reset")
+    assert agent_core.thread_for("lark:ou_x") == "sess-rotated-by-reset"
+    # An empty value must not erase what the router said.
+    agent_core.remember_thread("lark:ou_x", "")
+    assert agent_core.thread_for("lark:ou_x") == "sess-rotated-by-reset"
+    # And it is per actor.
+    assert agent_core.thread_for("lark:ou_other") == agent_core._session_id_for("lark:ou_other")
+
+
+def test_the_page_sends_no_thread_id():
+    """It cannot be trusted with one, so it must not be in a position to send one."""
+    import pathlib as _p
+    page = (_p.Path(__file__).parents[1] / "webui" / "index.html").read_text()
+    assert "memorySessionId" not in page
+    assert "runtimeSessionId" in page      # the routing key, which is not a capability
+
+
 def test_a_message_arriving_mid_turn_is_steered_not_refused():
     """Two turns on one thread each read the other's half-written checkpoint, which Bedrock
     rejects — the failure that made a live thread look broken. The second message joins the
