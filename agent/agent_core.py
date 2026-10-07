@@ -71,7 +71,13 @@ _APPROVAL_MCP_URL = os.environ.get("APPROVAL_MCP_URL", "")
 # no Google tools, the same way it has no search without a gateway.
 _GOOGLE_MCP_URL = os.environ.get("GOOGLE_MCP_URL", "")
 _GOOGLE_PROVIDER = os.environ.get("GOOGLE_OAUTH_PROVIDER", "")
-_GOOGLE_SCOPES = os.environ.get("GOOGLE_SCOPES", "openid email profile").split()
+_GOOGLE_SCOPES = os.environ.get(
+    "GOOGLE_SCOPES", "openid email profile https://www.googleapis.com/auth/calendar.readonly").split()
+# Systems besides Lark, keyed like the router's IDP_REGISTRY → (MCP url, provider, scopes).
+# Only configured ones appear, so the rest of the code never asks "is Google set up?".
+_DOWNSTREAMS = {k: v for k, v in {
+    "google": (_GOOGLE_MCP_URL, _GOOGLE_PROVIDER, _GOOGLE_SCOPES),
+}.items() if v[0] and v[1]}
 # Short on purpose. Operational facts a model cannot infer — the workspace persists, there
 # is no internet — live in each tool's description, next to what they constrain, instead of
 # being paid for on every turn. Debugging heuristics do not belong here at all: they encode
@@ -425,6 +431,16 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
     auth_url = None
     identity_error = None
     stack = AsyncExitStack()
+    # Consent is per system: each tool is tagged with the system whose server listed it, and
+    # a call is walled only when *that* system has no grant. Untagged tools never wall.
+    tool_idp: dict[str, str] = {}
+    consent: dict[str, str] = {}   # idp → consent link; "" until a tool of it is reached
+
+    async def _open(connection: dict, idp: str = "") -> list:
+        opened = await _aopen_tools(stack, connection)
+        if idp:
+            tool_idp.update((t.name, idp) for t in opened)
+        return opened
     try:
         kind, value = await asyncio.to_thread(
             lark_3lo.get_user_lark_token, actor_id, False, workload_token)
@@ -434,6 +450,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
 
     if kind == "auth_url":
         auth_url = value  # remembered for the tool-call path, not returned upfront
+        consent["lark"] = value
     elif kind == "wrong_owner":
         telemetry.count("identity_refused", reason="wrong_owner")
         # A claimed actor that does not own the vaulted token. Refused rather than offered a
@@ -449,7 +466,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
 
     if identity_error is None:
         try:
-            tools += await _aopen_tools(stack, lark_3lo.mcp_connection_for(token))
+            tools += await _open(lark_3lo.mcp_connection_for(token), "lark")
         except Exception:  # noqa: BLE001 — chat without Lark tools beats no reply
             log.exception("lark-mcp unavailable for %s", actor_id)
 
@@ -459,27 +476,24 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         # .dev/adr/0006. The user token is still passed: add_sign needs it.
         if _APPROVAL_MCP_URL:
             try:
-                tools += await _aopen_tools(
-                    stack, lark_3lo.mcp_connection_for(token, url=_APPROVAL_MCP_URL))
+                tools += await _open(
+                    lark_3lo.mcp_connection_for(token, url=_APPROVAL_MCP_URL), "lark")
             except Exception:  # noqa: BLE001 — optional, like search
                 log.exception("approval tools unavailable for %s", actor_id)
 
-    # A second downstream system, independent of the Lark grant: a user may have consented
-    # to one and not the other, and neither absence should cost them the other's tools.
-    # No consent prompt is raised here — the tools are listed, and Google's own 401 is what
-    # tells the model to ask, exactly as with Lark.
-    if _GOOGLE_MCP_URL and _GOOGLE_PROVIDER:
+    # Other systems, independent of the Lark grant: a user may have consented to one and not
+    # the other. Tools are listed either way (servers gate calls, not discovery); a missing
+    # grant only records the system, and its link is minted if one of its tools is reached —
+    # minting here would start a consent flow nobody asked for, killing any link in flight.
+    for idp, (url, provider, scopes) in _DOWNSTREAMS.items():
         try:
-            g_kind, g_token = await asyncio.to_thread(
-                lark_3lo.get_user_token_for, actor_id, _GOOGLE_PROVIDER, _GOOGLE_SCOPES,
-                workload_token)
-            if g_kind == "token":
-                tools += await _aopen_tools(
-                    stack, lark_3lo.mcp_connection_for(g_token, url=_GOOGLE_MCP_URL))
-            else:
-                log.info("google not consented for %s — tools omitted this turn", actor_id)
+            d_token = await asyncio.to_thread(
+                lark_3lo.peek_user_token_for, actor_id, provider, scopes, workload_token)
+            if not d_token:
+                consent[idp] = ""
+            tools += await _open(lark_3lo.mcp_connection_for(d_token, url=url), idp)
         except Exception:  # noqa: BLE001 — optional, like search
-            log.exception("google tools unavailable for %s", actor_id)
+            log.exception("%s tools unavailable for %s", idp, actor_id)
 
     # Search doesn't depend on the user's Lark grant, so add it even when the Lark
     # tools are unavailable — an unauthorised user can still ask questions.
@@ -527,7 +541,10 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         "config": config,
         "actor_id": actor_id, "mem_sid": mem_sid,
         "created": time.time(),
+        # auth_url is Lark's link and doubles as "identity unverified" for the web surfaces;
+        # consent/tool_idp drive the per-system wall.
         "auth_url": auth_url, "identity_error": identity_error,
+        "consent": consent, "tool_idp": tool_idp,
         # Tool results seen during the current turn, for the auth-wall scan.
         "tool_texts": [],
     }
@@ -554,35 +571,59 @@ def _close_session(s: dict) -> None:
 
 
 _AUTH_PROMPT = (
-    "To do that I need access to your Lark account. Please authorize once here, "
+    "To do that I need access to your {label} account. Please authorize once here, "
     "then send your message again:\n{url}"
 )
 
-# lark-mcp's reply when a tools/call arrives without a user token. It shows up as a
+# Every MCP server's reply when a tools/call arrives without a user token. It shows up as a
 # tool result, not necessarily in the model's final reply — the model may paraphrase or
 # translate. Scanning the tool results is what makes this robust.
 _NEEDS_TOKEN_MARKER = "no user token (authorize first)"
 
 
-def _hit_auth_wall(session: dict) -> bool:
-    """True when this turn needs consent — either because the stream was aborted at a
-    Lark tool call (the fast path, before the model can editorialise) or because a tool
-    result carried lark-mcp's refusal (the fallback, e.g. an already-authorized session
-    whose token went stale mid-turn)."""
-    if session.pop("walled_tool", None):
-        return True
+def _walled_idp(session: dict, tool_name: str) -> str | None:
+    """The system `tool_name` acts on, if this session holds no grant for it."""
+    idp = (session.get("tool_idp") or {}).get(tool_name)
+    return idp if idp in (session.get("consent") or {}) else None
+
+
+def _hit_auth_wall(session: dict) -> str | None:
+    """The system this turn needs consent for, or None — either because the stream was
+    aborted at one of its tool calls (the fast path, before the model can editorialise) or
+    because a tool result carried the server's refusal (the fallback, e.g. the sync path)."""
+    tool = session.pop("walled_tool", None)
+    if tool:
+        return _walled_idp(session, tool)
     return _hit_auth_wall_from_tool_results(session)
 
 
-def _hit_auth_wall_from_tool_results(session: dict) -> bool:
-    """True if this turn produced a tool result asking the user to authorize.
+def _hit_auth_wall_from_tool_results(session: dict) -> str | None:
+    """The system whose server refused a call this turn for want of a user token.
 
     Reads the tool results collected while streaming rather than the model's answer,
     because the model paraphrases errors — 'no user token is available' would slip
     through a string check on the reply, and did in end-to-end testing."""
-    if not session.get("auth_url"):
-        return False
-    return any(_NEEDS_TOKEN_MARKER in t for t in session.get("tool_texts") or [])
+    for name, text in session.get("tool_texts") or []:
+        if _NEEDS_TOKEN_MARKER in text:
+            idp = _walled_idp(session, name)
+            if idp:
+                return idp
+    return None
+
+
+def _consent_link(session: dict, idp: str, workload_token: str = "") -> str:
+    """The link to consent to `idp`, minted now if the build deferred it. "" when the vault
+    turns out to hold a grant after all (its reads are nondeterministic, see _get_session)."""
+    link = session["consent"].get(idp)
+    if link or idp not in _DOWNSTREAMS:
+        return link or ""
+    _, provider, scopes = _DOWNSTREAMS[idp]
+    kind, value = lark_3lo.get_user_token_for(
+        session["actor_id"], provider, scopes, workload_token)
+    if kind != "auth_url":
+        return ""
+    session["consent"][idp] = value
+    return value
 
 
 _IDENTITY_ERROR = (
@@ -668,11 +709,13 @@ def chat_result(actor_id: str, message: str, email: str = "",
         _track(-1, thread_id)
     for m in state.get("messages", []):
         if isinstance(m, ToolMessage):
-            s["tool_texts"].append(_message_text(m))
+            s["tool_texts"].append((m.name, _message_text(m)))
     reply = _message_text(state["messages"][-1]) if state.get("messages") else ""
-    if _hit_auth_wall(s):
-        return {"reply": _AUTH_PROMPT.format(url=s["auth_url"]),
-                "needs_auth": True, "auth_url": s["auth_url"]}
+    idp = _hit_auth_wall(s)
+    link = _consent_link(s, idp, workload_token) if idp else ""
+    if link:
+        return {"reply": _AUTH_PROMPT.format(label=idp.capitalize(), url=link),
+                "needs_auth": True, "auth_url": link, "idp": idp}
     return {"reply": reply, "needs_auth": False}
 
 
@@ -716,14 +759,19 @@ def chat_async(actor_id: str, message: str, chat_id: str, email: str = "",
         try:
             with telemetry.timed("turn", surface="lark"):
                 answer = _stream_to_chat(s, message, chat_id)
-            if _hit_auth_wall(s):
-                telemetry.count("auth_wall", surface="lark")
-                # A clickable "点击授权" link, matching the router's synchronous path,
-                # instead of a raw URL. The message was parked before this turn, so the
-                # shim's /return replays it once consent lands — no re-send.
-                lark_notify.send_link(
-                    chat_id, "需要访问你的 Lark 账号，授权后我会自动继续：",
-                    "点击授权", s["auth_url"])
+            idp = _hit_auth_wall(s)
+            if idp:
+                telemetry.count("auth_wall", surface="lark", idp=idp)
+                link = _consent_link(s, idp, workload_token)
+                if link:
+                    # The message was parked before this turn, so the shim's /return
+                    # replays it once consent lands — no re-send.
+                    lark_notify.send_link(
+                        chat_id, f"需要访问你的 {idp.capitalize()} 账号，授权后我会自动继续：",
+                        "点击授权", link)
+                else:
+                    _drop_sessions(actor_id)
+                    lark_notify.send_text(chat_id, f"{idp.capitalize()} 已授权，请再发一次。")
         except Exception as e:  # noqa: BLE001 — the caller is already gone
             log.exception("async turn failed for %s", actor_id)
             # This session stays cached, so a turn that died mid tool call would make every
@@ -777,9 +825,9 @@ def _iter_deltas(graph, message: str, config: dict, on_tool_use=None,
     without touching asyncio.
 
     `on_tool_use(tool_name) -> bool` is consulted when the model starts a tool call;
-    returning True abandons the stream. Used to cut a turn short the moment an
-    unauthorized session reaches for a Lark tool. `on_tool_result(text)` receives each
-    tool result, which is how the auth-wall fallback sees lark-mcp's refusal."""
+    returning True abandons the stream. Used to cut a turn short the moment the model
+    reaches for a tool whose system has no grant. `on_tool_result(name, text)` receives
+    each tool result, which is how the auth-wall fallback sees a server's refusal."""
     q: queue.Queue = queue.Queue()
 
     async def _pump() -> None:
@@ -789,13 +837,13 @@ def _iter_deltas(graph, message: str, config: dict, on_tool_use=None,
             async for chunk, _meta in stream:
                 if isinstance(chunk, ToolMessage):
                     if on_tool_result is not None:
-                        on_tool_result(_message_text(chunk))
+                        on_tool_result(chunk.name, _message_text(chunk))
                     continue
                 # Strands emitted no tool-result event and LangGraph does; what both
                 # give us is the tool call as it *starts*, which is what matters here:
-                # in an unauthorized session any Lark tool call is certain to be
-                # refused, so seeing one begin means the turn is already lost — stop
-                # rather than let the model narrate the refusal at length.
+                # a call to a system with no grant is certain to be refused, so seeing
+                # one begin means the turn is already lost — stop rather than let the
+                # model narrate the refusal at length.
                 for tc in getattr(chunk, "tool_call_chunks", None) or []:
                     name = tc.get("name")
                     if name and on_tool_use is not None and on_tool_use(name):
@@ -874,23 +922,21 @@ def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
     card = lark_notify.StreamingCard(chat_id)
     streaming = card.open()
 
-    # Unauthorized: the first Lark tool the model reaches for is certain to be refused,
-    # and letting the turn run on means it narrates that refusal at length before the
-    # consent card arrives. Stop at the tool call instead — the caller sees `walled`
-    # and posts the card as the only reply.
-    unauthorized = bool(session.get("auth_url"))
-
-    def _abort_on_lark_tool(tool_name: str) -> bool:
-        if not unauthorized or tool_name.startswith("WebSearch"):
+    # A tool whose system has no grant is certain to be refused, and letting the turn run
+    # on means the model narrates that refusal at length before the consent card arrives.
+    # Stop at the tool call instead — the caller sees `walled_tool` and posts the card.
+    def _abort_on_ungranted_tool(tool_name: str) -> bool:
+        idp = _walled_idp(session, tool_name)
+        if not idp:
             return False
         session["walled_tool"] = tool_name
-        log.info("aborting turn: %s needs consent", tool_name)
+        log.info("aborting turn: %s needs %s consent", tool_name, idp)
         return True
 
     acc = []
     for delta in _iter_deltas(session["graph"], message, session["config"],
-                              on_tool_use=_abort_on_lark_tool,
-                              on_tool_result=session["tool_texts"].append):
+                              on_tool_use=_abort_on_ungranted_tool,
+                              on_tool_result=lambda name, text: session["tool_texts"].append((name, text))):
         acc.append(delta)
         if streaming and not card.update("".join(acc)):
             streaming = False  # a failed write drops us to the fallback below
@@ -900,7 +946,8 @@ def _stream_to_chat(session: dict, message: str, chat_id: str) -> str:
     # about a failure the user is about to be asked to fix, so replace it rather than
     # leave it on the card.
     if session.get("walled_tool"):
-        text = "🔐 这一步需要访问你的 Lark 账号"
+        idp = _walled_idp(session, session["walled_tool"]) or "lark"
+        text = f"🔐 这一步需要访问你的 {idp.capitalize()} 账号"
 
     if streaming:
         if not card.close(text):
@@ -1021,13 +1068,25 @@ def clear_history(actor_id: str, mem_sid: str = "") -> dict:
 
 
 def auth_status(actor_id: str, workload_token: str = "") -> dict:
-    """Which IdPs this user has authorised → {"lark": bool}.
+    """Which IdPs this user has authorised → {"lark": bool, "google": bool, …}.
 
     Only the agent can answer this. A consent is vaulted against the workload identity the
     Runtime derives from the inbound JWT, and re-deriving one from a fresh JWT for the same
     user reads a different namespace — see docs/agentcore-behavior.md."""
     kind, _ = lark_3lo.get_user_lark_token(actor_id, workload_token=workload_token)
-    return {"lark": kind == "token"}
+    status = {"lark": kind == "token"}
+    for idp, (_, provider, scopes) in _DOWNSTREAMS.items():
+        status[idp] = bool(lark_3lo.peek_user_token_for(actor_id, provider, scopes, workload_token))
+    return status
+
+
+def _drop_sessions(actor_id: str) -> None:
+    """Drop every cached session for this user so the next turn re-reads the vault."""
+    with _lock:
+        for key in [k for k in _sessions if k.startswith(f"{actor_id}|")]:
+            s = _sessions.pop(key, None)
+            if s:
+                _close_session(s)
 
 
 def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
@@ -1036,24 +1095,20 @@ def reauth(actor_id: str, idp: str = "lark", workload_token: str = "") -> dict:
     Per-IdP, and the Lark path stays distinct for a reason: only it can ask the vendor whose
     token this actually is and refuse a mismatch. A second system reuses the generic vault
     fetch, which cannot make that check — see lark_3lo.get_user_token_for."""
-    if idp in ("google",) and not (_GOOGLE_PROVIDER and _GOOGLE_MCP_URL):
-        return {"reply": "Google 未配置（需要 GOOGLE_CLIENT_ID 与已部署的 google MCP server）",
-                "needs_auth": False}
-    if idp not in ("", "lark", "google"):
-        return {"reply": f"IdP 尚未接入：{idp}", "needs_auth": False}
-    # Drop every cached session for this user so the next turn re-reads the vault.
-    with _lock:
-        for key in [k for k in _sessions if k.startswith(f"{actor_id}|")]:
-            s = _sessions.pop(key, None)
-            if s:
-                _close_session(s)
-    if idp == "google":
-        kind, value = lark_3lo.get_user_token_for(
-            actor_id, _GOOGLE_PROVIDER, _GOOGLE_SCOPES, workload_token)
-    else:
+    idp = idp or "lark"
+    if idp != "lark" and idp not in _DOWNSTREAMS:
+        # The router lists what it has registered; the agent may lack the server or provider.
+        known = idp == "google"
+        return {"reply": f"{idp.capitalize()} 未配置（需要 OAuth provider 与已部署的 MCP server）"
+                if known else f"IdP 尚未接入：{idp}", "needs_auth": False}
+    _drop_sessions(actor_id)
+    if idp == "lark":
         kind, value = lark_3lo.get_user_lark_token(actor_id, force=True,
                                                    workload_token=workload_token)
+    else:
+        _, provider, scopes = _DOWNSTREAMS[idp]
+        kind, value = lark_3lo.get_user_token_for(actor_id, provider, scopes, workload_token)
     if kind == "auth_url":
-        return {"reply": _AUTH_PROMPT.format(url=value),
+        return {"reply": _AUTH_PROMPT.format(label=idp.capitalize(), url=value),
                 "needs_auth": True, "auth_url": value}
     return {"reply": "Already authorized.", "needs_auth": False}

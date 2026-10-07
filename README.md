@@ -91,7 +91,7 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 | `./deploy.sh mcp` | build every MCP server under `mcp-servers/` (CodeBuild ARM64) + create/update a Runtime each. `./deploy.sh mcp approval` for just one |
 | `./deploy.sh 3lo` | workload identity + the `agentcore-fullstack-3lo` OAuth credential provider |
 | `./deploy.sh gateway` | Web Search gateway in us-east-1 — skipped unless `WEB_SEARCH=true` |
-| `./deploy.sh runtime` | build the agent image + deploy the agent Runtime |
+| `./deploy.sh runtime` | point the agent Runtime at the image `base` published — agent code changes need `base` first |
 | `./deploy.sh lark` | seed Lark credentials to Secrets Manager + allowlist your `open_id` |
 | `./deploy.sh approvals` | subscribe to Lark approval events for each `AGENT_DECIDE_APPROVAL_CODES` definition — no-op when that is empty. Ticking the event in the console is **not** sufficient; Lark delivers approval events only for definitions also subscribed through the API |
 
@@ -183,6 +183,22 @@ To enable:
 One tool is deliberately left unusable: `approval_add_sign` (加签) is the single approval endpoint that takes the *user's* token instead of the app's, but the vaulted token carries only the scopes `LARK_SCOPES` requests (`drive:drive docx:document offline_access`), and the only user-token approval scope on offer is `approval:approval:readonly` — a read scope, while add_sign writes. So it fails on permissions by construction. It stays exposed because that boundary is the lesson: Lark's approval API admits a user identity for exactly one operation, and not one this sample can reach.
 
 Then submit an approval assigned to that approver. Both outcomes are worth trying: within the limits the agent decides and comments `[AI 自动处理]`; over the amount ceiling it refuses to decide and hands the case back.
+
+### Optional: Google as a second downstream system
+
+Off unless `GOOGLE_CLIENT_ID` is set. It exists to show the identity chain is not Lark-specific: Google is a built-in AgentCore vendor, so there is no shim — the `google` MCP server calls Google's APIs with the user's own token and offers `google_whoami` and a read-only `google_calendar_upcoming`.
+
+In [Google Auth Platform](https://console.cloud.google.com/auth/overview) for your project:
+
+1. **APIs & Services → Library**: enable **Google Calendar API**.
+2. **Audience**: *Internal* (Google Workspace — no verification needed, any account in your organisation can consent). *External* also works, but while in testing only the listed test users can consent.
+3. **Data Access**: add `openid`, `.../auth/userinfo.email`, `.../auth/userinfo.profile`, `.../auth/calendar.readonly` — the scopes `GOOGLE_SCOPES` requests.
+4. **Clients → Create client → Web application**. Put the ID and secret in `.env` as `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`, then run `./deploy.sh` (idempotent; it creates the `agentcore-fullstack-google` provider, the `google` MCP Runtime, and adds `google` to the router's `/auth` list).
+5. Back on the client: **Authorized redirect URIs** = the `callbackUrl` that `./deploy.sh 3lo` prints for the Google provider (`https://bedrock-agentcore.<region>.amazonaws.com/identities/oauth2/callback/<uuid>` — a different uuid from Lark's). Saving it adds `amazonaws.com` to **Branding → Authorized domains** automatically.
+
+Then `/auth google` in the bot chat. Google shows two screens — sign-in (name and picture), then the Calendar permission — both are expected.
+
+> If consent ends in Google's `400 error.` page, retry with only one Google account signed in (or in an incognito window).
 
 ### Letting more people in
 

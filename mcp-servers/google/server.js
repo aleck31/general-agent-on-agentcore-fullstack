@@ -10,9 +10,8 @@
 // caller's own access token. And that token is all this server has — it holds no client
 // secret and no service account, so it can reach exactly what the user consented to.
 //
-// Deliberately one tool. `google_whoami` proves the identity chain end to end (the address
-// it returns is the consenting user's) without choosing between Drive, Gmail and Calendar,
-// and without a scope that would need Google's verification review.
+// `google_whoami` proves the identity chain (the address it returns is the consenting user's);
+// `google_calendar_upcoming` is the demo — read-only, so a wrong turn cannot change anything.
 'use strict';
 
 const http = require('http');
@@ -30,6 +29,33 @@ const TOOLS = [
       + 'acting as that person against Google, not as an application.',
     inputSchema: { type: 'object', properties: {} },
     call: () => googleGet('https://www.googleapis.com/oauth2/v3/userinfo'),
+  },
+  {
+    name: 'google_calendar_upcoming',
+    description:
+      "List the calling user's upcoming events from their primary Google Calendar, soonest "
+      + 'first. Read-only. Optional max_results (default 10, at most 50) and days_ahead '
+      + '(default 7).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        max_results: { type: 'integer', description: 'how many events, 1-50 (default 10)' },
+        days_ahead: { type: 'integer', description: 'how far ahead to look, in days (default 7)' },
+      },
+    },
+    call: (args) => {
+      const n = Math.min(Math.max(parseInt(args.max_results || 10, 10) || 10, 1), 50);
+      const days = Math.min(Math.max(parseInt(args.days_ahead || 7, 10) || 7, 1), 365);
+      const now = new Date();
+      const q = new URLSearchParams({
+        timeMin: now.toISOString(),
+        timeMax: new Date(now.getTime() + days * 86400000).toISOString(),
+        maxResults: String(n), singleEvents: 'true', orderBy: 'startTime',
+        // Only what a summary needs; attendees and descriptions stay out of the model's context.
+        fields: 'items(summary,start,end,location,htmlLink,status),timeZone',
+      });
+      return googleGet(`https://www.googleapis.com/calendar/v3/calendars/primary/events?${q}`);
+    },
   },
 ];
 
@@ -107,7 +133,7 @@ const server = http.createServer((req, res) => {
       }
       if (!userToken) {
         return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {
-          content: [{ type: 'text', text: 'no user token (authorize Google first)' }], isError: true } });
+          content: [{ type: 'text', text: 'no user token (authorize first)' }], isError: true } });
       }
       const out = await tool.call(mcp.params.arguments || {})(userToken);
       return sse(res, { jsonrpc: '2.0', id: mcp.id, result: {

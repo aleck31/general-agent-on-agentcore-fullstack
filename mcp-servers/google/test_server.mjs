@@ -38,7 +38,7 @@ test('tools are listed without a token, so an unconsented user still gets a sess
     await withServer(async () => {
       const out = await frame(await post({ jsonrpc: '2.0', id: 1, method: 'tools/list' }));
       const names = out.result.tools.map((t) => t.name);
-      assert.deepEqual(names, ['google_whoami']);
+      assert.deepEqual(names, ['google_whoami', 'google_calendar_upcoming']);
     });
   });
 

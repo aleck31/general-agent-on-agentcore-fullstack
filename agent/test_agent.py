@@ -230,8 +230,7 @@ def test_a_second_downstream_system_is_absent_not_broken():
     """Google unconfigured must cost nothing: no session build failure, no tool, and /auth
     google says so instead of pretending. The same convention as search and long-term
     memory — an optional system that is not deployed simply is not there."""
-    with mock.patch.object(agent_core, "_GOOGLE_MCP_URL", ""), \
-         mock.patch.object(agent_core, "_GOOGLE_PROVIDER", ""):
+    with mock.patch.dict(agent_core._DOWNSTREAMS, {}, clear=True):
         r = agent_core.reauth("lark:ou_x", "google")
     assert r["needs_auth"] is False
     assert "未配置" in r["reply"]
@@ -383,11 +382,11 @@ def test_auth_marker_matches_the_mcp_server():
     not, the user silently stops being offered a consent link."""
     here = os.path.dirname(__file__)
     core = open(os.path.join(here, "agent_core.py"), encoding="utf-8").read()
-    server = open(os.path.join(here, "..", "mcp-servers", "lark-cli", "server.js"), encoding="utf-8").read()
     marker = re.search(r'_NEEDS_TOKEN_MARKER = "([^"]+)"', core).group(1)
-    assert marker in server, (
-        f"agent_core expects {marker!r} but mcp-servers/lark-cli/server.js no longer says it"
-    )
+    for name in ("lark-cli", "approval", "google"):
+        server = open(os.path.join(here, "..", "mcp-servers", name, "server.js"), encoding="utf-8").read()
+        assert marker in server, (
+            f"agent_core expects {marker!r} but mcp-servers/{name}/server.js no longer says it")
 
 
 def test_hit_auth_wall_reads_tool_results_not_the_final_reply():
@@ -395,21 +394,21 @@ def test_hit_auth_wall_reads_tool_results_not_the_final_reply():
     paraphrases errors, so 'no user token is available' in the reply slips past a string
     check on the reply — verified end-to-end before this fix."""
     hit = agent_core._hit_auth_wall_from_tool_results
+    lark = {"consent": {"lark": "https://consent"}, "tool_idp": {"lark_docs": "lark"}}
 
     # 1. Nothing collected → nothing to inspect, so no auth wall.
-    assert hit({"auth_url": "https://consent"}) is False
-    assert hit({"auth_url": "https://consent", "tool_texts": []}) is False
+    assert hit(lark) is None
+    assert hit({**lark, "tool_texts": []}) is None
     # 2. A paraphrase of the error, not the tool's own words → NOT a wall. This is
     #    exactly the case that fooled the first version of this function.
-    assert hit({"auth_url": "https://consent", "tool_texts": [
-        "It looks like no user token is available — please authorize"]}) is False
-    # 3. The tool result carrying the marker verbatim → wall.
-    walled = {"auth_url": "https://consent",
-              "tool_texts": ["no user token (authorize first)"]}
-    assert hit(walled) is True
-    # 4. Same tool result but the session is authorized → no wall (auth_url absent),
-    #    because then the refusal means something else and consent won't fix it.
-    assert hit({"tool_texts": ["no user token (authorize first)"]}) is False
+    assert hit({**lark, "tool_texts": [
+        ("lark_docs", "It looks like no user token is available — please authorize")]}) is None
+    # 3. The tool result carrying the marker verbatim → wall, for that tool's system.
+    assert hit({**lark, "tool_texts": [("lark_docs", "no user token (authorize first)")]}) == "lark"
+    # 4. Same tool result but the system is granted → no wall, because then the refusal
+    #    means something else and consent won't fix it.
+    assert hit({"tool_idp": {"lark_docs": "lark"}, "consent": {},
+                "tool_texts": [("lark_docs", "no user token (authorize first)")]}) is None
 
 
 def test_unauthorized_session_passes_an_empty_token_and_still_gets_tools():
@@ -431,6 +430,8 @@ def test_unauthorized_session_passes_an_empty_token_and_still_gets_tools():
         s = agent_core._build_session("lark:ou_x", "", "mem1")
 
     assert s["auth_url"] == "https://consent"      # consent is remembered, not raised
+    assert s["consent"] == {"lark": "https://consent"}
+    assert s["tool_idp"] == {_dummy_tool.name: "lark"}
     assert opened == [{"tok": ""}], "the server must still be connected, with no token"
     assert s["graph"] is not None, "the model must see the Lark tools regardless"
 
@@ -736,7 +737,8 @@ def test_stream_aborts_when_an_unauthorized_session_reaches_a_lark_tool():
     card = FakeCard()
     session = _session_for(["让我查一下…"], tool_calls=["approval_list_pending"],
                            follow_up="很抱歉，我没有权限……",
-                           auth_url="https://consent")
+                           consent={"lark": "https://consent"},
+                           tool_idp={"approval_list_pending": "lark"})
     with _patch_notify(card, []):
         text = agent_core._stream_to_chat(session, "查待审批", "oc_1")
     assert session.get("walled_tool") == "approval_list_pending"
@@ -751,7 +753,7 @@ def test_stream_does_not_abort_on_websearch_when_unauthorized():
     """Search needs no Lark grant, so an unauthorized user must still get results."""
     card = FakeCard()
     session = _session_for(["天气是…"], tool_calls=["WebSearch___WebSearch"],
-                           follow_up="晴天", auth_url="https://consent")
+                           follow_up="晴天", consent={"lark": "https://consent"})
     with _patch_notify(card, []):
         text = agent_core._stream_to_chat(session, "今天天气", "oc_1")
     assert "walled_tool" not in session
@@ -777,12 +779,12 @@ def test_stream_collects_tool_results_for_the_auth_wall_fallback():
     # of the way and the turn runs to completion — the fallback's actual situation is a
     # session that looked authorized until a tool refused mid-turn.
     session = _session_for(["查询中…"], tool_calls=["lark_list_my_docs"],
-                           follow_up="失败了")
+                           follow_up="失败了", tool_idp={"lark_list_my_docs": "lark"})
     with _patch_notify(card, []):
         agent_core._stream_to_chat(session, "查文档", "oc_1")
-    session["auth_url"] = "https://consent"   # the vault lookup that follows finds one
-    assert any(agent_core._NEEDS_TOKEN_MARKER in t for t in session["tool_texts"])
-    assert agent_core._hit_auth_wall(session) is True
+    session["consent"] = {"lark": "https://consent"}   # the vault lookup that follows finds none
+    assert any(agent_core._NEEDS_TOKEN_MARKER in t for _, t in session["tool_texts"])
+    assert agent_core._hit_auth_wall(session) == "lark"
 
 
 def test_stream_falls_back_to_text_when_card_cannot_open():
@@ -1178,3 +1180,51 @@ def test_an_unconsented_caller_gets_needs_consent_not_a_guess():
     with mock.patch.object(lark_3lo, "_agentcore") as ac:
         ac.get_resource_oauth2_token.return_value = {"authorizationUrl": "https://x"}
         assert lark_3lo.actor_from_workload_token("WAT") == ("needs_consent", "")
+
+
+def test_consent_is_asked_for_the_system_the_tool_acts_on():
+    """A Google grant without a Lark one was walled with the Lark card for google_whoami:
+    the wall keyed on Lark alone. Each tool now walls only on its own system's grant."""
+    tool_idp = {"lark_docs": "lark", "google_whoami": "google"}
+    s = {"consent": {"lark": "https://lark"}, "tool_idp": tool_idp}
+    assert agent_core._walled_idp(s, "lark_docs") == "lark"
+    assert agent_core._walled_idp(s, "google_whoami") is None      # Google is granted
+    assert agent_core._walled_idp(s, "memory_save") is None        # untagged never walls
+    s = {"consent": {"google": ""}, "tool_idp": tool_idp}
+    assert agent_core._walled_idp(s, "google_whoami") == "google"
+    assert agent_core._walled_idp(s, "lark_docs") is None
+
+
+def test_stream_walls_a_google_tool_with_the_google_card():
+    card = FakeCard()
+    session = _session_for(["查一下…"], tool_calls=["google_whoami"], follow_up="没有权限",
+                           consent={"google": ""}, tool_idp={"google_whoami": "google"})
+    with _patch_notify(card, []):
+        text = agent_core._stream_to_chat(session, "我的 Google 账号", "oc_1")
+    assert session.get("walled_tool") == "google_whoami"
+    assert "Google" in text and "Lark" not in text
+
+
+def test_downstream_consent_is_recorded_at_build_and_minted_only_when_reached():
+    """Minting at build would start a consent flow nobody asked for and kill any link the
+    user is already holding; the build only peeks, the wall mints."""
+    async def fake_open(stack, connection):
+        return [_make_tool("google_whoami")] if connection["url"] else [_dummy_tool]
+
+    with mock.patch.dict(agent_core._DOWNSTREAMS, {"google": ("https://g", "p", ["openid"])},
+                         clear=True), \
+         mock.patch.object(agent_core.lark_3lo, "get_user_lark_token",
+                           return_value=("token", "lark-tok")), \
+         mock.patch.object(agent_core.lark_3lo, "peek_user_token_for", return_value=""), \
+         mock.patch.object(agent_core.lark_3lo, "get_user_token_for",
+                           return_value=("auth_url", "https://google-consent")) as mint, \
+         mock.patch.object(agent_core.lark_3lo, "mcp_connection_for",
+                           side_effect=lambda tok, url="": {"url": url}), \
+         mock.patch.object(agent_core, "_aopen_tools", fake_open), \
+         mock.patch.object(agent_core.websearch, "available", return_value=False):
+        s = agent_core._build_session("lark:ou_x", "", "mem1")
+        assert s["consent"] == {"google": ""} and not s["auth_url"]
+        assert s["tool_idp"]["google_whoami"] == "google"
+        mint.assert_not_called()
+        assert agent_core._consent_link(s, "google") == "https://google-consent"
+        mint.assert_called_once()

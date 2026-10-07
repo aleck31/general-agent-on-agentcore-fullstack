@@ -241,14 +241,19 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
                 "Run code and get its output. Use this for anything computed rather than "
                 "recalled — data work, file conversion, checking your own arithmetic. "
                 "Files you write persist between turns and across days, so build on them "
-                "instead of regenerating them. Python has pandas available."),
+                "instead of regenerating them. Nothing can be installed; Python already has "
+                "pandas, matplotlib, scikit-learn, opencv, moviepy and pydub (audio/video), "
+                "python-docx, python-pptx, openpyxl, pypdf and reportlab."),
             args_schema=_RunCodeArgs),
         StructuredTool.from_function(
             func=_guard(run_command), name="run_command",
             description=(
                 "Run one shell command in the workspace. Use it for the things a shell is "
                 "better at than a program — inspecting files, moving them, checking sizes. "
-                "There is no internet access here."),
+                "No internet and no root, so nothing can be installed. Available: jq, "
+                "sqlite3, gcc, make, ImageMagick `convert`. ffmpeg is not on PATH; its path "
+                "is `python3 -c 'import imageio_ffmpeg as f; print(f.get_ffmpeg_exe())'`. "
+                "Not available: git, pandoc, LibreOffice, tesseract, any browser."),
             args_schema=_RunCommandArgs),
         StructuredTool.from_function(
             func=_guard(list_files), name="list_files",

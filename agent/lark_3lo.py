@@ -290,6 +290,13 @@ def get_user_token_for(actor_id: str, provider: str, scopes: list,
     return "auth_url", resp["authorizationUrl"]
 
 
+def peek_user_token_for(actor_id: str, provider: str, scopes: list,
+                        workload_token: str = "") -> str:
+    """The vaulted token for `provider`, or "" — a read that never starts a consent flow."""
+    wat = _workload_token_for(actor_id, workload_token)
+    return _fetch_vaulted(wat, actor_id, provider=provider, scopes=scopes).get("accessToken") or ""
+
+
 def mcp_connection_for(lark_token: str, url: str = "") -> dict:
     """A langchain-mcp-adapters `StreamableHttpConnection` for an MCP-server Runtime:
     SigV4 transport + the Lark token in the custom passthrough header. Defaults to the

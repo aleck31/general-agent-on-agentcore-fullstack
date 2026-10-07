@@ -82,7 +82,7 @@ import os
 import boto3
 
 e = os.environ
-c = boto3.client("bedrock-agentcore-control")
+c = boto3.client("bedrock-agentcore-control", region_name=os.environ["AWS_REGION"])  # explicit: the profile default region won once
 cfg = {
     "customOauth2ProviderConfig": {
         "oauthDiscovery": {
@@ -143,7 +143,7 @@ import os
 import boto3
 
 e = os.environ
-c = boto3.client("bedrock-agentcore-control")
+c = boto3.client("bedrock-agentcore-control", region_name=os.environ["AWS_REGION"])  # explicit: the profile default region won once
 cfg = {"googleOauth2ProviderConfig": {
     "clientId": e["GOOGLE_CLIENT_ID"],
     "clientSecret": e["GOOGLE_CLIENT_SECRET"],
@@ -161,8 +161,12 @@ except c.exceptions.ResourceNotFoundException:
         oauth2ProviderConfigInput=cfg)
     print("  created")
 PYEOF
-  GOOGLE_CALLBACK="$(aws bedrock-agentcore-control get-oauth2-credential-provider \
-    --name "$GOOGLE_PROVIDER" --query callbackUrl --output text)"
+  # Retried: a provider can be unreadable for a few seconds after create returns (measured).
+  for _ in 1 2 3 4 5 6; do
+    GOOGLE_CALLBACK="$(aws bedrock-agentcore-control get-oauth2-credential-provider \
+      --name "$GOOGLE_PROVIDER" --query callbackUrl --output text 2>/dev/null)" && break
+    sleep 5
+  done
   warn "Google Cloud console → Credentials → your OAuth client → Authorized redirect URIs:"
   echo "  $GOOGLE_CALLBACK"
   echo "  (AgentCore's own callback, not the shim's /return — the shim is Lark-only)"
@@ -182,10 +186,10 @@ idps = [{"key": "lark", "provider": e["PROVIDER"],
          "scopes": ["drive:drive", "docx:document", "offline_access"],
          "label": "Lark"}]
 if e.get("HAS_GOOGLE"):
-    # openid/email/profile only: enough to prove whose token this is, and none of it is a
-    # sensitive scope, so the consent screen needs no verification review from Google.
+    # calendar.readonly is a sensitive scope: fine for test users in Testing, but publishing
+    # needs a verification review by Google. Read-only, so a demo cannot change anything.
     idps.append({"key": "google", "provider": e["GOOGLE_PROVIDER"],
-                 "scopes": ["openid", "email", "profile"],
+                 "scopes": ["openid", "email", "profile", "https://www.googleapis.com/auth/calendar.readonly"],
                  "label": "Google"})
 print(json.dumps(idps))')"
 echo "  $IDP_REGISTRY"
