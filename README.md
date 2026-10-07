@@ -50,7 +50,7 @@ Two behaviours worth knowing before reading the code. **Delivery is asynchronous
 
 Four layers ship switched off, because each adds cost or console work: web search (`WEB_SEARCH`), the web page (`WEBUI`), A2A (`A2A`), and code execution with its storage (`FILES_STORAGE`). The agent runs without any of them.
 
-See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop auth, and the consent-wait sequence; **[docs/agentcore-behavior.md](docs/agentcore-behavior.md)** for measured AgentCore Runtime/Gateway behavior (read this before debugging anything platform-level); **[docs/native-3lo-builtin-vendor.md](docs/native-3lo-builtin-vendor.md)** for the reusable recipe to give the agent access to *another* downstream system.
+See **[docs/architecture.md](docs/architecture.md)** for the full flow, per-hop auth, and the consent-wait sequence; **[docs/agentcore-behavior.md](docs/agentcore-behavior.md)** for measured AgentCore Runtime/Gateway behavior (read this before debugging anything platform-level); **[docs/per-user-oauth.md](docs/per-user-oauth.md)** for how a tool acts as the user in another app (Google, Slack, …) and how to add one.
 
 ## Layout
 
@@ -97,11 +97,11 @@ Individual steps, for iterating — each is idempotent, so re-running any of the
 
 Order matters in one place: `3lo` and `gateway` precede `runtime`, because the agent Runtime is created with the provider name and the gateway URL baked into its environment. `deploy.sh` handles that; the underlying implementations are in `scripts/`.
 
-`setup-3lo.sh` registers the OAuth credential provider (Lark behind the RFC-6749 shim) plus the agent's workload identity, and prints the provider `callbackUrl` — register that in the Lark console (step 4 below) before the first 3LO consent.
+`setup-3lo.sh` registers the OAuth credential provider (Lark behind the RFC-6749 shim) plus the agent's workload identity, and prints the provider `callbackUrl` — register that in the Lark console ([step 4](docs/console-setup.md#lark-console-setup)) before the first 3LO consent.
 
 Per-deployment ids (runtime/gateway) go to `.cdk-state.json` (gitignored), so `cdk.json` stays free of environment state.
 
-Optional web chat: set `WEBUI=true` in `.env`, then register the printed domain on the Lark app (step 5 below). CloudFront only assigns the domain at deploy time and the router must allow that exact origin to trade an h5 code for a JWT, so `./deploy.sh webui` writes it to `.cdk-state.json` and re-deploys the router itself — the same route the file system id takes. Off by default: without the Lark-side registration the page loads but can establish nobody.
+Optional web chat: set `WEBUI=true` in `.env`, then register the printed domain on the Lark app ([step 5](docs/console-setup.md#lark-console-setup)). CloudFront only assigns the domain at deploy time and the router must allow that exact origin to trade an h5 code for a JWT, so `./deploy.sh webui` writes it to `.cdk-state.json` and re-deploys the router itself — the same route the file system id takes. Off by default: without the Lark-side registration the page loads but can establish nobody.
 
 Optional web search: set `WEB_SEARCH=true` in `.env` before deploying (or run `./deploy.sh gateway` then `./deploy.sh runtime`). That provisions a Gateway fronting AgentCore's built-in Web Search connector — **in us-east-1, the only region offering it**, so the agent calls it cross-region. Search carries no end-user identity, so it uses `GATEWAY_IAM_ROLE` and never touches the per-user 3LO path the Lark tools have to avoid. Off by default; the agent just runs without the tool.
 
@@ -116,91 +116,11 @@ Deletes in dependency order — gateway targets → gateways (including the Web 
 
 Two consequences worth knowing: deleting the provider **purges every user's vaulted token**, so everyone consents again after a redeploy — and the new provider gets a **new `callbackUrl`** that must be registered in the Lark console (`scripts/setup-3lo.sh` prints it). Your Lark console app config is otherwise untouched; re-seed credentials from `.env` via `scripts/setup-lark.sh`.
 
-## Lark console setup
+## Console setup
 
-1. **Add features**: enable **Bot**.
-2. **Permissions & Scopes** — two groups, and the split is what makes the identity model real: the bot speaks with its own identity, while anything touching a user's data acts as that user.
+What to configure in the vendors' own consoles — scopes, events and redirect URLs for the Lark app, plus the optional approval demo and Google — is in **[docs/console-setup.md](docs/console-setup.md)**.
 
-   **Tenant token scopes** (the bot acting as itself — receiving webhooks, replying, reacting):
-
-   | Scope | Used for |
-   |---|---|
-   | `im:message` | receive events, send replies, and the in-progress emoji reaction (no separate reaction scope needed) |
-   | `im:message:readonly` | read message content |
-   | `im:message.p2p_msg:readonly` | **required for single (p2p) chats** — without it the bot never sees direct messages |
-   | `im:message.group_at_msg:readonly` | see @mentions in group chats (the router strips the mention before passing the text on) |
-   | `im:message:send_as_bot` | post as the bot |
-   | `im:resource` | download images the user sends |
-   | `contact:user.base:readonly` | resolve the sender's basic profile |
-   | `cardkit:card:write` | create and update the streaming reply card ("Create and update cards") |
-
-   **User token scopes** (the *user's* identity, via 3LO — this is what the Lark MCP server uses, so tools reach only what that user can). Needs admin approval:
-
-   | Scope | Used for |
-   |---|---|
-   | `drive:drive` | list and read the user's Drive |
-   | `docx:document` | read/write the user's documents |
-   | `offline_access` | issue a refresh token, so the vaulted grant survives without re-consent |
-
-   Nothing in the first group can read a user's documents, and nothing in the second is ever used to speak as the bot — `LARKSUITE_CLI_DEFAULT_AS=user` keeps the MCP server on the user's token exclusively. Widening what the agent can *do* for a user means adding user-token scopes here and to `LARK_SCOPES`; every user then re-consents once.
-3. **Events & Callbacks**: Request URL = the webhook URL from deploy output; enable Encryption; add `im.message.receive_v1`. For the approval demo also add **审批任务状态变更** (`approval_task`) — and note that ticking it here is not enough on its own, see below.
-4. **Security Settings → Redirect URLs**: add the OAuth credential provider's `callbackUrl` (`https://bedrock-agentcore.<region>.amazonaws.com/identities/oauth2/callback/<uuid>`, from `get-oauth2-credential-provider --name agentcore-fullstack-3lo`). This is where AgentCore Identity receives the 3LO code — not the shim URL.
-5. **Web chat only** (skip unless `WEBUI=true`) — three separate fields, and they do not match the same way:
-
-   | Field | Value | Why it is easy to get wrong |
-   |---|---|---|
-   | **Features → Web app** → Desktop + Mobile homepage | the CloudFront URL, "open in Lark" | This is what creates the workspace entry. A trusted domain alone gives you no way in |
-   | **Security Settings → H5 trusted domains** | the CloudFront URL, no trailing slash | Matched by origin. Grants JSAPI access — necessary, but by itself produces no entrypoint |
-   | **Security Settings → Redirect URLs** | the CloudFront URL **with a trailing `/`** | Matched as an exact page URL; `?query`/`#fragment` are stripped first. A homepage entry without the slash fails `requestAuthCode` with error 10236 ("invalid url"), which is the single most common cause |
-
-   No permission scope is needed for this: `requestAuthCode` is exempt from JSAPI authorization, and the code→`open_id` exchange requires none. Then publish, with your own user in the availability scope.
-
-6. **Publish** a version (re-publish after any scope/event change).
-
-### Optional: the approval demo
-
-Off by default. It shows what an agent must do when a downstream API *refuses* to accept the user's identity — Lark's approval endpoints take only an app token, so a decision is made by the app with a `user_id` saying whose name to record it under. Read [docs/architecture.md](docs/architecture.md#a-third-path-approvals-where-the-users-identity-cannot-be-passed-through) before switching it on: the limits are self-imposed, and what they can and cannot prevent is the point of the demo.
-
-To enable:
-
-1. Add the approval scopes and the `approval_task` event from step 3 above, then re-publish. The console lists these by display name, so both are given here:
-
-   | Scope | Type | Display name | Used for |
-   |---|---|---|---|
-   | `approval:approval` | tenant | View, create, update, and delete info of Approval app | making decisions (approve/reject/transfer) |
-   | `approval:approval:readonly` | tenant | Access Approval | reading instances and queues |
-
-   The `approval_task` event accepts **either** of those two (the console shows "any one suffices"), so nothing extra is needed to receive events.
-2. Set the limits in `.env` — the agent decides nothing until you do:
-   ```
-   AGENT_DECIDE_APPROVAL_CODES="<definitionCode>, ..."   # empty = decide nothing
-   AGENT_DECIDE_MAX_AMOUNT=1000                          # 0 = kill switch
-   ```
-   The definition code is the `definitionCode=` query parameter in the URL of a form's edit page in the Lark approval admin.
-3. `./deploy.sh mcp approval` (builds the approval Runtime — gated on that variable so it costs nothing when unused), then `./deploy.sh approvals` to subscribe. **Both the console tick and this API subscription are required**; Lark delivers approval events only for definitions subscribed through the API.
-4. Authorize as the approver (`/auth lark` in the bot chat). The server refuses to decide for anyone without their own grant on record, so an approver who never consented gets a 点击授权 card instead — after which the turn resumes on its own.
-
-One tool is deliberately left unusable: `approval_add_sign` (加签) is the single approval endpoint that takes the *user's* token instead of the app's, but the vaulted token carries only the scopes `LARK_SCOPES` requests (`drive:drive docx:document offline_access`), and the only user-token approval scope on offer is `approval:approval:readonly` — a read scope, while add_sign writes. So it fails on permissions by construction. It stays exposed because that boundary is the lesson: Lark's approval API admits a user identity for exactly one operation, and not one this sample can reach.
-
-Then submit an approval assigned to that approver. Both outcomes are worth trying: within the limits the agent decides and comments `[AI 自动处理]`; over the amount ceiling it refuses to decide and hands the case back.
-
-### Optional: Google as a second downstream system
-
-Off unless `GOOGLE_CLIENT_ID` is set. It exists to show the identity chain is not Lark-specific: Google is a built-in AgentCore vendor, so there is no shim — the `google` MCP server calls Google's APIs with the user's own token and offers `google_whoami` and a read-only `google_calendar_upcoming`.
-
-In [Google Auth Platform](https://console.cloud.google.com/auth/overview) for your project:
-
-1. **APIs & Services → Library**: enable **Google Calendar API**.
-2. **Audience**: *Internal* (Google Workspace — no verification needed, any account in your organisation can consent). *External* also works, but while in testing only the listed test users can consent.
-3. **Data Access**: add `openid`, `.../auth/userinfo.email`, `.../auth/userinfo.profile`, `.../auth/calendar.readonly` — the scopes `GOOGLE_SCOPES` requests.
-4. **Clients → Create client → Web application**. Put the ID and secret in `.env` as `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`, then run `./deploy.sh` (idempotent; it creates the `agentcore-fullstack-google` provider, the `google` MCP Runtime, and adds `google` to the router's `/auth` list).
-5. Back on the client: **Authorized redirect URIs** = the `callbackUrl` that `./deploy.sh 3lo` prints for the Google provider (`https://bedrock-agentcore.<region>.amazonaws.com/identities/oauth2/callback/<uuid>` — a different uuid from Lark's). Saving it adds `amazonaws.com` to **Branding → Authorized domains** automatically.
-
-Then `/auth google` in the bot chat. Google shows two screens — sign-in (name and picture), then the Calendar permission — both are expected.
-
-> If consent ends in Google's `400 error.` page, retry with only one Google account signed in (or in an incognito window).
-
-### Letting more people in
+## Letting more people in
 
 The bot answers only allowlisted users; `./deploy.sh lark` adds you and nobody else. An unlisted user who messages the bot is told their own id, which is the easiest way to collect one:
 
@@ -237,7 +157,7 @@ The four extension points that need no new plumbing:
 | To add | Do this |
 |---|---|
 | A tool server | Create `mcp-servers/<name>/` with a `Dockerfile`, a server speaking MCP on `:8000`, and a `runtime.env` (`RUNTIME_SUFFIX`, `IMAGE_TAG`, `RUNTIME_ENV_MAP`, optional `DEPLOY_IF` gate and `REQUIRE_VARS`), then `./deploy.sh mcp <name>`. `scripts/build-mcp.sh` needs no edit — each server describes itself. The agent must be pointed at the new Runtime's URL, the way `APPROVAL_MCP_URL` is in `scripts/provision.sh` |
-| A downstream system with its own login | Register an OAuth credential provider and append an `IDP_REGISTRY` entry — `/auth` then reports it and `/auth <key>` consents to it. Built-in vendors need no shim; anything non-standard needs one like `lambda/shim/`. Recipe: `docs/native-3lo-builtin-vendor.md` |
+| A downstream system with its own login | Register an OAuth credential provider, add an MCP server, and one entry each in `IDP_REGISTRY` (router) and `_DOWNSTREAMS` (agent) — `/auth` then reports it, `/auth <key>` consents to it, and its tools ask for that system's consent. Built-in vendors need no shim; anything non-standard needs one like `lambda/shim/`. Recipe: `docs/per-user-oauth.md` |
 | A different model | `MODEL_ID` in `.env` (falls back to `default_model_id` in `cdk.json`), then `./deploy.sh runtime` |
 | A different system prompt | `AGENT_SYSTEM_PROMPT` in `.env`, passed through to the Runtime by `./deploy.sh runtime`. Blank keeps the default in `agent/agent_core.py`, which is short on purpose |
 

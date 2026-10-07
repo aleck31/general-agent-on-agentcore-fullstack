@@ -1,4 +1,4 @@
-# Adding another downstream system (per-user 3LO)
+# Per-user OAuth: letting a tool act as the user in another app
 
 Lark is the system this repo wires up, but the pattern isn't Lark-specific: **one OAuth credential provider per downstream system, one vaulted token per (user, provider)**, and the agent fetches whichever one a tool needs. This page is the checklist. For the reasoning, the measured evidence and the full OAuth dance, read the two samples that exist for that subject: [sample-lark-identity-on-agentcore-native](https://github.com/aws-samples/sample-lark-identity-on-agentcore-native) and [sample-lark-identity-on-agentcore-interceptor](https://github.com/aws-samples/sample-lark-identity-on-agentcore-interceptor).
 
@@ -16,7 +16,7 @@ Lark is the system this repo wires up, but the pattern isn't Lark-specific: **on
 
 ## Steps
 
-1. **Create the OAuth client at the IdP.** Leave the redirect URI as a placeholder; you fill it in at step 3.
+1. **Create the OAuth client at the IdP** (for Google, see [console-setup.md](console-setup.md#optional-google-as-a-second-downstream-system)). Leave the redirect URI as a placeholder; you fill it in at step 3.
 2. **Register the credential provider.**
    ```bash
    aws bedrock-agentcore-control create-oauth2-credential-provider \
@@ -35,8 +35,8 @@ Lark is the system this repo wires up, but the pattern isn't Lark-specific: **on
    aws bedrock-agentcore-control update-workload-identity --name agentcore-fullstack-wl \
      --allowed-resource-oauth2-return-urls "https://<your-return-endpoint>/return"
    ```
-5. **Append an `IDP_REGISTRY` entry** (`scripts/setup-3lo.sh`) — `{key, provider, scopes, label}`. `/auth` then reports the new system's status and `/auth <key>` consents to it, **with no router change**. This step used to claim "no agent change either", which was wrong and went unnoticed until Google was actually added: `reauth` refused every key but `lark`, and the provider and scopes were module-level constants in `agent/lark_3lo.py`. Both are parameters now (`get_user_token_for`), so a third system needs no further work — but that is a claim worth re-testing rather than trusting.
-6. **Point a tool at it.** The agent fetches the token for `(provider, user)` and passes it to the tool server in the custom passthrough header; `mcp-servers/google/` is the minimal reference — one tool, no CLI to wrap, and no credential of its own.
+5. **Register it on both sides.** Append an `IDP_REGISTRY` entry in `scripts/setup-3lo.sh` (`{key, provider, scopes, label}`) — the router's `/auth` reads it, so `/auth` reports the system and `/auth <key>` consents to it with no router change. The agent needs one line too: an entry in `_DOWNSTREAMS` (`agent/agent_core.py`, `key → (MCP url, provider, scopes)`), fed by env vars that `scripts/provision.sh` sets when it finds the server's Runtime. That entry is what wires the tools, the per-system consent wall, `/auth` status and `/auth <key>`; nothing else in the agent names a system.
+6. **Add the MCP server** as a directory under `mcp-servers/` (`./deploy.sh mcp` builds every one). It reads the user's token from the custom passthrough header, lists its tools without one, and refuses a call without one with exactly `no user token (authorize first)` — that string is how the agent recognises a consent wall. `mcp-servers/google/` is the minimal reference: no CLI to wrap, and no credential of its own.
 
 ## What does not carry over: the ownership check
 

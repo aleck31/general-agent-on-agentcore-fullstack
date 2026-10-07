@@ -1,15 +1,8 @@
-"""Gateway stack — IAM service role for the MCP Gateway.
+"""Gateway stack — IAM service role for the Web Search Gateway.
 
-The AgentCore Gateway itself is NOT a CloudFormation resource. It is created by
-scripts/provision.sh via `aws bedrock-agentcore-control create-gateway` with a
-customJWTAuthorizer (Cognito) inbound and an mcpServer target (the lark-mcp
-Runtime) outbound. This stack only provisions the Gateway's service role.
-
-Identity variant: no interceptor, no tool Lambda. Downstream tools are the
-official lark-mcp server on AgentCore Runtime; per-user Lark tokens are injected
-by AgentCore Identity (3LO Token Vault) into the outbound Authorization: Bearer.
-The gateway role needs InvokeAgentRuntime on the lark-mcp Runtime (granted in
-deploy.sh once the runtime id is known, to avoid a hard dependency here).
+The Gateway itself is created by scripts/provision.sh (`create-gateway`, us-east-1) with
+the Web Search connector as its only target. Search carries no user identity, so the
+target uses GATEWAY_IAM_ROLE; per-user tools bypass the Gateway (see docs/agentcore-behavior.md).
 """
 
 from aws_cdk import (
@@ -28,9 +21,7 @@ class GatewayStack(Stack):
         prefix = self.node.try_get_context("resource_prefix") or "agentcore-fullstack"
         agentcore_principal = iam.ServicePrincipal("bedrock-agentcore.amazonaws.com")
 
-        # Gateway service role — assumed by the Gateway to sign SigV4 calls to its
-        # mcpServer target on Runtime. The specific InvokeAgentRuntime resource is
-        # attached by deploy.sh after the lark-mcp runtime exists.
+        # Gateway service role — what the Web Search target calls the connector as.
         self.gateway_role = iam.Role(
             self, "GatewayRole",
             role_name=f"{prefix}-gateway-role-{region}",
