@@ -82,7 +82,7 @@ shim = ShimStack(
 
 # --- Storage: S3 Files, mounted per user into the code sandbox (opt-in) ---
 # Off unless files_storage=true. No NAT: only the Code Interpreter session sits in this
-# VPC and it reaches S3 through a free gateway endpoint — see .dev/adr/0007. Declared
+# VPC and it reaches S3 through a free gateway endpoint — see docs/architecture.md. Declared
 # before the router so its ids are available to the phases that need them.
 storage = None
 if _flag("files_storage"):

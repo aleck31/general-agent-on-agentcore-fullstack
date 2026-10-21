@@ -166,7 +166,7 @@ class AgentCoreStack(Stack):
 
         # Downstream MCP servers, scoped to this project's runtimes. A name prefix, not exact
         # ARNs: the AWS-assigned suffix only exists after provision.sh runs, and this stack
-        # owns the role it runs with. Verified scopable, and why it matters: .dev/adr/0008.
+        # owns the role it runs with. Verified scopable.
         rt_prefix = prefix.replace("-", "_")
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
@@ -222,7 +222,7 @@ class AgentCoreStack(Stack):
         # Code execution: one shared Code Interpreter, one Access Point per user, and the
         # session mounts that user's Access Point. The agent needs to create the Access
         # Point on first use and to drive sessions — it never gets mount credentials of its
-        # own, and never S3 access to the bucket. See .dev/adr/0007.
+        # own, and never S3 access to the bucket. See docs/architecture.md.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["bedrock-agentcore:StartCodeInterpreterSession",
@@ -286,7 +286,7 @@ class AgentCoreStack(Stack):
         # --- Per-user files. Reached through the sandbox's mount, never with this role:
         # the agent deliberately holds no S3 permission on this bucket. Access is granted
         # only to the S3 Files file system role (scoped to users/*) and, per session, to the
-        # one Access Point that session mounts — see .dev/adr/0007. An earlier version
+        # one Access Point that session mounts. An earlier version
         # granted this role read/write on the whole bucket, which handed every session's
         # code every user's files.
         self.user_files_bucket = s3.Bucket(
@@ -324,7 +324,7 @@ class AgentCoreStack(Stack):
         # --- Conversation checkpoints (LangGraph graph state) -----------------
         # One table for all users; isolation is the partition key, derived from thread_id.
         # Kept separate from the router's identity table for privilege, not layout.
-        # Why not per-user tables, and the quota that rules them out: .dev/adr/0008.
+        # Not per-user tables: the per-region table quota would become the user limit.
         self.checkpoint_table = dynamodb.Table(
             self,
             "CheckpointTable",
@@ -342,7 +342,7 @@ class AgentCoreStack(Stack):
         # State over ~350 KB spills to S3, leaving only a reference in the item, because
         # DynamoDB caps an item at 400 KB and one thread per user grows without bound.
         # A dedicated bucket, not the user-files one: that bucket grants this role nothing
-        # by design (.dev/adr/0007), its mandatory versioning would retain a copy of every
+        # by design, its mandatory versioning would retain a copy of every
         # superstep overwrite, and its 365-day expiry would strip a payload out from under
         # a live reference.
         self.checkpoint_bucket = s3.Bucket(
@@ -368,7 +368,7 @@ class AgentCoreStack(Stack):
         # every thread — so removing Scan and List is what stops "read everyone" from being
         # one call. thread_id is sha256 of the actor and Lark open_ids live in the router's
         # table, which this role cannot read, so without enumeration an attacker must
-        # already know whose conversation to ask for. See .dev/adr/0008.
+        # already know whose conversation to ask for.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[

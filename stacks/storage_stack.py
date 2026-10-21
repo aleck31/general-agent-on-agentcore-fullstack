@@ -6,7 +6,7 @@ does for free. The agent Runtime stays PUBLIC. That is the whole difference from
 this replaced, where the Runtime itself had to mount NFS and therefore needed a route out
 to Bedrock, Lark and a cross-region Gateway.
 
-What isolation rests on (see .dev/adr/0007):
+What isolation rests on (see docs/architecture.md):
   - one Access Point per user, `rootDirectory` fixed server-side to /users/<actor>
   - the session mounts exactly one Access Point, enforced at the microVM boundary
 Neither is agent code, which is the point — the agent runs model output.
@@ -164,7 +164,7 @@ class StorageStack(Stack):
 
         # The permissions for all of this — creating an Access Point and mounting one —
         # live on the agent's execution role in the agentcore stack, which is also the Code
-        # Interpreter's execution role. Nothing here vends credentials. See .dev/adr/0007.
+        # Interpreter's execution role. Nothing here vends credentials.
 
         CfnOutput(self, "FileSystemId", value=self.file_system.attr_file_system_id)
         CfnOutput(self, "FileSystemArn", value=self.file_system.ref)

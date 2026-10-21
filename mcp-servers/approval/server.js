@@ -22,7 +22,7 @@ const APP_ID = process.env.APP_ID || '';
 // Injected as an environment variable, not fetched from Secrets Manager: this
 // container carries no AWS SDK. It matters more here than in the lark-cli server,
 // which never actually needs it — a tenant token can complete any approval in the
-// tenant, so anyone who can read this Runtime's config gains that. See .dev/adr/0006.
+// tenant, so anyone who can read this Runtime's config gains that. See docs/architecture.md.
 const APP_SECRET = process.env.APP_SECRET || '';
 const API = (process.env.LARK_DOMAIN || 'https://open.larksuite.com').replace(/\/$/, '');
 const TOKEN_HEADER = 'x-amzn-bedrock-agentcore-runtime-custom-lark-token';

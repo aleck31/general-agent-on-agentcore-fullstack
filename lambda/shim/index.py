@@ -4,7 +4,7 @@ AgentCore Identity's custom OAuth2 provider speaks standard OAuth2 (form-encoded
 token requests, JSON responses, non-2xx on error). Lark's authen/v2/oauth/token
 uses a JSON request body, a `code:"0"`-wrapped response, and sometimes HTTP-200
 on error. This shim translates between the two so Lark can be registered as a
-provider. See .dev/LARK_OAUTH_SPEC.md for the exact Lark shapes.
+provider. The sibling samples linked from README.md document the exact Lark shapes.
 
 Routes (API Gateway HTTP API, payload v2):
   GET  /authorize  -> 302 to Lark's accounts.* authorize URL (pass-through params)

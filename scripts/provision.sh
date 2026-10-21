@@ -27,7 +27,7 @@ REGION="${_CLI_REGION:-${REGION:-us-west-2}}"
 WEB_SEARCH="${_CLI_WEB_SEARCH:-${WEB_SEARCH:-false}}"
 # Code execution and its per-user workspace. Off by default: it adds a VPC (no NAT — the
 # sandbox only needs S3, via a free gateway endpoint) and an S3 Files file system.
-# See .dev/adr/0007.
+# See docs/architecture.md.
 FILES_STORAGE="${_CLI_FILES:-${FILES_STORAGE:-false}}"
 PREFIX="agentcore-fullstack"
 export AWS_REGION="$REGION" UV_LINK_MODE=copy
@@ -116,7 +116,7 @@ phase_memory() {
 
   # Long-term records only; the conversation lives in DynamoDB. No memoryStrategies on
   # purpose — direct writes are embedded and scored without one, and a custom strategy is
-  # rejected without an execution role. eventExpiryDuration is required. See .dev/adr/0008.
+  # rejected without an execution role. eventExpiryDuration is required. See docs/architecture.md.
   local mname="${PREFIX//-/_}_ltm" mid
   # list-memories returns no `name` — only `id`, which is "<name>-<suffix>". Matching on
   # name would never hit, and this step would create a new memory on every run.
@@ -209,7 +209,7 @@ phase2_runtime() {
     echo "${PREFIX//-/_}_mcp runtime not found — run ./deploy.sh mcp first"; exit 1; }
 
   # Code execution: the Runtime stays PUBLIC. Only the Code Interpreter session joins the
-  # storage VPC, and only the ids it needs are baked in here. See .dev/adr/0007.
+  # storage VPC, and only the ids it needs are baked in here. See docs/architecture.md.
   local fs_arn="" ci_id=""
   if [ "$FILES_STORAGE" = "true" ]; then
     fs_arn="$(cfn_out "$PREFIX-storage" FileSystemArn)"
@@ -350,7 +350,7 @@ phase_code() {
   # needed, only the S3 gateway endpoint the storage stack creates.
   #
   # No filesystemConfigurations here on purpose: the mount is named per session, so one
-  # shared interpreter serves every user with their own Access Point. See .dev/adr/0007.
+  # shared interpreter serves every user with their own Access Point. See docs/architecture.md.
   existing="$(aws bedrock-agentcore-control list-code-interpreters \
     --query "codeInterpreterSummaries[?name=='$name'].codeInterpreterId" --output text 2>/dev/null | head -1)"
   if [ -n "$existing" ] && [ "$existing" != "None" ]; then

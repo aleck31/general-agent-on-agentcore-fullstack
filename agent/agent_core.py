@@ -7,7 +7,7 @@ every MCP server and re-lists tools, which adds ~15–20s of latency. AgentCore 
 each session its own microVM, so the cache holds essentially one entry per container.
 
 Memory is two independent backends, because the two jobs have different requirements
-(see .dev/adr/0008):
+(see docs/architecture.md, "Conversation memory"):
   - DynamoDBSaver — the checkpointer, i.e. the conversation itself. Full graph state
     (messages with their tool calls and results, channels, pending writes), addressed by
     thread_id alone — the sha256 of the actor. Nothing about the container is part of the
@@ -141,7 +141,8 @@ _model = _CachingChatBedrockConverse(model=_MODEL_ID, region_name=_REGION,
 # --------------------------- bounding an endless thread ----------------------
 # The thread is permanent per user and DynamoDBSaver has no prune, so summarisation is the
 # only bound. Threshold-triggered, never per turn: it rewrites the cached prefix.
-# Why late, and why `tokens` over `fraction`: .dev/adr/0008.
+# Tokens, not a fraction: a fraction of a permanently growing thread re-summarises
+# forever. Late, because summarising early discards detail the user can still refer to.
 _SUMMARIZE_AT_TOKENS = int(os.environ.get("SUMMARIZE_AT_TOKENS", "120000"))  # 0 disables
 _SUMMARIZE_KEEP = int(os.environ.get("SUMMARIZE_KEEP_MESSAGES", "20"))
 
@@ -473,7 +474,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         # Approval tools, when that Runtime is deployed. Separate server because its
         # write operations run on the app's tenant token (Lark accepts no user token
         # there) and its decision limits have to be bound to specific tools — see
-        # .dev/adr/0006. The user token is still passed: add_sign needs it.
+        # docs/architecture.md. The user token is still passed: add_sign needs it.
         if _APPROVAL_MCP_URL:
             try:
                 tools += await _open(

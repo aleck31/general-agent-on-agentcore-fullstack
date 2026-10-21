@@ -3,7 +3,7 @@
 #
 # Two identities in one server: approve/reject/transfer run on the app tenant token
 # (Lark accepts no user token there), while add_sign needs the caller user token from
-# the custom passthrough header. See .dev/adr/0006 for why, and for the limits.
+# the custom passthrough header. See docs/architecture.md for why, and for the limits.
 # Decision limits (AGENT_DECIDE_MAX_AMOUNT / AGENT_DECIDE_APPROVAL_CODES) are enforced
 # in code, never by the model — an approval form is untrusted input.
 #

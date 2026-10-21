@@ -3,7 +3,7 @@
 # Amazon Linux 2023 because the agent's dependencies install cleanly on its python3.11.
 # It used to be here for a stronger reason — `mount.s3files` from amazon-efs-utils, which
 # needed root — and that reason is gone: the per-user mount now happens inside the Code
-# Interpreter session, not in this container. See .dev/adr/0007. Nothing left here needs
+# Interpreter session, not in this container. Nothing left here needs
 # root, so switching to a dedicated user is a worthwhile follow-up, deliberately not done
 # blind in the same change.
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023

@@ -180,13 +180,13 @@ What that leaves as the one thing to get right is **which Access Point a session
 
 **What the model sees is a working directory, not a mount.** Three tools — `run_code`, `run_command`, `list_files` — and every call is prefixed with a `cd` into the workspace, because the sandbox's own working directory is elsewhere and anything written there dies with the session. The tools take no path outside the workspace and no actor id: which Access Point gets mounted is decided from the turn's verified identity, never from an argument. The session starts lazily, on the first tool call rather than while the tool list is built, and is stopped when the cached session is discarded — a code session left running is billed until it times out.
 
-**Known edges.** `mountPath` must match `/mnt/[a-zA-Z0-9._-]+/?`, so the path is `/mnt/workspace` rather than a friendlier `/workspace`. Write-through to S3 is asynchronous (~40 s measured for a small file), so reading an artifact out of the bucket needs a retry while reading it back through the sandbox does not. `readFiles`/`writeFiles` are scoped to the sandbox's own workspace and cannot touch the mount — use `executeCommand`/`executeCode`. Access Points are limited (EFS allows 1000 per file system; s3files assumed similar, unconfirmed), which bounds the user count. `/clear` deletes conversation state, never files. Measured details in `docs/agentcore-behavior.md`, decisions in `.dev/adr/0007`.
+**Known edges.** `mountPath` must match `/mnt/[a-zA-Z0-9._-]+/?`, so the path is `/mnt/workspace` rather than a friendlier `/workspace`. Write-through to S3 is asynchronous (~40 s measured for a small file), so reading an artifact out of the bucket needs a retry while reading it back through the sandbox does not. `readFiles`/`writeFiles` are scoped to the sandbox's own workspace and cannot touch the mount — use `executeCommand`/`executeCode`. Access Points are limited (EFS allows 1000 per file system; s3files assumed similar, unconfirmed), which bounds the user count. `/clear` deletes conversation state, never files. Measured details in `docs/agentcore-behavior.md`.
 
 ## Conversation memory
 
 The conversation is LangGraph graph state in a DynamoDB table, addressed by `thread_id` alone — and `thread_id` is derived from the user, never from the container. So a turn cut off at the 15-minute invoke cap resumes in a brand-new microVM. Checkpoints are written **per superstep**, so the durable record advances *during* a turn: a microVM gets no shutdown hook, and any design that flushes at the end loses the turn that was interrupted. The compiled graph and its MCP sessions are cached per session and reused across messages — rebuilding per message re-handshakes every MCP server and re-lists tools, ~15–20s of avoidable latency.
 
-**Two backends, two jobs** (see `.dev/adr/0008` for why each):
+**Two backends, two jobs:**
 
 | | Holds | Read by |
 |---|---|---|

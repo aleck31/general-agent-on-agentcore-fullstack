@@ -748,7 +748,7 @@ def _web_session(body: str) -> dict:
         # The same routing key Lark chat uses, so both surfaces land on one microVM and one
         # conversation. AgentCore maps a session id to exactly one microVM, which is what
         # lets the agent serialise two surfaces' turns in process instead of needing a
-        # distributed lock — see .dev/adr/0002. Neither id is a credential: one routes, the
+        # distributed lock — see docs/architecture.md. Neither id is a credential: one routes, the
         # other names a thread, and without the JWT above neither does anything.
         "runtimeSessionId": identity.get_or_create_session(user_id),
         "memorySessionId": identity.get_or_create_memory_session(user_id, actor_id),
@@ -782,7 +782,7 @@ def handler(event, context):
 
     # Consent-resume path: the shim invokes us here after a user finishes 3LO, so the
     # message that hit the auth wall can be replayed with the token now in the vault
-    # — the user does not re-send. See .dev/adr and PLAN-consent-resume.
+    # — the user does not re-send. The full sequence is in docs/architecture.md.
     if event.get("_consent_resumed"):
         actor_id = event.get("actorId", "")
         resume_consented_turn(actor_id)

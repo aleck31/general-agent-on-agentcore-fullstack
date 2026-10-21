@@ -1,7 +1,7 @@
 """Long-term memory as two explicit tools, not as a by-product of every turn.
 
 The conversation itself is graph state in DynamoDB and needs nothing from here (see
-.dev/adr/0008). What this adds is the ability to carry a fact *across* threads — the kind
+docs/architecture.md, "Conversation memory"). What this adds is the ability to carry a fact *across* threads — the kind
 of thing a user says once and expects to hold next week.
 
 Why tools rather than automatic extraction:
