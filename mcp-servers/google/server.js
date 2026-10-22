@@ -89,7 +89,7 @@ function sse(res, obj) {
   res.end(`event: message\ndata: ${JSON.stringify(obj)}\n\n`);
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer((req, res) => {  // nosemgrep: using-http-server — TLS terminated by the Runtime
   if (req.method === 'GET') { res.writeHead(200); res.end('ok'); return; }
   let body = '';
   req.on('data', (c) => (body += c));

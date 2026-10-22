@@ -85,7 +85,7 @@ def _post_lark(payload: dict) -> tuple[int, dict]:
         headers={"Content-Type": "application/json; charset=utf-8"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=10) as r:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
             return r.status, json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         try:
@@ -157,7 +157,7 @@ def handle_token(form: dict, headers: dict) -> dict:
             clean["refresh_token"] = body["refresh_token"]
             clean["refresh_token_expires_in"] = body.get("refresh_token_expires_in")
         # Lifetimes only — never log the tokens themselves.
-        logger.info(
+        logger.info(  # nosemgrep: python-logger-credential-disclosure — logs ids and codes, never values
             "token ok: grant=%s expires_in=%s refresh_expires_in=%s scope=%r",
             payload.get("grant_type"), body.get("expires_in"),
             body.get("refresh_token_expires_in"), body.get("scope", ""),
@@ -166,7 +166,8 @@ def handle_token(form: dict, headers: dict) -> dict:
 
     # Error: force a non-2xx even if Lark answered HTTP 200 with a nonzero code.
     status = http_status if http_status >= 400 else 400
-    logger.warning("token error from Lark (lark_code=%s): %s", body.get("code"), body)
+    logger.warning("token error from Lark: lark_code=%s error=%s description=%s",  # nosemgrep: python-logger-credential-disclosure — codes only, never the token
+                   body.get("code"), body.get("error"), body.get("error_description"))
     return _resp(status, {
         "error": body.get("error", "invalid_grant"),
         "error_description": body.get("error_description",
@@ -230,7 +231,7 @@ def _post_json(url: str, body: dict, bearer: str = "") -> dict:
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=10) as r:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         return json.loads(e.read().decode() or "{}")

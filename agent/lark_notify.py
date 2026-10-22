@@ -41,7 +41,7 @@ def _call(method: str, url: str, body: dict, bearer: str = "") -> dict:
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with urllib.request.urlopen(req, timeout=10) as r:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         return json.loads(e.read().decode() or "{}")
@@ -65,7 +65,7 @@ def _tenant_token() -> str:
                      {"app_id": secret["appId"], "app_secret": secret["appSecret"]})
         tok = body.get("tenant_access_token", "")
         if not tok:
-            log.error("tenant token request failed: %s", body.get("msg", body))
+            log.error("tenant token request failed: %s", body.get("msg", body))  # nosemgrep: python-logger-credential-disclosure — logs ids and codes, never values
             return ""
         _token = (tok, time.time() + int(body.get("expire", 7200)) - 300)
         return tok

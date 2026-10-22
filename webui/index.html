@@ -23,12 +23,17 @@
 <!-- Deploy-time values (router URL, Lark app id); written by the WebUI stack. -->
 <script src="config.js"></script>
 <!-- This exact path, not the /goofy/locality/openplatform/ one — that 404s, so h5sdk never
-     defines itself and every failure presents as "not in the Lark client". -->
-<script src="https://lf1-cdn-tos.bytegoofy.com/goofy/lark/op/h5-js-sdk-1.5.34.js"></script>
+     defines itself and every failure presents as "not in the Lark client". No integrity hash:
+     Lark's CDN makes no immutability promise, and a stale hash would break the page outright. -->
+<script src="https://lf1-cdn-tos.bytegoofy.com/goofy/lark/op/h5-js-sdk-1.5.34.js"></script>  <!-- nosemgrep: missing-integrity — vendor CDN, no immutability promise -->
 <!-- Model output is markdown. Sanitised because a tool result is untrusted input that
      reaches this page through the model. -->
-<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"
+        integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi"
+        crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"
+        integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a"
+        crossorigin="anonymous"></script>
 <style>
   :root { color-scheme: light dark; --edge: color-mix(in oklab, currentColor 14%, transparent);
           --accent: #2563eb; --me-bg: #d2e4ff; --me-fg: #10233d; }
@@ -121,7 +126,7 @@ function paintMarkdown(el, raw) {
   el.dataset.md = raw;
   const html = md(raw);
   if (html === null) { el.style.whiteSpace = 'pre-wrap'; el.textContent = raw; }
-  else el.innerHTML = html;
+  else el.innerHTML = html;  // nosemgrep: insecure-document-method — md() returns DOMPurify-sanitised HTML
   log.scrollTop = log.scrollHeight;
 }
 

@@ -86,7 +86,7 @@ def test_session_id_deterministic_per_user():
     # exec only the function definition we care about
     start = src.index("def _session_id_for")
     end = src.index("\n\ndef ", start)
-    exec(src[start:end], ns)
+    exec(src[start:end], ns)  # nosec B102 # nosemgrep: exec-detected — asserts a source contract
     sid = ns["_session_id_for"]
     assert sid("lark:ou_abc") == sid("lark:ou_abc")          # stable
     assert sid("lark:ou_abc") != sid("lark:ou_xyz")          # per-user
@@ -550,7 +550,7 @@ def _load_3lo_guard(owner_lookup):
     start = src.index("_VERIFIED: dict[str, str] = {}")
     end = src.index("def get_user_lark_token(")
     ns = {"hashlib": hashlib, "log": mock.Mock(), "httpx": mock.Mock()}
-    exec(src[start:end], ns)
+    exec(src[start:end], ns)  # nosec B102 # nosemgrep: exec-detected — asserts a source contract
     ns["_token_owner"] = owner_lookup          # replace the HTTP call
     return ns
 
@@ -709,7 +709,7 @@ def test_card_update_reports_failure_on_the_next_call():
     for _ in range(50):                   # let the worker discover it
         if not card.ok:
             break
-        _t.sleep(0.02)
+        _t.sleep(0.02)  # nosemgrep: arbitrary-sleep — polls the worker in a unit test
     assert card.ok is False
     assert card.update("ab") is False      # now the caller is told
 

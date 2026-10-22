@@ -446,7 +446,7 @@ async def _abuild_session(actor_id: str, email: str, mem_sid: str,
         kind, value = await asyncio.to_thread(
             lark_3lo.get_user_lark_token, actor_id, False, workload_token)
     except Exception as e:  # noqa: BLE001 — never crash the turn on identity hiccups
-        log.exception("3LO token lookup failed for %s", actor_id)
+        log.exception("3LO token lookup failed for %s", actor_id)  # nosemgrep: python-logger-credential-disclosure — logs ids and codes, never values
         kind, value = "error", str(e)
 
     if kind == "auth_url":

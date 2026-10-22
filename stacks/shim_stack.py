@@ -62,7 +62,7 @@ class ShimStack(Stack):
         # built from the deterministic name — no router-stack reference needed.
         self.shim_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["lambda:InvokeFunction"],
-            resources=[f"arn:aws:lambda:{Stack.of(self).region}:{Stack.of(self).account}"
+            resources=[f"arn:aws:lambda:{Stack.of(self).region}:{Stack.of(self).account}"  # nosemgrep: string-concat-in-list — one wrapped ARN, not two items
                        f":function:{router_function}"],
         ))
         # The return-url handler completes the 3LO auth session.
@@ -75,10 +75,10 @@ class ShimStack(Stack):
         self.shim_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
             resources=[
-                f"arn:aws:secretsmanager:{Stack.of(self).region}:{Stack.of(self).account}"
+                f"arn:aws:secretsmanager:{Stack.of(self).region}:{Stack.of(self).account}"  # nosemgrep: string-concat-in-list — one wrapped ARN, not two items
                 ":secret:bedrock-agentcore-identity!default/oauth2/*",
                 # Lark app credentials — used to DM the user after consent.
-                f"arn:aws:secretsmanager:{Stack.of(self).region}:{Stack.of(self).account}"
+                f"arn:aws:secretsmanager:{Stack.of(self).region}:{Stack.of(self).account}"  # nosemgrep: string-concat-in-list — one wrapped ARN, not two items
                 f":secret:{prefix}/*",
             ],
         ))

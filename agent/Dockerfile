@@ -3,13 +3,13 @@
 # Amazon Linux 2023 because the agent's dependencies install cleanly on its python3.11.
 # It used to be here for a stronger reason — `mount.s3files` from amazon-efs-utils, which
 # needed root — and that reason is gone: the per-user mount now happens inside the Code
-# Interpreter session, not in this container. Nothing left here needs
-# root, so switching to a dedicated user is a worthwhile follow-up, deliberately not done
-# blind in the same change.
+# Interpreter session, not in this container. So nothing here needs root, and it runs as a
+# dedicated user.
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023
 
-# python3.11 is what AL2023 packages.
-RUN dnf install -y --setopt=install_weak_deps=False python3.11 python3.11-pip \
+# python3.11 is what AL2023 packages. shadow-utils is for useradd: the minimal AL2023 image
+# has none, and without it the USER line below fails the build with exit 127.
+RUN dnf install -y --setopt=install_weak_deps=False python3.11 python3.11-pip shadow-utils \
     && dnf clean all && rm -rf /var/cache/dnf
 
 WORKDIR /app
@@ -25,6 +25,12 @@ RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python3
 COPY *.py /app/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
+
+# Least privilege. Nothing is written outside the interpreter session, so a read-only /app
+# is enough; HOME is set because libraries fall back to writing caches there.
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser /app
+USER appuser
+ENV HOME=/home/appuser
 
 EXPOSE 8080
 

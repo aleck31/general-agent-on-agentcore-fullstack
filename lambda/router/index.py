@@ -122,7 +122,7 @@ def invoke_agent(session_id: str, user_id: str, actor_id: str, message: str,
     )
     timeout = max(int(budget), 10) if budget is not None else READ_TIMEOUT
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — const scheme+host
             raw = r.read().decode()
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")[:400]
@@ -179,7 +179,7 @@ def probe_agent(session_id: str, user_id: str, actor_id: str) -> dict | None:
             retryable = "RetryableConflict" in type(e).__name__ or "409" in str(e)
             if retryable and attempt == 0:
                 logger.info("microVM probe conflicted, retrying once")
-                time.sleep(1)
+                time.sleep(1)  # nosemgrep: arbitrary-sleep — backs off one conflicting probe retry
                 continue
             logger.info("microVM probe failed for %s: %s", actor_id, type(e).__name__)
             return None

@@ -105,7 +105,7 @@ def tools_for(actor_id: str) -> list:
     return [
         StructuredTool.from_function(
             func=remember, name="remember",
-            description=(
+            description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
                 "Store one durable fact about this user for future conversations. Use it "
                 "when they tell you something that should outlast this chat — a "
                 "preference, a name, an ongoing project. Do not use it for things only "
@@ -114,7 +114,7 @@ def tools_for(actor_id: str) -> list:
             args_schema=_RememberArgs),
         StructuredTool.from_function(
             func=recall, name="recall",
-            description=(
+            description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
                 "Look up what you previously stored about this user. Use it when the "
                 "answer may depend on something said in an earlier conversation, not for "
                 "anything visible in the messages above."),

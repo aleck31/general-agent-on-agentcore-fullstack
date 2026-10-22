@@ -237,7 +237,7 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
     return [
         StructuredTool.from_function(
             func=_guard(run_code), name="run_code",
-            description=(
+            description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
                 "Run code and get its output. Use this for anything computed rather than "
                 "recalled — data work, file conversion, checking your own arithmetic. "
                 "Files you write persist between turns and across days, so build on them "
@@ -247,7 +247,7 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
             args_schema=_RunCodeArgs),
         StructuredTool.from_function(
             func=_guard(run_command), name="run_command",
-            description=(
+            description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
                 "Run one shell command in the workspace. Use it for the things a shell is "
                 "better at than a program — inspecting files, moving them, checking sizes. "
                 "No internet and no root, so nothing can be installed. Available: jq, "
@@ -257,7 +257,7 @@ def tools_for(actor_id: str, sandbox: _Sandbox | None = None) -> list:
             args_schema=_RunCommandArgs),
         StructuredTool.from_function(
             func=_guard(list_files), name="list_files",
-            description=(
+            description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
                 "List what is already in the workspace. Worth doing before you claim a "
                 "file does or does not exist, since it persists from earlier conversations."),
             args_schema=_ListFilesArgs),

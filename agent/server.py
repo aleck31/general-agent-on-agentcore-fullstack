@@ -53,7 +53,7 @@ def _kernel_uptime() -> float | None:
     tells the two apart: process age can never exceed it, so a process claiming to be
     older than its kernel would mean the probe (or the guest clock) is wrong."""
     try:
-        with open("/proc/uptime") as f:
+        with open("/proc/uptime", encoding="utf-8") as f:
             return round(float(f.read().split()[0]), 1)
     except Exception:
         return None
@@ -287,7 +287,7 @@ def _log_startup_breakdown() -> None:
 async def main() -> None:
     http_runner = web.AppRunner(build_http_app())
     await http_runner.setup()
-    await web.TCPSite(http_runner, "0.0.0.0", _HTTP_PORT).start()
+    await web.TCPSite(http_runner, "0.0.0.0", _HTTP_PORT).start()  # nosec B104 # nosemgrep: avoid-bind-to-all-interfaces — the Runtime routes to this port
     log.info("HTTP contract on :%d", _HTTP_PORT)
     _log_startup_breakdown()
 

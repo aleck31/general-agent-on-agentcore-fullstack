@@ -73,7 +73,7 @@ def _token_owner(token: str) -> str:
                       headers={"Authorization": f"Bearer {token}"}, timeout=10)
         return ((r.json().get("data") or {}).get("open_id") or "")
     except Exception as e:  # noqa: BLE001
-        log.warning("could not read the token's owner: %s", e)
+        log.warning("could not read the token's owner: %s", e)  # nosemgrep: python-logger-credential-disclosure — logs ids and codes, never values
         return ""
 
 
@@ -92,7 +92,7 @@ def _belongs_to(token: str, actor_id: str) -> bool:
     owner = _token_owner(token)
     expected = actor_id.split(":", 1)[1] if ":" in actor_id else actor_id
     if not owner or owner != expected:
-        log.error("vaulted token does not belong to %s (owner=%s) — refusing it",
+        log.error("vaulted token does not belong to %s (owner=%s) — refusing it",  # nosemgrep: python-logger-credential-disclosure — logs ids and codes, never values
                   actor_id, owner[:12] + "…" if owner else "unknown")
         return False
     if len(_VERIFIED) >= _VERIFIED_MAX:
@@ -257,7 +257,7 @@ def _workload_token_for(actor_id: str, workload_token: str = "") -> str:
     consents already."""
     if workload_token:
         return workload_token
-    log.warning("no platform workload token for %s — falling back to ForUserId", actor_id)
+    log.warning("no platform workload token for %s — falling back to ForUserId", actor_id)  # nosemgrep: python-logger-credential-disclosure — logs ids and codes, never values
     return _agentcore.get_workload_access_token_for_user_id(
         workloadName=_WORKLOAD, userId=actor_id)["workloadAccessToken"]
 

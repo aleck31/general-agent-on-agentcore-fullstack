@@ -15,11 +15,14 @@ FROM public.ecr.aws/docker/library/node:24-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Official Lark CLI (pinned). The `install` subcommand fetches the platform binary;
 # fall back to -g. Provides `lark-cli api <method> <path>` for every Lark endpoint,
 # with per-invocation token via env var.
+# pipefail so the fallback below reacts to the real failure, not just the last command's status.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 ARG LARK_CLI_VERSION=1.0.86
 RUN npx -y @larksuite/cli@${LARK_CLI_VERSION} install 2>/dev/null || npm install -g @larksuite/cli@${LARK_CLI_VERSION}
 RUN npx -y skills add larksuite/cli -y -g 2>/dev/null || true

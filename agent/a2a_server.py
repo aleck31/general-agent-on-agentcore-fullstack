@@ -116,7 +116,7 @@ def build_app():
         skills=[AgentSkill(
             id="act-as-user-in-lark",
             name="Act as the user in Lark",
-            description=(
+            description=(  # nosemgrep: string-concat-in-list — one wrapped description, not two items
                 "Read or write in the caller's Lark tenant as a specific person: their "
                 "documents, their approvals. Requires that person to have consented once, "
                 "and requires the caller to present their identity token — a caller able to "
@@ -159,7 +159,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     log.info("A2A contract on :%d", _PORT)
-    uvicorn.run(_with_bearer(build_app()), host="0.0.0.0", port=_PORT, log_level="info")
+    uvicorn.run(_with_bearer(build_app()), host="0.0.0.0", port=_PORT, log_level="info")  # nosec B104 # nosemgrep: avoid-bind-to-all-interfaces — the Runtime routes to this port
 
 
 if __name__ == "__main__":

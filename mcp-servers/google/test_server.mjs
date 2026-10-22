@@ -22,7 +22,7 @@ async function withServer(fn) {
   }
 }
 
-const post = (body, headers = {}) => fetch(`http://127.0.0.1:${PORT}/mcp`, {
+const post = (body, headers = {}) => fetch(`http://127.0.0.1:${PORT}/mcp`, {  // nosemgrep: react-insecure-request — loopback to the test's own server
   method: 'POST',
   headers: { 'Content-Type': 'application/json', ...headers },
   body: JSON.stringify(body),

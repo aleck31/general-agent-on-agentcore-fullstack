@@ -28,7 +28,7 @@ _PID = os.getpid()
 _lock = threading.Lock()
 _count = 0
 
-mcp = FastMCP("probe", host="0.0.0.0", port=8000, stateless_http=True)
+mcp = FastMCP("probe", host="0.0.0.0", port=8000, stateless_http=True)  # nosec B104 # nosemgrep: avoid-bind-to-all-interfaces — the Runtime routes to this port
 
 
 def _digest(value: str) -> str:

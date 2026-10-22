@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 def _post(body: bytes, headers: dict) -> tuple[int, str]:
     req = urllib.request.Request(WEBHOOK_URL, data=body, method="POST", headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 # nosemgrep: dynamic-urllib-use-detected — test target
             return resp.status, resp.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()
