@@ -1,5 +1,7 @@
 # General Agent on AgentCore — a full-stack agent sample
 
+> ⚠️ **This repository is no longer maintained.**  The project has moved to the AWS Samples repo: [aws-samples/sample-general-agent-on-agentcore-fullstack](https://github.com/aws-samples/sample-general-agent-on-agentcore-fullstack).
+
 A general-purpose agent on **Amazon Bedrock AgentCore**, with **Lark (Feishu) as its interaction channel**. The agent runs on AgentCore Runtime (LangGraph + Bedrock), checkpoints conversation state to DynamoDB, reaches its tools over MCP, and answers in Lark chat — typed into a streaming card as it is produced, because a real task outlasts any request/response window.
 
 Every message resolves to `lark:{open_id}`, and any tool touching a user's data acts **as that user**, with their own vaulted Lark token (3LO through AgentCore Identity). So Lark adjudicates access and there is no parallel permission layer to keep in sync. That identity chain is documented in depth by two sibling samples rather than here: [native](https://github.com/aws-samples/sample-lark-identity-on-agentcore-native) (the Token Vault path this repo uses) and [interceptor](https://github.com/aws-samples/sample-lark-identity-on-agentcore-interceptor) (same guarantees, self-managed vaulting).
